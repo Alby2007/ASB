@@ -65,12 +65,12 @@ export class Brain {
           eventId: { type: "number" },
           eventIds: { type: "array", items: { type: "number" } },
           reason: { type: "string" }
-        }, required: ["action", "reason"], additionalProperties: false
+        }, required: ["action", "eventId", "eventIds", "reason"], additionalProperties: false
       } } }
     });
-    const raw = JSON.parse(response.output_text) as { action: string; eventId?: number; eventIds?: number[]; reason: string };
-    if (raw.action === "attach" && raw.eventId != null) return { action: "attach", eventId: raw.eventId };
-    if (raw.action === "reference" && raw.eventId != null) return { action: "reference", eventId: raw.eventId };
+    const raw = JSON.parse(response.output_text) as { action: string; eventId: number; eventIds: number[]; reason: string };
+    if (raw.action === "attach" && raw.eventId > 0) return { action: "attach", eventId: raw.eventId };
+    if (raw.action === "reference" && raw.eventId > 0) return { action: "reference", eventId: raw.eventId };
     if (raw.action === "bridge" && raw.eventIds?.length) return { action: "bridge", eventIds: raw.eventIds };
     return { action: "new" };
   }

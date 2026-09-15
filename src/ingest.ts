@@ -11,8 +11,27 @@ import type { MessageEvent } from "./types.js";
 // ── Config ────────────────────────────────────────────────────────────────────
 const CHANNEL_NAME = "general-chat";
 const BATCH_SIZE = 100;            // Discord API max per fetch
-const LLM_DELAY_MS = 2200;         // ~27 RPM — safe under Groq's 30 RPM free tier
-const EVENT_DELAY_MS = 200;        // Small pause between event pipeline calls
+const LLM_DELAY_MS = 8000;         // ~7.5 RPM — well under Groq's token limit
+const EVENT_DELAY_MS = 8000;       // Same — pipeline can trigger assessContinuity LLM calls
+
+async function withRetry<T>(fn: () => Promise<T>, retries = 6): Promise<T> {
+  for (let i = 0; i < retries; i++) {
+    try { return await fn(); } catch (err) {
+      const msg = (err as Error).message;
+      if (msg.includes("429") && i < retries - 1) {
+        const headers = (err as { headers?: Headers }).headers;
+        const tokenReset = headers?.get("x-ratelimit-reset-tokens");
+        const retryAfter = headers?.get("retry-after");
+        const wait = tokenReset
+          ? Math.ceil(parseFloat(tokenReset) * 1000) + 1000
+          : retryAfter ? parseInt(retryAfter) * 1000 + 1000 : (i + 1) * 30_000;
+        console.log(`  [429] rate limit — waiting ${(wait / 1000).toFixed(1)}s...`);
+        await sleep(wait);
+      } else throw err;
+    }
+  }
+  throw new Error("exhausted retries");
+}
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const store = new MemoryStore();
@@ -40,7 +59,9 @@ async function processMessage(msg: { id: string; author: { id: string; bot: bool
 
   const savedMemoryIds: number[] = [];
   const replyToId = msg.reference?.messageId ?? undefined;
-  if (shouldInspectForMemory(event)) {
+  // On re-ingest, skip messages that already produced evidence — avoids re-spending tokens
+  const alreadyProcessed = store.db.prepare("SELECT COUNT(*) as c FROM memory_evidence WHERE message_id = ?").get(msg.id) as { c: number };
+  if (shouldInspectForMemory(event) && alreadyProcessed.c === 0) {
     memoryCalls++;
     // Resolve reply context so the LLM can see what this message is responding to
     let replyToContent: string | undefined;
@@ -49,7 +70,7 @@ async function processMessage(msg: { id: string; author: { id: string; bot: bool
       if (ref) replyToContent = `${ref.authorName}: ${ref.content}`;
     }
     try {
-      const candidates = await brain.extractMemories(event, replyToContent);
+      const candidates = await withRetry(() => brain.extractMemories(event, replyToContent));
       for (const memory of candidates) {
         const saved = store.saveMemory(event, memory, config.candidateConfidenceThreshold);
         savedMemoryIds.push(saved.id);
@@ -64,7 +85,7 @@ async function processMessage(msg: { id: string; author: { id: string; bot: bool
 
   try {
     const before = eventStore.listEvents(msg.guild.id, { tier: "candidate" }).total;
-    await pipeline.process(event, savedMemoryIds, eventStore, store, brain, replyToId);
+    await withRetry(() => pipeline.process(event, savedMemoryIds, eventStore, store, brain, replyToId));
     const after = eventStore.listEvents(msg.guild.id, { tier: "candidate" }).total;
     if (after > before) eventsCreated++;
   } catch (err) {
