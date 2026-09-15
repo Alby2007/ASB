@@ -159,6 +159,11 @@ export class MemoryStore {
     return { resolved: false, netScore };
   }
   recentContext(guildId: string, channelId: string, limit = 12) { return this.db.prepare("SELECT author_name as authorName, content, created_at as createdAt FROM messages WHERE guild_id=? AND channel_id=? ORDER BY created_at DESC LIMIT ?").all(guildId, channelId, limit).reverse() as Array<{ authorName: string; content: string; createdAt: string }>; }
+  messagesByIds(messageIds: string[]): Array<{ authorName: string; content: string; createdAt: string }> {
+    if (messageIds.length === 0) return [];
+    const placeholders = messageIds.map(() => "?").join(",");
+    return this.db.prepare(`SELECT author_name as authorName, content, created_at as createdAt FROM messages WHERE id IN (${placeholders}) ORDER BY created_at ASC`).all(...messageIds) as Array<{ authorName: string; content: string; createdAt: string }>;
+  }
   deleteRawMessagesOlderThan(guildId: string, days: number) { return this.db.prepare("DELETE FROM messages WHERE guild_id=? AND created_at < ?").run(guildId, new Date(Date.now() - days * 86_400_000).toISOString()).changes; }
   // Consolidate active episodes for a subject into behavioral_patterns rows.
   // Only active-status episodes count toward pattern formation — candidates and quarantined

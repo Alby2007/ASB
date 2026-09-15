@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
+    "ingest": "tsx src/ingest.ts",
     "check": "tsc --noEmit",
     "test": "tsx --test src/**/*.test.ts"
   },

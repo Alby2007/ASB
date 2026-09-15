@@ -45,7 +45,6 @@ client.on(Events.InteractionCreate, async interaction => {
 });
 
 client.on(Events.MessageCreate, async message => {
-  console.log(`[debug] MessageCreate fired — guild=${message.guild?.id} author=${message.author?.username} content=${message.content?.slice(0,50)}`);
   if (!message.guild || message.author.bot || !message.content.trim()) return;
   if (config.guildId && message.guild.id !== config.guildId) return;
   const event: MessageEvent = {

@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { Client, GatewayIntentBits } from "discord.js";
+import { Client, GatewayIntentBits, type Message } from "discord.js";
 import { Brain } from "./brain.js";
 import { config } from "./config.js";
 import { MemoryStore } from "./database.js";
@@ -9,7 +9,7 @@ import { shouldInspectForMemory } from "./perception.js";
 import type { MessageEvent } from "./types.js";
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const CHANNEL_NAME = "general-chat";
+const CHANNEL_NAME = process.env.INGEST_CHANNEL ?? "general-chat";
 const BATCH_SIZE = 100;            // Discord API max per fetch
 const LLM_DELAY_MS = 8000;         // ~7.5 RPM — well under Groq's token limit
 const EVENT_DELAY_MS = 8000;       // Same — pipeline can trigger assessContinuity LLM calls
@@ -85,13 +85,14 @@ async function processMessage(msg: { id: string; author: { id: string; bot: bool
 
   try {
     const before = eventStore.listEvents(msg.guild.id, { tier: "candidate" }).total;
-    await withRetry(() => pipeline.process(event, savedMemoryIds, eventStore, store, brain, replyToId));
+    const llmUsed = await withRetry(() => pipeline.process(event, savedMemoryIds, eventStore, store, brain, replyToId));
     const after = eventStore.listEvents(msg.guild.id, { tier: "candidate" }).total;
     if (after > before) eventsCreated++;
+    // Only pace when an LLM call was actually made — heuristic-only messages are free
+    if (llmUsed) await sleep(EVENT_DELAY_MS);
   } catch (err) {
     console.error(`  [event pipeline error] msg ${msg.id}:`, (err as Error).message.slice(0, 100));
   }
-  await sleep(EVENT_DELAY_MS);
 }
 
 client.once("ready", async () => {
@@ -102,11 +103,14 @@ client.once("ready", async () => {
   if (!channel) { console.error(`Channel "${CHANNEL_NAME}" not found`); process.exit(1); }
   if (channel.type !== 0) { console.error("Channel is not a text channel"); process.exit(1); }
 
-  console.log(`Ingesting #${CHANNEL_NAME}...`);
-  let lastId: string | undefined;
-  let done = false;
+  console.log(`Fetching #${CHANNEL_NAME} history...`);
 
-  while (!done) {
+  // Discord pages newest→oldest, so buffer everything and sort globally —
+  // events must be built in chronological order across batch boundaries.
+  const backlog: Message[] = [];
+  let lastId: string | undefined;
+
+  while (true) {
     const options: { limit: number; before?: string } = { limit: BATCH_SIZE };
     if (lastId) options.before = lastId;
 
@@ -119,17 +123,21 @@ client.once("ready", async () => {
       continue;
     }
 
-    if (batch.size === 0) { done = true; break; }
+    if (batch.size === 0) break;
+    backlog.push(...batch.values());
+    const oldest = batch.reduce((min, m) => (m.createdTimestamp < min.createdTimestamp ? m : min));
+    lastId = oldest.id; // before= paginates backwards from the oldest message seen
+    console.log(`  fetched ${backlog.length} messages...`);
+  }
 
-    // Sort oldest→newest so events build chronologically
-    const sorted = [...batch.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-    for (const msg of sorted) {
-      await processMessage(msg as Parameters<typeof processMessage>[0]);
-      if (total % 100 === 0) {
-        console.log(`  ${total} messages processed | ${archived} archived | ${memoriesSaved} memories | ${eventsCreated} events | ${llmErrors} errors`);
-      }
+  backlog.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+  console.log(`Ingesting ${backlog.length} messages (oldest→newest)...`);
+
+  for (const msg of backlog) {
+    await processMessage(msg as Parameters<typeof processMessage>[0]);
+    if (total % 100 === 0) {
+      console.log(`  ${total} messages processed | ${archived} archived | ${memoriesSaved} memories | ${eventsCreated} events | ${llmErrors} errors`);
     }
-    lastId = sorted[0].id; // oldest message id for next batch (before= pagination)
   }
 
   console.log(`\nDone. ${total} total | ${archived} archived | ${memoriesSaved} memories | ${eventsCreated} candidate events | ${llmErrors} LLM errors`);

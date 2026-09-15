@@ -92,6 +92,8 @@ export class EventPipeline {
    * @param memoryStore The MemoryStore instance (to read message context).
    * @param brain     The Brain instance (for LLM calls when heuristic is ambiguous).
    * @param replyToMessageId  Optional: Discord message_id this message replies to.
+   * @returns true if the pipeline made an LLM call (assessContinuity or classifyEvent) —
+   *          used by ingest.ts to pace requests against the rate limit.
    */
   async process(
     message: MessageEvent,
@@ -100,9 +102,9 @@ export class EventPipeline {
     memoryStore: MemoryStore,
     brain: Brain,
     replyToMessageId?: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     const openEvents = eventStore.openEvents(message.guildId, message.channelId);
-    const decision = await this.decideContinuity(message, openEvents, brain, replyToMessageId);
+    const { decision, llmCalled } = await this.decideContinuity(message, openEvents, memoryStore, brain, replyToMessageId);
 
     if (decision.action === "attach") {
       eventStore.attachMessage(decision.eventId, message.messageId);
@@ -112,7 +114,8 @@ export class EventPipeline {
       eventStore.incrementReferenceCount(decision.eventId);
       for (const id of savedMemoryIds) eventStore.attachMemory(decision.eventId, id, "referenced");
       // Re-score the referenced event if its reference count has reached a promotion threshold
-      await this.maybeRetroactivelyPromote(decision.eventId, message.guildId, eventStore, memoryStore, brain);
+      const promoted = await this.maybeRetroactivelyPromote(decision.eventId, message.guildId, eventStore, memoryStore, brain);
+      return llmCalled || promoted;
     } else if (decision.action === "bridge") {
       // Attach to the first event and record the link on the second
       const [primary, ...rest] = decision.eventIds;
@@ -142,6 +145,7 @@ export class EventPipeline {
         for (const id of savedMemoryIds) eventStore.attachMemory(ev.id, id, "generated");
       }
     }
+    return llmCalled;
   }
 
   // ── Continuity decision ───────────────────────────────────────────────────
@@ -149,39 +153,41 @@ export class EventPipeline {
   async decideContinuity(
     message: MessageEvent,
     openEvents: StoredEvent[],
+    memoryStore: MemoryStore,
     brain: Brain,
     replyToMessageId?: string
-  ): Promise<ContinuityDecision> {
-    if (openEvents.length === 0) return { action: "new" };
+  ): Promise<{ decision: ContinuityDecision; llmCalled: boolean }> {
+    if (openEvents.length === 0) return { decision: { action: "new" }, llmCalled: false };
 
     const scores = scoreOpenEvents(message, openEvents, replyToMessageId);
-    if (scores.length === 0) return { action: "new" };
+    if (scores.length === 0) return { decision: { action: "new" }, llmCalled: false };
 
     const top = scores[0];
 
     // Definite attach: reply chain, or heuristic score well above threshold
     if (top.isReplyChain || top.score >= HEURISTIC_ATTACH_THRESHOLD) {
-      return { action: "attach", eventId: top.eventId };
+      return { decision: { action: "attach", eventId: top.eventId }, llmCalled: false };
     }
 
     // Definite discard: nothing scores above the noise floor
-    if (top.score < HEURISTIC_DISCARD_THRESHOLD) return { action: "new" };
+    if (top.score < HEURISTIC_DISCARD_THRESHOLD) return { decision: { action: "new" }, llmCalled: false };
 
-    // Ambiguous: ask the LLM
+    // Ambiguous: ask the LLM. Candidate events have no title/summary until they are
+    // classified at close, so the archived messages are the real signal here.
     const candidates = scores.slice(0, MAX_LLM_CANDIDATES);
     const llmEvents = candidates.map(s => {
       const ev = openEvents.find(e => e.id === s.eventId)!;
-      // We don't have the raw messages here, so we use the title/summary as context.
-      // The message archive is queried via MemoryStore in the full pipeline (index.ts),
-      // but for the Brain call we use what we have on the event object already.
+      const recentMessages = memoryStore
+        .messagesByIds(ev.messageIds.slice(-LLM_CONTEXT_MESSAGES))
+        .map(m => ({ authorName: m.authorName, content: m.content }));
       return {
         id: ev.id,
         title: ev.title || `(untitled event #${ev.id})`,
         summary: ev.summary || `Started at ${ev.occurredAt.toISOString()} with ${ev.participants.map(p => p.userName).join(", ")}`,
-        recentMessages: [] as Array<{ authorName: string; content: string }>,
+        recentMessages,
       };
     });
-    return brain.assessContinuity(message, llmEvents);
+    return { decision: await brain.assessContinuity(message, llmEvents), llmCalled: true };
   }
 
   // ── Retroactive promotion ─────────────────────────────────────────────────
@@ -189,6 +195,7 @@ export class EventPipeline {
   /**
    * Called when a "reference" back-reference is recorded against an event.
    * If the event has accumulated enough references, re-evaluate its significance.
+   * Returns true if a classifyEvent LLM call was made.
    */
   async maybeRetroactivelyPromote(
     eventId: number,
@@ -196,10 +203,10 @@ export class EventPipeline {
     eventStore: EventStore,
     memoryStore: MemoryStore,
     brain: Brain
-  ): Promise<void> {
+  ): Promise<boolean> {
     const ev = eventStore.getEvent(guildId, eventId);
-    if (!ev || ev.tier === "event") return; // already promoted or not found
-    if (ev.referenceCount < 2) return;     // wait for more evidence
+    if (!ev || ev.tier === "event") return false; // already promoted or not found
+    if (ev.referenceCount < 2) return false;      // wait for more evidence
 
     // Re-classify using current cluster data
     const cluster = buildCluster(ev, memoryStore);
@@ -219,6 +226,7 @@ export class EventPipeline {
       eventStore.updateSignificance(eventId, score, "candidate", classification.title, classification.summary);
     }
     // "discard" tier — don't downgrade an event that has accumulated references
+    return true;
   }
 
   // ── Cluster scoring (for nightly maintain() call) ─────────────────────────
@@ -242,6 +250,10 @@ export class EventPipeline {
 
     for (const ev of unscored.events) {
       if (ev.closedAt == null) continue; // still open
+      // significance is only written once a candidate has been classified; a
+      // positive value means this row was already scored in a previous run —
+      // skip it rather than spending another LLM call.
+      if (ev.significance > 0) continue;
       const cluster = buildCluster(ev, memoryStore);
       const classification = await brain.classifyEvent(cluster);
       const { score, tier } = calculateSignificance({
@@ -277,13 +289,11 @@ function buildCluster(
   participants: string[];
   memoryCount: number;
 } {
-  // Read back the raw messages from the message archive where possible.
-  // recentContext returns the last 12 — enough for cluster scoring.
-  const context = memoryStore.recentContext(ev.guildId, ev.channelId, 50)
-    .filter(m => ev.messageIds.includes((m as unknown as { messageId?: string }).messageId ?? ""))
-    .map(m => ({ authorName: m.authorName, content: m.content, createdAt: m.createdAt }));
+  // Read back the raw messages that belong to this event. If the archive has
+  // been purged by retention this returns fewer (or zero) messages — the LLM
+  // classification still runs on whatever remains.
+  const context = memoryStore.messagesByIds(ev.messageIds);
 
-  // Fall back to an empty message list if the raw messages have been purged.
   return {
     messages: context,
     participants: ev.participants.map(p => p.userName),

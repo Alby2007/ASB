@@ -228,7 +228,67 @@ test("pipeline: back-reference message increments event reference_count", async 
   assert.equal(fresh.referenceCount, 1);
 });
 
-// ── 7. Migration v4 ───────────────────────────────────────────────────────────
+test("pipeline: ambiguous continuity sends the event's recent messages to the LLM", async () => {
+  const { store, evStore } = makeStore();
+  const pipeline = new EventPipeline();
+
+  // Open candidate with an archived message attached
+  store.recordMessage(msg("em-1", "Tom just lost £20 on the Arsenal bet"));
+  const ev = evStore.createEvent({ guildId: guild, channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(Date.now() - 60_000), participants: [{ userId: "user2", userName: "Tom", role: "subject" }] });
+  evStore.attachMessage(ev.id, "em-1");
+
+  // Back-reference + keyword overlap lands in the ambiguous band → LLM consulted
+  const seen: Array<Array<{ id: number; recentMessages: Array<{ authorName: string; content: string }> }>> = [];
+  const brain = {
+    assessContinuity: async (_e: MessageEvent, events: Array<{ id: number; recentMessages: Array<{ authorName: string; content: string }> }>) => {
+      seen.push(events);
+      return { action: "reference" as const, eventId: ev.id };
+    },
+    classifyEvent: stubBrain().classifyEvent,
+  } as unknown as Brain;
+
+  const backRef = msg("m2", "remember when Tom lost that Arsenal bet?", "user1", "Alice");
+  await pipeline.process(backRef, [], evStore, store, brain);
+
+  assert.equal(seen.length, 1, "assessContinuity should have been called");
+  const offered = seen[0].find(e => e.id === ev.id);
+  assert.ok(offered, "the open event should be among the LLM candidates");
+  assert.deepEqual(offered.recentMessages.map(m => m.content), ["Tom just lost £20 on the Arsenal bet"]);
+});
+
+// ── 8. Pipeline — classifyEvent receives the event's messages ────────────────
+
+test("pipeline: maintainEvents passes the event's archived messages to classifyEvent", async () => {
+  const { store, evStore } = makeStore();
+  const pipeline = new EventPipeline();
+
+  // Archive two messages and attach them to a candidate event
+  store.recordMessage(msg("em-1", "I can't believe Tom bet £20 on Arsenal"));
+  store.recordMessage(msg("em-2", "he lost it in ten minutes"));
+  const ev = evStore.createEvent({ guildId: guild, channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(Date.now() - 60_000), participants: [] });
+  evStore.attachMessage(ev.id, "em-1");
+  evStore.attachMessage(ev.id, "em-2");
+  evStore.closeEvent(ev.id);
+
+  const capturedClusters: Array<{ messages: Array<{ authorName: string; content: string }> }> = [];
+  const brain = {
+    assessContinuity: async () => ({ action: "new" as const }),
+    classifyEvent: async (cluster: { messages: Array<{ authorName: string; content: string }> }) => {
+      capturedClusters.push(cluster);
+      return { significance: 0.75, tier: "high" as const, tone: "dramatic", narrativeComplete: true, futureRelevant: true, title: "T", summary: "S" };
+    },
+  } as unknown as Brain;
+
+  await pipeline.maintainEvents(guild, evStore, store, brain);
+
+  assert.equal(capturedClusters.length, 1, "classifyEvent should have been called once");
+  assert.deepEqual(capturedClusters[0].messages.map(m => m.content), [
+    "I can't believe Tom bet £20 on Arsenal",
+    "he lost it in ten minutes",
+  ]);
+});
+
+// ── 8. Migration v4 ───────────────────────────────────────────────────────────
 
 test("migration v4 creates events, event_participants, event_messages, event_memories tables", () => {
   const db = new Database(":memory:");

@@ -11,7 +11,9 @@ export class Brain {
     let score = 0.05;
     if (event.mentionsBot) { score += 0.85; reasons.push("direct mention"); }
     if (event.content.endsWith("?")) { score += 0.1; reasons.push("question"); }
-    if (recentBotMessages > 0) { score -= 0.25; reasons.push("bot spoke recently"); }
+    // The recency penalty suppresses unsolicited chatter — it must never suppress
+    // an explicit mention, which is a direct request for a reply.
+    if (recentBotMessages > 0 && !event.mentionsBot) { score -= 0.25; reasons.push("bot spoke recently"); }
     return { shouldSpeak: score >= 0.7, score: Math.max(0, Math.min(1, score)), reasons };
   }
 
