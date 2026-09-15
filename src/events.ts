@@ -144,12 +144,13 @@ export class EventStore {
 
   async createEvent(candidate: Omit<EventCandidate, "messageIds" | "memoryIds">): Promise<StoredEvent> {
     return await this.sql.begin(async sql => {
-      const inserted = await sql`
+      const inserted = await sql<EventRow[]>`
         INSERT INTO events (guild_id, channel_id, title, summary, significance, tier, occurred_at)
         VALUES (${candidate.guildId}, ${candidate.channelId}, ${candidate.title}, ${candidate.summary}, ${candidate.significance}, ${candidate.tier}, ${candidate.occurredAt.toISOString()})
-        RETURNING id
+        RETURNING id, guild_id, channel_id, title, summary, significance, tier, occurred_at, closed_at, reference_count, created_at, updated_at
       `;
-      const eventId = Number(inserted[0].id);
+      const row = inserted[0];
+      const eventId = Number(row.id);
       for (const p of candidate.participants) {
         await sql`
           INSERT INTO event_participants (event_id, user_id, user_name, role)
@@ -157,8 +158,8 @@ export class EventStore {
           ON CONFLICT (event_id, user_id) DO NOTHING
         `;
       }
-      const ev = await this.getEvent(candidate.guildId, eventId);
-      return ev!;
+      // Build the StoredEvent from the RETURNING row + participants (no separate SELECT needed)
+      return rowToStored(row, candidate.participants, [], []);
     }) as StoredEvent;
   }
 

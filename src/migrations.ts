@@ -266,7 +266,7 @@ export async function runMigrations(sql: Sql, targetVersion?: number): Promise<v
         console.log(`Applying migration ${migration.version}: ${migration.name}`);
         await sql.begin(async sql => {
           await migration.up(sql as unknown as Sql);
-          await sql`INSERT INTO schema_migrations (version) VALUES (${migration.version})`;
+          await sql`INSERT INTO schema_migrations (version) VALUES (${migration.version}) ON CONFLICT DO NOTHING`;
         });
       }
     }

@@ -1,3 +1,4 @@
+import "dotenv/config";
 import assert from "node:assert/strict";
 import test from "node:test";
 import postgres from "postgres";
@@ -10,7 +11,7 @@ import { runMigrations, getMigrationVersion } from "./migrations.js";
 function makeTestSql() {
   const url = process.env.TEST_DATABASE_URL;
   if (!url) throw new Error("TEST_DATABASE_URL is required for migration tests");
-  return postgres(url, { max: 3 });
+  return postgres(url, { max: 3, onnotice: () => {} });
 }
 
 /** Drop all project tables so each test starts fresh. */

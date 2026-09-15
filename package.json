@@ -8,7 +8,7 @@
     "start": "tsx src/index.ts",
     "ingest": "tsx src/ingest.ts",
     "check": "tsc --noEmit",
-    "test": "tsx --test src/**/*.test.ts"
+    "test": "tsx --test --test-concurrency=1 src/**/*.test.ts"
   },
   "dependencies": {
     "discord.js": "^14.21.0",

@@ -2,6 +2,7 @@
  * Shared helpers for test files.
  * Requires TEST_DATABASE_URL to point at a Postgres DB used exclusively for tests.
  */
+import "dotenv/config";
 import postgres from "postgres";
 import { MemoryStore } from "./database.js";
 import { EventStore } from "./events.js";
@@ -9,12 +10,14 @@ import { EventStore } from "./events.js";
 export function makeTestSql() {
   const url = process.env.TEST_DATABASE_URL;
   if (!url) throw new Error("TEST_DATABASE_URL is required to run tests");
-  return postgres(url, { max: 3 });
+  // Suppress NOTICE messages (e.g. "relation already exists, skipping") from migration DDL.
+  return postgres(url, { max: 3, onnotice: () => {} });
 }
 
-/** Truncate all data tables while preserving schema — fast reset between tests. */
+/** Truncate all data tables while preserving schema and migration tracking. */
 export async function clearData(sql: ReturnType<typeof postgres>) {
-  // Truncate in reverse-dependency order to avoid FK violations.
+  // Truncate data tables only — schema_migrations is NOT truncated so runMigrations stays idempotent.
+  // Use CASCADE to handle FK constraints; RESTART IDENTITY resets sequences.
   await sql`TRUNCATE TABLE event_memories, event_messages, event_participants, events, behavioral_patterns, memory_history, memory_evidence, server_settings, memories, messages RESTART IDENTITY CASCADE`;
 }
 
