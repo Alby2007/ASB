@@ -39,10 +39,17 @@ async function processMessage(msg: { id: string; author: { id: string; bot: bool
   archived++;
 
   const savedMemoryIds: number[] = [];
+  const replyToId = msg.reference?.messageId ?? undefined;
   if (shouldInspectForMemory(event)) {
     memoryCalls++;
+    // Resolve reply context so the LLM can see what this message is responding to
+    let replyToContent: string | undefined;
+    if (replyToId) {
+      const ref = store.getMessage(replyToId);
+      if (ref) replyToContent = `${ref.authorName}: ${ref.content}`;
+    }
     try {
-      const candidates = await brain.extractMemories(event);
+      const candidates = await brain.extractMemories(event, replyToContent);
       for (const memory of candidates) {
         const saved = store.saveMemory(event, memory, config.candidateConfidenceThreshold);
         savedMemoryIds.push(saved.id);
@@ -56,7 +63,6 @@ async function processMessage(msg: { id: string; author: { id: string; bot: bool
   }
 
   try {
-    const replyToId = msg.reference?.messageId ?? undefined;
     const before = eventStore.listEvents(msg.guild.id, { tier: "candidate" }).total;
     await pipeline.process(event, savedMemoryIds, eventStore, store, brain, replyToId);
     const after = eventStore.listEvents(msg.guild.id, { tier: "candidate" }).total;

@@ -65,6 +65,7 @@ export class MemoryStore {
   }
   setPaused(guildId: string, paused: boolean, defaultRetentionDays = 30) { this.ensureSettings(guildId, defaultRetentionDays); this.db.prepare("UPDATE server_settings SET memory_enabled=?, reply_enabled=? WHERE guild_id=?").run(paused ? 0 : 1, paused ? 0 : 1, guildId); }
   recordMessage(event: MessageEvent) { this.db.prepare("INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)").run(event.messageId, event.guildId, event.channelId, event.authorId, event.authorName, event.content, event.createdAt.toISOString()); }
+  getMessage(messageId: string) { return this.db.prepare("SELECT id, guild_id as guildId, channel_id as channelId, author_id as authorId, author_name as authorName, content, created_at as createdAt FROM messages WHERE id=?").get(messageId) as { id: string; guildId: string; channelId: string; authorId: string; authorName: string; content: string; createdAt: string } | undefined; }
   // Phase 1 authoritative update: the LLM supplies language interpretation only. Confidence,
   // lifecycle, counters, and history are all determined here after an idempotent evidence insert.
   saveMemory(event: MessageEvent, memory: MemoryCandidate, candidateThreshold = .7): Memory {

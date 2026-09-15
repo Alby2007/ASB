@@ -56,9 +56,16 @@ client.on(Events.MessageCreate, async message => {
   const settings = store.settings(event.guildId, config.rawMessageRetentionDays);
   store.recordMessage(event);
   const savedMemoryIds: number[] = [];
+  // Resolve reply context so the LLM knows what the message is responding to
+  const replyToId = message.reference?.messageId ?? undefined;
+  let replyToContent: string | undefined;
+  if (replyToId) {
+    const ref = store.getMessage(replyToId);
+    if (ref) replyToContent = `${ref.authorName}: ${ref.content}`;
+  }
   if (settings.memoryEnabled && shouldInspectForMemory(event)) {
     try {
-      const candidates = await brain.extractMemories(event);
+      const candidates = await brain.extractMemories(event, replyToContent);
       candidates.forEach(memory => {
         const saved = store.saveMemory(event, memory, config.candidateConfidenceThreshold);
         savedMemoryIds.push(saved.id);
@@ -69,7 +76,6 @@ client.on(Events.MessageCreate, async message => {
   // so back-references and reply chains are tracked even for ordinary messages)
   if (settings.memoryEnabled) {
     try {
-      const replyToId = message.reference?.messageId ?? undefined;
       await pipeline.process(event, savedMemoryIds, eventStore, store, brain, replyToId);
     } catch (error) { console.error("Event pipeline failed", error); }
   }
