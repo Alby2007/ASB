@@ -248,7 +248,7 @@ test("migration v4 creates events, event_participants, event_messages, event_mem
     CREATE TABLE IF NOT EXISTS server_settings (guild_id TEXT PRIMARY KEY, memory_enabled INTEGER NOT NULL DEFAULT 1, reply_enabled INTEGER NOT NULL DEFAULT 1, raw_retention_days INTEGER NOT NULL DEFAULT 30);
   `);
   runMigrations(db);
-  assert.equal(getMigrationVersion(db), 4);
+  assert.equal(getMigrationVersion(db), 5);
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
   for (const name of ["events", "event_participants", "event_messages", "event_memories"]) {
     assert.ok(tables.some(t => t.name === name), `Missing table: ${name}`);
@@ -281,7 +281,7 @@ test("migration v4 rollback removes event tables and event_id column data", () =
     CREATE TABLE IF NOT EXISTS server_settings (guild_id TEXT PRIMARY KEY, memory_enabled INTEGER NOT NULL DEFAULT 1, reply_enabled INTEGER NOT NULL DEFAULT 1, raw_retention_days INTEGER NOT NULL DEFAULT 30);
   `);
   runMigrations(db);
-  assert.equal(getMigrationVersion(db), 4);
+  assert.equal(getMigrationVersion(db), 5);
   runMigrations(db, 3);
   assert.equal(getMigrationVersion(db), 3);
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;

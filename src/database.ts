@@ -20,6 +20,8 @@ export type Memory = Omit<MemoryCandidate, "confidence" | "importance" | "explic
   primaryEvidenceType: string;
   // v0.2 — nullable FK to the event this memory was generated from or linked to.
   eventId: number | null;
+  // v0.2 — display name of the subject at the time the memory was created.
+  subjectName: string;
 };
 export type BehavioralPattern = { id: number; guildId: string; subjectId: string; description: string; episodeCount: number; confidence: number; createdAt: string; updatedAt: string; status: string };
 export type MemoryEvidence = { id: number; memoryId: number; messageId: string; authorId: string; quote: string; reason: string; explicitness: number; observedAt: string; evidenceType: string; effect: string; messageContentSnapshot: string; messageTimestamp: string; createdAt: string };
@@ -55,7 +57,7 @@ export class MemoryStore {
     `);
     runMigrations(this.db);
   }
-  private memorySelect() { return "id, guild_id as guildId, subject_id as subjectId, kind, content, confidence, importance, mentions, confirmation_count as confirmationCount, contradiction_count as contradictionCount, created_at as createdAt, updated_at as updatedAt, last_confirmed_at as lastConfirmedAt, last_contradicted_at as lastContradictedAt, status, superseded_by as supersededBy, supersedes_memory_id as supersedesMemoryId, explicitness, reason, net_score as netScore, frozen_confidence as frozenConfidence, pattern_id as patternId, primary_evidence_type as primaryEvidenceType, event_id as eventId"; }
+  private memorySelect() { return "id, guild_id as guildId, subject_id as subjectId, subject_name as subjectName, kind, content, confidence, importance, mentions, confirmation_count as confirmationCount, contradiction_count as contradictionCount, created_at as createdAt, updated_at as updatedAt, last_confirmed_at as lastConfirmedAt, last_contradicted_at as lastContradictedAt, status, superseded_by as supersededBy, supersedes_memory_id as supersedesMemoryId, explicitness, reason, net_score as netScore, frozen_confidence as frozenConfidence, pattern_id as patternId, primary_evidence_type as primaryEvidenceType, event_id as eventId"; }
   private ensureSettings(guildId: string, retentionDays = 30) { this.db.prepare("INSERT OR IGNORE INTO server_settings (guild_id, raw_retention_days) VALUES (?, ?)").run(guildId, retentionDays); }
   settings(guildId: string, defaultRetentionDays = 30) {
     this.ensureSettings(guildId, defaultRetentionDays);
@@ -75,7 +77,7 @@ export class MemoryStore {
         const initialConfidence = calculateInitialConfidence(evidenceType);
         const importance = memory.importance ?? calculateDefaultImportance(memory.kind);
         const explicitness = memory.explicitness ?? calculateDefaultExplicitness(evidenceType);
-        this.db.prepare("INSERT INTO memories (guild_id, subject_id, kind, content, confidence, importance, mentions, confirmation_count, created_at, updated_at, last_confirmed_at, status, explicitness, reason, primary_evidence_type) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'candidate', ?, ?, ?)").run(event.guildId, memory.subjectId, memory.kind, memory.content, initialConfidence, importance, now, now, now, explicitness, memory.reason, evidenceType);
+        this.db.prepare("INSERT INTO memories (guild_id, subject_id, subject_name, kind, content, confidence, importance, mentions, confirmation_count, created_at, updated_at, last_confirmed_at, status, explicitness, reason, primary_evidence_type) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'candidate', ?, ?, ?)").run(event.guildId, memory.subjectId, memory.subjectId === event.authorId ? event.authorName : "", memory.kind, memory.content, initialConfidence, importance, now, now, now, explicitness, memory.reason, evidenceType);
       }
       const saved = this.db.prepare(`SELECT ${this.memorySelect()} FROM memories WHERE guild_id=? AND subject_id=? AND kind=? AND content=?`).get(event.guildId, memory.subjectId, memory.kind, memory.content) as Memory;
       

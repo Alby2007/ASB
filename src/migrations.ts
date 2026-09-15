@@ -181,6 +181,18 @@ const migrations: Migration[] = [
       db.exec("UPDATE memories SET event_id = NULL");
     },
   },
+  {
+    version: 5,
+    name: "v02_memory_subject_name",
+    up: (db: Db) => {
+      // Store a display name alongside subject_id so memories are human-readable
+      // without needing to join through evidence → messages.
+      addColumn(db, "memories", "subject_name TEXT NOT NULL DEFAULT ''");
+    },
+    down: (db: Db) => {
+      db.exec("UPDATE memories SET subject_name = ''");
+    },
+  },
 ];
 
 export function runMigrations(db: Db, targetVersion?: number) {

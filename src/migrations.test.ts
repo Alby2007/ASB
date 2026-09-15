@@ -33,7 +33,7 @@ test("migrations are applied in order", () => {
   setupBaseSchema(db);
   runMigrations(db);
   const version = getMigrationVersion(db);
-  assert.equal(version, 4);
+  assert.equal(version, 5);
 });
 
 test("migrations are idempotent", () => {
@@ -167,7 +167,7 @@ test("rolling back to v1 removes behavioral_patterns table and index", () => {
   const db = new Database(":memory:");
   setupBaseSchema(db);
   runMigrations(db);
-  assert.equal(getMigrationVersion(db), 4);
+  assert.equal(getMigrationVersion(db), 5);
   runMigrations(db, 1);
   assert.equal(getMigrationVersion(db), 1);
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
