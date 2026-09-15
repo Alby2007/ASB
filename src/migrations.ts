@@ -1,236 +1,289 @@
-import type Database from "better-sqlite3";
-
-type Db = Database.Database;
+import type { Sql } from "./db.js";
 
 export interface Migration {
   version: number;
   name: string;
-  up: (db: Db) => void;
-  down: (db: Db) => void;
+  up: (sql: Sql) => Promise<void>;
+  down: (sql: Sql) => Promise<void>;
 }
 
-function hasColumn(db: Db, table: string, column: string) {
-  return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some(item => item.name === column);
+async function hasColumn(sql: Sql, table: string, column: string): Promise<boolean> {
+  const rows = await sql`
+    SELECT column_name FROM information_schema.columns
+    WHERE table_name = ${table} AND column_name = ${column}
+  `;
+  return rows.length > 0;
 }
 
-function addColumn(db: Db, table: string, definition: string) {
+async function addColumn(sql: Sql, table: string, definition: string): Promise<void> {
   const column = definition.trim().split(/\s+/)[0];
-  if (!hasColumn(db, table, column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
+  if (!(await hasColumn(sql, table, column))) {
+    await sql.unsafe(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
+  }
 }
 
 const migrations: Migration[] = [
   {
     version: 1,
     name: "phase_1a_add_evidence_tracking",
-    up: (db: Db) => {
-      addColumn(db, "memories", "confirmation_count INTEGER NOT NULL DEFAULT 0");
-      addColumn(db, "memories", "contradiction_count INTEGER NOT NULL DEFAULT 0");
-      addColumn(db, "memories", "updated_at TEXT NOT NULL DEFAULT ''");
-      addColumn(db, "memories", "last_contradicted_at TEXT");
-      addColumn(db, "memories", "supersedes_memory_id INTEGER");
-      addColumn(db, "memory_evidence", "evidence_type TEXT NOT NULL DEFAULT 'uncertain_inference'");
-      addColumn(db, "memory_evidence", "effect TEXT NOT NULL DEFAULT 'context'");
-      addColumn(db, "memory_evidence", "message_content_snapshot TEXT NOT NULL DEFAULT ''");
-      addColumn(db, "memory_evidence", "message_timestamp TEXT NOT NULL DEFAULT ''");
-      addColumn(db, "memory_evidence", "created_at TEXT NOT NULL DEFAULT ''");
-      db.exec(`
+    up: async (sql) => {
+      await addColumn(sql, "memories", "confirmation_count INTEGER NOT NULL DEFAULT 0");
+      await addColumn(sql, "memories", "contradiction_count INTEGER NOT NULL DEFAULT 0");
+      await addColumn(sql, "memories", "updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()");
+      await addColumn(sql, "memories", "last_contradicted_at TIMESTAMPTZ");
+      await addColumn(sql, "memories", "supersedes_memory_id BIGINT");
+      await addColumn(sql, "memory_evidence", "evidence_type TEXT NOT NULL DEFAULT 'uncertain_inference'");
+      await addColumn(sql, "memory_evidence", "effect TEXT NOT NULL DEFAULT 'context'");
+      await addColumn(sql, "memory_evidence", "message_content_snapshot TEXT NOT NULL DEFAULT ''");
+      await addColumn(sql, "memory_evidence", "message_timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()");
+      await addColumn(sql, "memory_evidence", "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()");
+      await sql`
         CREATE TABLE IF NOT EXISTS memory_history (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, memory_id INTEGER NOT NULL REFERENCES memories(id),
-          action TEXT NOT NULL, previous_confidence REAL, new_confidence REAL,
-          previous_status TEXT, new_status TEXT, evidence_id INTEGER REFERENCES memory_evidence(id),
-          details_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS memory_history_lookup ON memory_history(memory_id, created_at DESC);
-      `);
-      db.exec("UPDATE memories SET confirmation_count=mentions WHERE confirmation_count=0 AND mentions > 0");
-      db.exec("UPDATE memories SET updated_at=last_confirmed_at WHERE updated_at='' ");
-      db.exec("UPDATE memories SET status='quarantined' WHERE status='stale'");
-      db.exec("UPDATE memory_evidence SET message_content_snapshot=quote WHERE message_content_snapshot='' ");
-      db.exec("UPDATE memory_evidence SET message_timestamp=observed_at WHERE message_timestamp='' ");
-      db.exec("UPDATE memory_evidence SET created_at=observed_at WHERE created_at='' ");
+          id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          memory_id        BIGINT NOT NULL REFERENCES memories(id),
+          action           TEXT NOT NULL,
+          previous_confidence DOUBLE PRECISION,
+          new_confidence   DOUBLE PRECISION,
+          previous_status  TEXT,
+          new_status       TEXT,
+          evidence_id      BIGINT REFERENCES memory_evidence(id),
+          details_json     TEXT NOT NULL DEFAULT '{}',
+          created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `;
+      await sql`CREATE INDEX IF NOT EXISTS memory_history_lookup ON memory_history(memory_id, created_at DESC)`;
+      await sql`UPDATE memories SET confirmation_count = mentions WHERE confirmation_count = 0 AND mentions > 0`;
+      await sql`UPDATE memories SET status = 'quarantined' WHERE status = 'stale'`;
     },
-    down: (db: Db) => {
-      db.exec("DROP INDEX IF EXISTS memory_history_lookup");
-      db.exec("DROP TABLE IF EXISTS memory_history");
-      // SQLite has limited DROP COLUMN support, so we set values to defaults instead
-      db.exec("UPDATE memory_evidence SET created_at = '', message_timestamp = '', message_content_snapshot = '', effect = 'context', evidence_type = 'uncertain_inference'");
-      db.exec("UPDATE memories SET supersedes_memory_id = NULL, last_contradicted_at = NULL, updated_at = '', contradiction_count = 0, confirmation_count = 0");
+    down: async (sql) => {
+      await sql`DROP INDEX IF EXISTS memory_history_lookup`;
+      await sql`DROP TABLE IF EXISTS memory_history`;
+      await sql`UPDATE memory_evidence SET message_content_snapshot = '', effect = 'context', evidence_type = 'uncertain_inference'`;
+      await sql`UPDATE memories SET supersedes_memory_id = NULL, last_contradicted_at = NULL, contradiction_count = 0, confirmation_count = 0`;
     },
   },
   {
     version: 2,
     name: "phase_1c_conflict_and_patterns",
-    up: (db: Db) => {
-      // Conflict resolution: persistent net_score and frozen_confidence let the UI and
-      // future analytics inspect the resolution state without recomputing from evidence.
-      addColumn(db, "memories", "net_score REAL");
-      addColumn(db, "memories", "frozen_confidence REAL");
-      // Pattern tracking: a nullable FK linking an episode to its consolidated pattern.
-      addColumn(db, "memories", "pattern_id INTEGER");
-      // Behavioral patterns table: one row per recognised pattern, pointing back to a
-      // representative memory (the highest-confidence active episode in the group).
-      db.exec(`
+    up: async (sql) => {
+      await addColumn(sql, "memories", "net_score DOUBLE PRECISION");
+      await addColumn(sql, "memories", "frozen_confidence DOUBLE PRECISION");
+      await addColumn(sql, "memories", "pattern_id BIGINT");
+      await sql`
         CREATE TABLE IF NOT EXISTS behavioral_patterns (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          guild_id TEXT NOT NULL,
-          subject_id TEXT NOT NULL,
-          description TEXT NOT NULL,
+          id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          guild_id      TEXT NOT NULL,
+          subject_id    TEXT NOT NULL,
+          description   TEXT NOT NULL,
           episode_count INTEGER NOT NULL DEFAULT 0,
-          confidence REAL NOT NULL DEFAULT 0,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL,
-          status TEXT NOT NULL DEFAULT 'active'
-        );
-        CREATE INDEX IF NOT EXISTS patterns_lookup ON behavioral_patterns(guild_id, subject_id, status);
-      `);
+          confidence    DOUBLE PRECISION NOT NULL DEFAULT 0,
+          created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          status        TEXT NOT NULL DEFAULT 'active'
+        )
+      `;
+      await sql`CREATE INDEX IF NOT EXISTS patterns_lookup ON behavioral_patterns(guild_id, subject_id, status)`;
     },
-    down: (db: Db) => {
-      db.exec("DROP INDEX IF EXISTS patterns_lookup");
-      db.exec("DROP TABLE IF EXISTS behavioral_patterns");
-      // SQLite does not support DROP COLUMN reliably; null the added columns instead.
-      db.exec("UPDATE memories SET net_score = NULL, frozen_confidence = NULL, pattern_id = NULL");
+    down: async (sql) => {
+      await sql`DROP INDEX IF EXISTS patterns_lookup`;
+      await sql`DROP TABLE IF EXISTS behavioral_patterns`;
+      await sql`UPDATE memories SET net_score = NULL, frozen_confidence = NULL, pattern_id = NULL`;
     },
   },
   {
     version: 3,
     name: "phase_1c_primary_evidence_type",
-    up: (db: Db) => {
-      // Store the evidence type that first created the memory so that the nightly bulk-promotion
-      // path in maintain() can enforce the same evidence-type gate as the per-insert path.
-      addColumn(db, "memories", "primary_evidence_type TEXT NOT NULL DEFAULT 'uncertain_inference'");
+    up: async (sql) => {
+      await addColumn(sql, "memories", "primary_evidence_type TEXT NOT NULL DEFAULT 'uncertain_inference'");
     },
-    down: (db: Db) => {
-      db.exec("UPDATE memories SET primary_evidence_type = 'uncertain_inference'");
+    down: async (sql) => {
+      await sql`UPDATE memories SET primary_evidence_type = 'uncertain_inference'`;
     },
   },
   {
     version: 4,
     name: "v02_events",
-    up: (db: Db) => {
-      // Link memories to the event that generated or referenced them.
-      addColumn(db, "memories", "event_id INTEGER");
-
-      db.exec(`
-        -- Core event row: one per detected incident.
+    up: async (sql) => {
+      await addColumn(sql, "memories", "event_id BIGINT");
+      await sql`
         CREATE TABLE IF NOT EXISTS events (
-          id              INTEGER PRIMARY KEY AUTOINCREMENT,
-          guild_id        TEXT    NOT NULL,
-          channel_id      TEXT    NOT NULL,
-          title           TEXT    NOT NULL DEFAULT '',
-          summary         TEXT    NOT NULL DEFAULT '',
-          significance    REAL    NOT NULL DEFAULT 0,
-          tier            TEXT    NOT NULL DEFAULT 'candidate',
-          occurred_at     TEXT    NOT NULL,
-          closed_at       TEXT,
+          id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          guild_id        TEXT NOT NULL,
+          channel_id      TEXT NOT NULL,
+          title           TEXT NOT NULL DEFAULT '',
+          summary         TEXT NOT NULL DEFAULT '',
+          significance    DOUBLE PRECISION NOT NULL DEFAULT 0,
+          tier            TEXT NOT NULL DEFAULT 'candidate',
+          occurred_at     TIMESTAMPTZ NOT NULL,
+          closed_at       TIMESTAMPTZ,
           reference_count INTEGER NOT NULL DEFAULT 0,
-          created_at      TEXT    NOT NULL,
-          updated_at      TEXT    NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS events_guild_channel
-          ON events(guild_id, channel_id, occurred_at DESC);
-        CREATE INDEX IF NOT EXISTS events_guild_open
-          ON events(guild_id, tier, closed_at);
-
-        -- Who was involved in an event.
+          created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `;
+      await sql`CREATE INDEX IF NOT EXISTS events_guild_channel ON events(guild_id, channel_id, occurred_at DESC)`;
+      await sql`CREATE INDEX IF NOT EXISTS events_guild_open ON events(guild_id, tier, closed_at)`;
+      await sql`
         CREATE TABLE IF NOT EXISTS event_participants (
-          id        INTEGER PRIMARY KEY AUTOINCREMENT,
-          event_id  INTEGER NOT NULL REFERENCES events(id),
-          user_id   TEXT    NOT NULL,
-          user_name TEXT    NOT NULL,
-          role      TEXT    NOT NULL DEFAULT 'participant',
+          id        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          event_id  BIGINT NOT NULL REFERENCES events(id),
+          user_id   TEXT NOT NULL,
+          user_name TEXT NOT NULL,
+          role      TEXT NOT NULL DEFAULT 'participant',
           UNIQUE(event_id, user_id)
-        );
-        CREATE INDEX IF NOT EXISTS event_participants_event
-          ON event_participants(event_id);
-
-        -- Which Discord messages are part of the event.
+        )
+      `;
+      await sql`CREATE INDEX IF NOT EXISTS event_participants_event ON event_participants(event_id)`;
+      await sql`
         CREATE TABLE IF NOT EXISTS event_messages (
-          id         INTEGER PRIMARY KEY AUTOINCREMENT,
-          event_id   INTEGER NOT NULL REFERENCES events(id),
-          message_id TEXT    NOT NULL,
+          id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          event_id   BIGINT NOT NULL REFERENCES events(id),
+          message_id TEXT NOT NULL,
           UNIQUE(event_id, message_id)
-        );
-        CREATE INDEX IF NOT EXISTS event_messages_event
-          ON event_messages(event_id);
-
-        -- Which memories are linked to the event.
+        )
+      `;
+      await sql`CREATE INDEX IF NOT EXISTS event_messages_event ON event_messages(event_id)`;
+      await sql`
         CREATE TABLE IF NOT EXISTS event_memories (
-          id        INTEGER PRIMARY KEY AUTOINCREMENT,
-          event_id  INTEGER NOT NULL REFERENCES events(id),
-          memory_id INTEGER NOT NULL REFERENCES memories(id),
-          link_type TEXT    NOT NULL DEFAULT 'generated',
+          id        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          event_id  BIGINT NOT NULL REFERENCES events(id),
+          memory_id BIGINT NOT NULL REFERENCES memories(id),
+          link_type TEXT NOT NULL DEFAULT 'generated',
           UNIQUE(event_id, memory_id)
-        );
-        CREATE INDEX IF NOT EXISTS event_memories_memory
-          ON event_memories(memory_id);
-        CREATE INDEX IF NOT EXISTS event_memories_event
-          ON event_memories(event_id);
-      `);
+        )
+      `;
+      await sql`CREATE INDEX IF NOT EXISTS event_memories_memory ON event_memories(memory_id)`;
+      await sql`CREATE INDEX IF NOT EXISTS event_memories_event ON event_memories(event_id)`;
     },
-    down: (db: Db) => {
-      db.exec("DROP INDEX IF EXISTS event_memories_event");
-      db.exec("DROP INDEX IF EXISTS event_memories_memory");
-      db.exec("DROP TABLE IF EXISTS event_memories");
-      db.exec("DROP INDEX IF EXISTS event_messages_event");
-      db.exec("DROP TABLE IF EXISTS event_messages");
-      db.exec("DROP INDEX IF EXISTS event_participants_event");
-      db.exec("DROP TABLE IF EXISTS event_participants");
-      db.exec("DROP INDEX IF EXISTS events_guild_open");
-      db.exec("DROP INDEX IF EXISTS events_guild_channel");
-      db.exec("DROP TABLE IF EXISTS events");
-      db.exec("UPDATE memories SET event_id = NULL");
+    down: async (sql) => {
+      await sql`DROP INDEX IF EXISTS event_memories_event`;
+      await sql`DROP INDEX IF EXISTS event_memories_memory`;
+      await sql`DROP TABLE IF EXISTS event_memories`;
+      await sql`DROP INDEX IF EXISTS event_messages_event`;
+      await sql`DROP TABLE IF EXISTS event_messages`;
+      await sql`DROP INDEX IF EXISTS event_participants_event`;
+      await sql`DROP TABLE IF EXISTS event_participants`;
+      await sql`DROP INDEX IF EXISTS events_guild_open`;
+      await sql`DROP INDEX IF EXISTS events_guild_channel`;
+      await sql`DROP TABLE IF EXISTS events`;
+      await sql`UPDATE memories SET event_id = NULL`;
     },
   },
   {
     version: 5,
     name: "v02_memory_subject_name",
-    up: (db: Db) => {
-      // Store a display name alongside subject_id so memories are human-readable
-      // without needing to join through evidence → messages.
-      addColumn(db, "memories", "subject_name TEXT NOT NULL DEFAULT ''");
+    up: async (sql) => {
+      await addColumn(sql, "memories", "subject_name TEXT NOT NULL DEFAULT ''");
     },
-    down: (db: Db) => {
-      db.exec("UPDATE memories SET subject_name = ''");
+    down: async (sql) => {
+      await sql`UPDATE memories SET subject_name = ''`;
     },
   },
 ];
 
-export function runMigrations(db: Db, targetVersion?: number) {
-  db.exec("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
-  
-  const currentVersion = db.prepare("SELECT MAX(version) as version FROM schema_migrations").get() as { version: number | null };
-  const current = currentVersion.version ?? 0;
-  
+export async function runMigrations(sql: Sql, targetVersion?: number): Promise<void> {
+  // Ensure the base tables exist on a fresh database.
+  await sql`
+    CREATE TABLE IF NOT EXISTS messages (
+      id         TEXT PRIMARY KEY,
+      guild_id   TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      author_id  TEXT NOT NULL,
+      author_name TEXT NOT NULL,
+      content    TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL
+    )
+  `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS memories (
+      id                  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      guild_id            TEXT NOT NULL,
+      subject_id          TEXT NOT NULL,
+      kind                TEXT NOT NULL,
+      content             TEXT NOT NULL,
+      confidence          DOUBLE PRECISION NOT NULL,
+      importance          DOUBLE PRECISION NOT NULL,
+      mentions            INTEGER NOT NULL DEFAULT 1,
+      confirmation_count  INTEGER NOT NULL DEFAULT 0,
+      contradiction_count INTEGER NOT NULL DEFAULT 0,
+      created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_confirmed_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_contradicted_at TIMESTAMPTZ,
+      status              TEXT NOT NULL DEFAULT 'candidate',
+      superseded_by       BIGINT,
+      supersedes_memory_id BIGINT,
+      explicitness        DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+      reason              TEXT NOT NULL DEFAULT '',
+      UNIQUE(guild_id, subject_id, kind, content)
+    )
+  `;
+  await sql`CREATE INDEX IF NOT EXISTS memories_lookup ON memories(guild_id, subject_id, status, importance DESC)`;
+  await sql`CREATE INDEX IF NOT EXISTS messages_context ON messages(guild_id, channel_id, created_at DESC)`;
+  await sql`
+    CREATE TABLE IF NOT EXISTS memory_evidence (
+      id                      BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      memory_id               BIGINT NOT NULL REFERENCES memories(id),
+      message_id              TEXT NOT NULL,
+      author_id               TEXT NOT NULL,
+      quote                   TEXT NOT NULL,
+      reason                  TEXT NOT NULL,
+      explicitness            DOUBLE PRECISION NOT NULL,
+      observed_at             TIMESTAMPTZ NOT NULL,
+      evidence_type           TEXT NOT NULL DEFAULT 'uncertain_inference',
+      effect                  TEXT NOT NULL DEFAULT 'context',
+      message_content_snapshot TEXT NOT NULL DEFAULT '',
+      message_timestamp       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(memory_id, message_id)
+    )
+  `;
+  await sql`CREATE INDEX IF NOT EXISTS evidence_memory ON memory_evidence(memory_id, observed_at DESC)`;
+  await sql`
+    CREATE TABLE IF NOT EXISTS server_settings (
+      guild_id          TEXT PRIMARY KEY,
+      memory_enabled    SMALLINT NOT NULL DEFAULT 1,
+      reply_enabled     SMALLINT NOT NULL DEFAULT 1,
+      raw_retention_days INTEGER NOT NULL DEFAULT 30
+    )
+  `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version    INTEGER PRIMARY KEY,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `;
+
+  const row = await sql<[{ version: number | null }]>`SELECT MAX(version) as version FROM schema_migrations`;
+  const current = row[0].version ?? 0;
   const target = targetVersion ?? Math.max(...migrations.map(m => m.version));
-  
+
   if (current === target) return;
-  
+
   if (target > current) {
     for (const migration of migrations) {
       if (migration.version > current && migration.version <= target) {
         console.log(`Applying migration ${migration.version}: ${migration.name}`);
-        const transaction = db.transaction(() => {
-          migration.up(db);
-          db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(migration.version, new Date().toISOString());
+        await sql.begin(async sql => {
+          await migration.up(sql as unknown as Sql);
+          await sql`INSERT INTO schema_migrations (version) VALUES (${migration.version})`;
         });
-        transaction();
       }
     }
-  } else if (target < current) {
+  } else {
     for (const migration of [...migrations].reverse()) {
       if (migration.version <= current && migration.version > target) {
         console.log(`Rolling back migration ${migration.version}: ${migration.name}`);
-        const transaction = db.transaction(() => {
-          migration.down(db);
-          db.prepare("DELETE FROM schema_migrations WHERE version = ?").run(migration.version);
+        await sql.begin(async sql => {
+          await migration.down(sql as unknown as Sql);
+          await sql`DELETE FROM schema_migrations WHERE version = ${migration.version}`;
         });
-        transaction();
       }
     }
   }
 }
 
-export function getMigrationVersion(db: Db): number {
-  const result = db.prepare("SELECT MAX(version) as version FROM schema_migrations").get() as { version: number | null };
-  return result.version ?? 0;
+export async function getMigrationVersion(sql: Sql): Promise<number> {
+  const rows = await sql<[{ version: number | null }]>`SELECT MAX(version) as version FROM schema_migrations`;
+  return rows[0].version ?? 0;
 }

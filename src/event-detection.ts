@@ -103,16 +103,16 @@ export class EventPipeline {
     brain: Brain,
     replyToMessageId?: string
   ): Promise<boolean> {
-    const openEvents = eventStore.openEvents(message.guildId, message.channelId);
+    const openEvents = await eventStore.openEvents(message.guildId, message.channelId);
     const { decision, llmCalled } = await this.decideContinuity(message, openEvents, memoryStore, brain, replyToMessageId);
 
     if (decision.action === "attach") {
-      eventStore.attachMessage(decision.eventId, message.messageId);
-      eventStore.addParticipant(decision.eventId, message.authorId, message.authorName);
-      for (const id of savedMemoryIds) eventStore.attachMemory(decision.eventId, id, "generated");
+      await eventStore.attachMessage(decision.eventId, message.messageId);
+      await eventStore.addParticipant(decision.eventId, message.authorId, message.authorName);
+      for (const id of savedMemoryIds) await eventStore.attachMemory(decision.eventId, id, "generated");
     } else if (decision.action === "reference") {
-      eventStore.incrementReferenceCount(decision.eventId);
-      for (const id of savedMemoryIds) eventStore.attachMemory(decision.eventId, id, "referenced");
+      await eventStore.incrementReferenceCount(decision.eventId);
+      for (const id of savedMemoryIds) await eventStore.attachMemory(decision.eventId, id, "referenced");
       // Re-score the referenced event if its reference count has reached a promotion threshold
       const promoted = await this.maybeRetroactivelyPromote(decision.eventId, message.guildId, eventStore, memoryStore, brain);
       return llmCalled || promoted;
@@ -120,18 +120,18 @@ export class EventPipeline {
       // Attach to the first event and record the link on the second
       const [primary, ...rest] = decision.eventIds;
       if (primary != null) {
-        eventStore.attachMessage(primary, message.messageId);
-        eventStore.addParticipant(primary, message.authorId, message.authorName);
-        for (const id of savedMemoryIds) eventStore.attachMemory(primary, id, "generated");
+        await eventStore.attachMessage(primary, message.messageId);
+        await eventStore.addParticipant(primary, message.authorId, message.authorName);
+        for (const id of savedMemoryIds) await eventStore.attachMemory(primary, id, "generated");
       }
       for (const bridgedId of rest) {
-        eventStore.incrementReferenceCount(bridgedId);
+        await eventStore.incrementReferenceCount(bridgedId);
       }
     } else {
       // "new" — only create a candidate event window if the message produced at least one memory
       // (ordinary chatter that didn't generate any memories doesn't need an event window).
       if (savedMemoryIds.length > 0) {
-        const ev = eventStore.createEvent({
+        const ev = await eventStore.createEvent({
           guildId: message.guildId,
           channelId: message.channelId,
           title: "",
@@ -141,8 +141,8 @@ export class EventPipeline {
           occurredAt: message.createdAt,
           participants: [{ userId: message.authorId, userName: message.authorName, role: "participant" }],
         });
-        eventStore.attachMessage(ev.id, message.messageId);
-        for (const id of savedMemoryIds) eventStore.attachMemory(ev.id, id, "generated");
+        await eventStore.attachMessage(ev.id, message.messageId);
+        for (const id of savedMemoryIds) await eventStore.attachMemory(ev.id, id, "generated");
       }
     }
     return llmCalled;
@@ -175,10 +175,9 @@ export class EventPipeline {
     // Ambiguous: ask the LLM. Candidate events have no title/summary until they are
     // classified at close, so the archived messages are the real signal here.
     const candidates = scores.slice(0, MAX_LLM_CANDIDATES);
-    const llmEvents = candidates.map(s => {
+    const llmEvents = await Promise.all(candidates.map(async s => {
       const ev = openEvents.find(e => e.id === s.eventId)!;
-      const recentMessages = memoryStore
-        .messagesByIds(ev.messageIds.slice(-LLM_CONTEXT_MESSAGES))
+      const recentMessages = (await memoryStore.messagesByIds(ev.messageIds.slice(-LLM_CONTEXT_MESSAGES)))
         .map(m => ({ authorName: m.authorName, content: m.content }));
       return {
         id: ev.id,
@@ -186,7 +185,7 @@ export class EventPipeline {
         summary: ev.summary || `Started at ${ev.occurredAt.toISOString()} with ${ev.participants.map(p => p.userName).join(", ")}`,
         recentMessages,
       };
-    });
+    }));
     return { decision: await brain.assessContinuity(message, llmEvents), llmCalled: true };
   }
 
@@ -204,12 +203,12 @@ export class EventPipeline {
     memoryStore: MemoryStore,
     brain: Brain
   ): Promise<boolean> {
-    const ev = eventStore.getEvent(guildId, eventId);
+    const ev = await eventStore.getEvent(guildId, eventId);
     if (!ev || ev.tier === "event") return false; // already promoted or not found
     if (ev.referenceCount < 2) return false;      // wait for more evidence
 
     // Re-classify using current cluster data
-    const cluster = buildCluster(ev, memoryStore);
+    const cluster = await buildCluster(ev, memoryStore);
     const classification = await brain.classifyEvent(cluster);
     const { score, tier } = calculateSignificance({
       distinctParticipants: ev.participants.length,
@@ -221,9 +220,9 @@ export class EventPipeline {
     });
 
     if (tier === "event") {
-      eventStore.updateSignificance(eventId, score, "event", classification.title, classification.summary);
+      await eventStore.updateSignificance(eventId, score, "event", classification.title, classification.summary);
     } else if (tier === "candidate" && ev.tier !== "candidate") {
-      eventStore.updateSignificance(eventId, score, "candidate", classification.title, classification.summary);
+      await eventStore.updateSignificance(eventId, score, "candidate", classification.title, classification.summary);
     }
     // "discard" tier — don't downgrade an event that has accumulated references
     return true;
@@ -242,10 +241,10 @@ export class EventPipeline {
     brain: Brain,
     maxAgeMs = 24 * 60 * 60 * 1000
   ): Promise<{ closed: number; promoted: number; discarded: number }> {
-    const closed = eventStore.closeStaleEvents(guildId, maxAgeMs);
+    const closed = await eventStore.closeStaleEvents(guildId, maxAgeMs);
 
     // Score all closed candidate events that have not been given a score yet
-    const unscored = eventStore.listEvents(guildId, { tier: "candidate" });
+    const unscored = await eventStore.listEvents(guildId, { tier: "candidate" });
     let promoted = 0, discarded = 0;
 
     for (const ev of unscored.events) {
@@ -254,7 +253,7 @@ export class EventPipeline {
       // positive value means this row was already scored in a previous run —
       // skip it rather than spending another LLM call.
       if (ev.significance > 0) continue;
-      const cluster = buildCluster(ev, memoryStore);
+      const cluster = await buildCluster(ev, memoryStore);
       const classification = await brain.classifyEvent(cluster);
       const { score, tier } = calculateSignificance({
         distinctParticipants: ev.participants.length,
@@ -265,12 +264,12 @@ export class EventPipeline {
         futureRelevant: classification.futureRelevant,
       });
       if (tier === "event") {
-        eventStore.updateSignificance(ev.id, score, "event", classification.title, classification.summary);
+        await eventStore.updateSignificance(ev.id, score, "event", classification.title, classification.summary);
         promoted++;
       } else if (tier === "discard") {
         // Discard: close the record with significance 0 and leave tier as candidate
         // (we never hard-delete — "discard" just means we don't surface it)
-        eventStore.updateSignificance(ev.id, score, "candidate", ev.title, ev.summary);
+        await eventStore.updateSignificance(ev.id, score, "candidate", ev.title, ev.summary);
         discarded++;
       }
     }
@@ -281,18 +280,18 @@ export class EventPipeline {
 
 // ── Cluster builder helper ────────────────────────────────────────────────────
 
-function buildCluster(
+async function buildCluster(
   ev: StoredEvent,
   memoryStore: MemoryStore
-): {
+): Promise<{
   messages: Array<{ authorName: string; content: string; createdAt: string }>;
   participants: string[];
   memoryCount: number;
-} {
+}> {
   // Read back the raw messages that belong to this event. If the archive has
   // been purged by retention this returns fewer (or zero) messages — the LLM
   // classification still runs on whatever remains.
-  const context = memoryStore.messagesByIds(ev.messageIds);
+  const context = await memoryStore.messagesByIds(ev.messageIds);
 
   return {
     messages: context,

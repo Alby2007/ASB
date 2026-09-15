@@ -9,13 +9,21 @@ import { EventPipeline } from "./event-detection.js";
 import type { MessageEvent } from "./types.js";
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
-const store = new MemoryStore();
-const eventStore = new EventStore(store.db);
 const brain = new Brain(config.groqKey, config.model, config.groqBaseUrl);
 const pipeline = new EventPipeline();
 const botActivity = new Map<string, number>();
 
+// MemoryStore.create() runs migrations; EventStore shares the same sql connection.
+let store: MemoryStore;
+let eventStore: EventStore;
+
+async function init() {
+  store = await MemoryStore.create();
+  eventStore = new EventStore();
+}
+
 client.once(Events.ClientReady, async ready => {
+  await init();
   if (config.guildId) await ready.application.commands.set(commandDefinitions, config.guildId);
   else await ready.application.commands.set(commandDefinitions);
   applyRetention();
@@ -24,9 +32,9 @@ client.once(Events.ClientReady, async ready => {
 
 async function applyRetention() {
   for (const guild of client.guilds.cache.values()) {
-    const settings = store.settings(guild.id, config.rawMessageRetentionDays);
-    const deleted = store.deleteRawMessagesOlderThan(guild.id, settings.rawRetentionDays);
-    store.maintain(guild.id, config.candidateConfidenceThreshold);
+    const settings = await store.settings(guild.id, config.rawMessageRetentionDays);
+    const deleted = await store.deleteRawMessagesOlderThan(guild.id, settings.rawRetentionDays);
+    await store.maintain(guild.id, config.candidateConfidenceThreshold);
     if (deleted) console.log(`Retention deleted ${deleted} raw messages in ${guild.name}`);
     // v0.2: close stale open event windows and score candidate events
     try {
@@ -52,23 +60,23 @@ client.on(Events.MessageCreate, async message => {
     authorId: message.author.id, authorName: message.member?.displayName ?? message.author.username,
     content: message.content, createdAt: message.createdAt, mentionsBot: message.mentions.has(client.user!),
   };
-  const settings = store.settings(event.guildId, config.rawMessageRetentionDays);
-  store.recordMessage(event);
+  const settings = await store.settings(event.guildId, config.rawMessageRetentionDays);
+  await store.recordMessage(event);
   const savedMemoryIds: number[] = [];
   // Resolve reply context so the LLM knows what the message is responding to
   const replyToId = message.reference?.messageId ?? undefined;
   let replyToContent: string | undefined;
   if (replyToId) {
-    const ref = store.getMessage(replyToId);
+    const ref = await store.getMessage(replyToId);
     if (ref) replyToContent = `${ref.authorName}: ${ref.content}`;
   }
   if (settings.memoryEnabled && shouldInspectForMemory(event)) {
     try {
       const candidates = await brain.extractMemories(event, replyToContent);
-      candidates.forEach(memory => {
-        const saved = store.saveMemory(event, memory, config.candidateConfidenceThreshold);
+      for (const memory of candidates) {
+        const saved = await store.saveMemory(event, memory, config.candidateConfidenceThreshold);
         savedMemoryIds.push(saved.id);
-      });
+      }
     } catch (error) { console.error("Memory extraction failed", error); }
   }
   // v0.2: event detection pipeline (runs regardless of whether memories were extracted,
@@ -86,7 +94,7 @@ client.on(Events.MessageCreate, async message => {
   if (!settings.replyEnabled || !decision.shouldSpeak || decision.score < config.speakThreshold) return;
   try {
     await message.channel.sendTyping();
-    const reply = await brain.reply(event, store.recentContext(event.guildId, event.channelId), store.relevantMemories(event.guildId, event.authorId));
+    const reply = await brain.reply(event, await store.recentContext(event.guildId, event.channelId), await store.relevantMemories(event.guildId, event.authorId));
     if (reply) { await message.reply({ content: reply, allowedMentions: { repliedUser: false } }); botActivity.set(key, Date.now()); }
   } catch (error) { console.error("Reply generation failed", error); }
 });

@@ -34,10 +34,11 @@ async function withRetry<T>(fn: () => Promise<T>, retries = 6): Promise<T> {
 }
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
-const store = new MemoryStore();
-const eventStore = new EventStore(store.db);
 const brain = new Brain(config.groqKey, config.model, config.groqBaseUrl);
 const pipeline = new EventPipeline();
+
+let store: MemoryStore;
+let eventStore: EventStore;
 
 let total = 0, archived = 0, memoryCalls = 0, memoriesSaved = 0, eventsCreated = 0, llmErrors = 0;
 
@@ -54,25 +55,25 @@ async function processMessage(msg: { id: string; author: { id: string; bot: bool
     content: msg.content, createdAt: msg.createdAt, mentionsBot: false,
   };
 
-  store.recordMessage(event);
+  await store.recordMessage(event);
   archived++;
 
   const savedMemoryIds: number[] = [];
   const replyToId = msg.reference?.messageId ?? undefined;
   // On re-ingest, skip messages that already produced evidence — avoids re-spending tokens
-  const alreadyProcessed = store.db.prepare("SELECT COUNT(*) as c FROM memory_evidence WHERE message_id = ?").get(msg.id) as { c: number };
-  if (shouldInspectForMemory(event) && alreadyProcessed.c === 0) {
+  const alreadyProcessed = await store.hasEvidence(msg.id);
+  if (shouldInspectForMemory(event) && !alreadyProcessed) {
     memoryCalls++;
     // Resolve reply context so the LLM can see what this message is responding to
     let replyToContent: string | undefined;
     if (replyToId) {
-      const ref = store.getMessage(replyToId);
+      const ref = await store.getMessage(replyToId);
       if (ref) replyToContent = `${ref.authorName}: ${ref.content}`;
     }
     try {
       const candidates = await withRetry(() => brain.extractMemories(event, replyToContent));
       for (const memory of candidates) {
-        const saved = store.saveMemory(event, memory, config.candidateConfidenceThreshold);
+        const saved = await store.saveMemory(event, memory, config.candidateConfidenceThreshold);
         savedMemoryIds.push(saved.id);
         memoriesSaved++;
       }
@@ -84,9 +85,9 @@ async function processMessage(msg: { id: string; author: { id: string; bot: bool
   }
 
   try {
-    const before = eventStore.listEvents(msg.guild.id, { tier: "candidate" }).total;
+    const before = (await eventStore.listEvents(msg.guild.id, { tier: "candidate" })).total;
     const llmUsed = await withRetry(() => pipeline.process(event, savedMemoryIds, eventStore, store, brain, replyToId));
-    const after = eventStore.listEvents(msg.guild.id, { tier: "candidate" }).total;
+    const after = (await eventStore.listEvents(msg.guild.id, { tier: "candidate" })).total;
     if (after > before) eventsCreated++;
     // Only pace when an LLM call was actually made — heuristic-only messages are free
     if (llmUsed) await sleep(EVENT_DELAY_MS);
@@ -96,6 +97,9 @@ async function processMessage(msg: { id: string; author: { id: string; bot: bool
 }
 
 client.once("ready", async () => {
+  store = await MemoryStore.create();
+  eventStore = new EventStore();
+
   const guild = client.guilds.cache.get(config.guildId!);
   if (!guild) { console.error("Guild not found"); process.exit(1); }
 

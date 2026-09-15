@@ -11,14 +11,13 @@
     "test": "tsx --test src/**/*.test.ts"
   },
   "dependencies": {
-    "better-sqlite3": "^12.2.0",
     "discord.js": "^14.21.0",
     "dotenv": "^17.2.1",
     "openai": "^5.12.2",
+    "postgres": "^3.4.5",
     "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.3.0",
     "tsx": "^4.20.4",
     "typescript": "^5.9.2"
