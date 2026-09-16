@@ -102,7 +102,20 @@ export class Brain {
         }, required: ["significance", "tier", "tone", "narrativeComplete", "futureRelevant", "title", "summary"], additionalProperties: false
       } } }
     });
-    return JSON.parse(response.output_text) as { significance: number; tier: "low" | "medium" | "high"; tone: string; narrativeComplete: boolean; futureRelevant: boolean; title: string; summary: string };
+    const raw = JSON.parse(response.output_text) as {
+      significance: number; tier: string; tone: string;
+      narrativeComplete: boolean | string; futureRelevant: boolean | string;
+      title: string; summary: string;
+    };
+    return {
+      significance: raw.significance,
+      tier: raw.tier as "low" | "medium" | "high",
+      tone: raw.tone,
+      narrativeComplete: raw.narrativeComplete === true || raw.narrativeComplete === "true",
+      futureRelevant: raw.futureRelevant === true || raw.futureRelevant === "true",
+      title: raw.title,
+      summary: raw.summary,
+    };
   }
 
   /**

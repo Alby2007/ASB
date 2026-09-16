@@ -254,7 +254,13 @@ export class EventPipeline {
       // skip it rather than spending another LLM call.
       if (ev.significance > 0) continue;
       const cluster = await buildCluster(ev, memoryStore);
-      const classification = await brain.classifyEvent(cluster);
+      let classification;
+      try {
+        classification = await brain.classifyEvent(cluster);
+      } catch (err) {
+        console.error(`  [classifyEvent error] event ${ev.id}:`, (err as Error).message.slice(0, 120));
+        continue;
+      }
       const { score, tier } = calculateSignificance({
         distinctParticipants: ev.participants.length,
         messageCount: ev.messageIds.length,
