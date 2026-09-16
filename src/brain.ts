@@ -105,6 +105,80 @@ export class Brain {
     return JSON.parse(response.output_text) as { significance: number; tier: "low" | "medium" | "high"; tone: string; narrativeComplete: boolean; futureRelevant: boolean; title: string; summary: string };
   }
 
+  /**
+   * Batch memory extraction for ingestion — processes up to 5 messages per LLM call.
+   * Uses Chat Completions (works with llama-4-scout and other non-Responses-API models).
+   * Returns a map of messageId → MemoryCandidate[].
+   */
+  async extractMemoriesBatch(
+    messages: Array<{ event: MessageEvent; replyToContent?: string }>,
+    model: string
+  ): Promise<Map<string, MemoryCandidate[]>> {
+    const numbered = messages.map((m, i) => {
+      const replyCtx = m.replyToContent ? ` [replying to: "${m.replyToContent}"]` : "";
+      return `[${i}] Author ID: ${m.event.authorId} | Author: ${m.event.authorName}${replyCtx}\n${m.event.content}`;
+    }).join("\n\n");
+
+    const schema = {
+      type: "object" as const,
+      properties: {
+        results: {
+          type: "array" as const,
+          items: {
+            type: "object" as const,
+            properties: {
+              index: { type: "number" as const },
+              memories: {
+                type: "array" as const,
+                items: {
+                  type: "object" as const,
+                  properties: {
+                    subjectId: { type: "string" as const },
+                    kind: { type: "string" as const, enum: ["person_fact", "person_preference", "server_lore", "episode"] },
+                    content: { type: "string" as const },
+                    reason: { type: "string" as const },
+                    evidenceType: { type: "string" as const, enum: ["explicit_fact", "clear_preference", "direct_observation", "reported_by_other", "sarcasm_or_joke", "uncertain_inference", "correction"] },
+                    effect: { type: "string" as const, enum: ["support", "contradict", "correct", "context"] },
+                  },
+                  required: ["subjectId", "kind", "content", "reason", "evidenceType", "effect"],
+                  additionalProperties: false,
+                },
+              },
+            },
+            required: ["index", "memories"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["results"],
+      additionalProperties: false,
+    };
+
+    const response = await this.client.chat.completions.create({
+      model,
+      messages: [{
+        role: "user",
+        content: `Extract only durable, useful memories from each of the following Discord messages. For each message, return its index and any memories found (empty array if none). Do not infer sensitive traits, diagnoses, private information, or insults. A single casual message rarely merits memory.\n\nsubjectId rules: use the Author ID when the memory is about the author. For third-party mentions use their Discord ID from <@ID> syntax. Otherwise use "unknown". Never use descriptive slugs.\n\nMessages:\n\n${numbered}`,
+      }],
+      response_format: { type: "json_schema", json_schema: { name: "batch_memories", strict: true, schema } },
+    });
+
+    const raw = JSON.parse(response.choices[0].message.content ?? "{}") as {
+      results: Array<{ index: number; memories: MemoryCandidate[] }>;
+    };
+
+    const out = new Map<string, MemoryCandidate[]>();
+    for (const r of raw.results) {
+      const m = messages[r.index];
+      if (m) out.set(m.event.messageId, r.memories);
+    }
+    // Ensure every message has an entry, even if LLM omitted it
+    for (const m of messages) {
+      if (!out.has(m.event.messageId)) out.set(m.event.messageId, []);
+    }
+    return out;
+  }
+
   async reply(event: MessageEvent, context: Array<{ authorName: string; content: string }>, memories: Memory[]): Promise<string> {
     const response = await this.client.responses.create({
       model: this.model,

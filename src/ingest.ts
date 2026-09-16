@@ -10,9 +10,13 @@ import type { MessageEvent } from "./types.js";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const CHANNEL_NAME = process.env.INGEST_CHANNEL ?? "general-chat";
-const BATCH_SIZE = 100;            // Discord API max per fetch
-const LLM_DELAY_MS = 8000;         // ~7.5 RPM — well under Groq's token limit
-const EVENT_DELAY_MS = 8000;       // Same — pipeline can trigger assessContinuity LLM calls
+const DISCORD_BATCH_SIZE = 100;     // Discord API max per fetch
+const LLM_BATCH_SIZE = 5;           // Messages per LLM call (batched extraction)
+// llama-4-scout has 30K TPM — 3.75x headroom vs gpt-oss-20b. At ~1500 tokens per 5-msg batch we
+// can safely fire a call every 3s without hitting the per-minute token ceiling.
+const BATCH_MODEL = process.env.INGEST_MODEL ?? "meta-llama/llama-4-scout-17b-16e-instruct";
+const BATCH_DELAY_MS = 3000;        // Delay between batch LLM calls
+const EVENT_DELAY_MS = 3000;        // Pipeline LLM calls get the same pacing
 
 async function withRetry<T>(fn: () => Promise<T>, retries = 6): Promise<T> {
   for (let i = 0; i < retries; i++) {
@@ -40,59 +44,54 @@ const pipeline = new EventPipeline();
 let store: MemoryStore;
 let eventStore: EventStore;
 
-let total = 0, archived = 0, memoryCalls = 0, memoriesSaved = 0, eventsCreated = 0, llmErrors = 0;
+let total = 0, archived = 0, batchCalls = 0, memoriesSaved = 0, eventsCreated = 0, llmErrors = 0;
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
-async function processMessage(msg: { id: string; author: { id: string; bot: boolean; username: string; displayName?: string }; member?: { displayName?: string } | null; content: string; createdAt: Date; reference?: { messageId?: string | null } | null; channel: { id: string }; guild: { id: string } }) {
-  if (msg.author.bot || !msg.content.trim()) return;
-  total++;
+type RawMsg = { id: string; author: { id: string; bot: boolean; username: string; displayName?: string }; member?: { displayName?: string } | null; content: string; createdAt: Date; reference?: { messageId?: string | null } | null; channel: { id: string }; guild: { id: string } };
 
-  const event: MessageEvent = {
+function toEvent(msg: RawMsg): MessageEvent {
+  return {
     guildId: msg.guild.id, channelId: msg.channel.id, messageId: msg.id,
     authorId: msg.author.id,
     authorName: msg.member?.displayName ?? msg.author.username,
     content: msg.content, createdAt: msg.createdAt, mentionsBot: false,
   };
+}
 
-  await store.recordMessage(event);
-  archived++;
+/** Archive all messages and return those that need memory extraction (passed pre-filter, not already processed). */
+async function archiveAndFilter(msgs: RawMsg[]): Promise<Array<{ event: MessageEvent; replyToId?: string; replyToContent?: string }>> {
+  const toExtract: Array<{ event: MessageEvent; replyToId?: string; replyToContent?: string }> = [];
+  for (const msg of msgs) {
+    if (msg.author.bot || !msg.content.trim()) continue;
+    total++;
+    const event = toEvent(msg);
+    await store.recordMessage(event);
+    archived++;
 
-  const savedMemoryIds: number[] = [];
-  const replyToId = msg.reference?.messageId ?? undefined;
-  // On re-ingest, skip messages that already produced evidence — avoids re-spending tokens
-  const alreadyProcessed = await store.hasEvidence(msg.id);
-  if (shouldInspectForMemory(event) && !alreadyProcessed) {
-    memoryCalls++;
-    // Resolve reply context so the LLM can see what this message is responding to
-    let replyToContent: string | undefined;
-    if (replyToId) {
-      const ref = await store.getMessage(replyToId);
-      if (ref) replyToContent = `${ref.authorName}: ${ref.content}`;
-    }
-    try {
-      const candidates = await withRetry(() => brain.extractMemories(event, replyToContent));
-      for (const memory of candidates) {
-        const saved = await store.saveMemory(event, memory, config.candidateConfidenceThreshold);
-        savedMemoryIds.push(saved.id);
-        memoriesSaved++;
+    const replyToId = msg.reference?.messageId ?? undefined;
+    if (shouldInspectForMemory(event) && !(await store.hasEvidence(msg.id))) {
+      let replyToContent: string | undefined;
+      if (replyToId) {
+        const ref = await store.getMessage(replyToId);
+        if (ref) replyToContent = `${ref.authorName}: ${ref.content}`;
       }
-    } catch (err) {
-      llmErrors++;
-      console.error(`  [memory extraction error] msg ${msg.id}:`, (err as Error).message.slice(0, 100));
+      toExtract.push({ event, replyToId, replyToContent });
     }
-    await sleep(LLM_DELAY_MS);
   }
+  return toExtract;
+}
 
+/** Run event pipeline (no memory IDs yet — memories are saved in batch step). */
+async function runEventPipeline(event: MessageEvent, savedMemoryIds: number[], replyToId?: string): Promise<void> {
   try {
-    const before = (await eventStore.listEvents(msg.guild.id, { tier: "candidate" })).total;
+    const before = (await eventStore.listEvents(event.guildId, { tier: "candidate" })).total;
     const llmUsed = await withRetry(() => pipeline.process(event, savedMemoryIds, eventStore, store, brain, replyToId));
-    const after = (await eventStore.listEvents(msg.guild.id, { tier: "candidate" })).total;
+    const after = (await eventStore.listEvents(event.guildId, { tier: "candidate" })).total;
     if (after > before) eventsCreated++;
-    // Only pace when an LLM call was actually made — heuristic-only messages are free
     if (llmUsed) await sleep(EVENT_DELAY_MS);
   } catch (err) {
-    console.error(`  [event pipeline error] msg ${msg.id}:`, (err as Error).message.slice(0, 100));
+    console.error(`  [event pipeline error] msg ${event.messageId}:`, (err as Error).message.slice(0, 100));
   }
 }
 
@@ -115,7 +114,7 @@ client.once("ready", async () => {
   let lastId: string | undefined;
 
   while (true) {
-    const options: { limit: number; before?: string } = { limit: BATCH_SIZE };
+    const options: { limit: number; before?: string } = { limit: DISCORD_BATCH_SIZE };
     if (lastId) options.before = lastId;
 
     let batch;
@@ -130,21 +129,62 @@ client.once("ready", async () => {
     if (batch.size === 0) break;
     backlog.push(...batch.values());
     const oldest = batch.reduce((min, m) => (m.createdTimestamp < min.createdTimestamp ? m : min));
-    lastId = oldest.id; // before= paginates backwards from the oldest message seen
+    lastId = oldest.id;
     console.log(`  fetched ${backlog.length} messages...`);
   }
 
   backlog.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-  console.log(`Ingesting ${backlog.length} messages (oldest→newest)...`);
+  console.log(`Ingesting ${backlog.length} messages oldest→newest (batch model: ${BATCH_MODEL})...`);
 
-  for (const msg of backlog) {
-    await processMessage(msg as Parameters<typeof processMessage>[0]);
-    if (total % 100 === 0) {
-      console.log(`  ${total} messages processed | ${archived} archived | ${memoriesSaved} memories | ${eventsCreated} events | ${llmErrors} errors`);
+  // ── Step 1: archive all messages + collect those that need extraction ────────
+  const toExtract = await archiveAndFilter(backlog as Parameters<typeof archiveAndFilter>[0]);
+  console.log(`  archived ${archived} | ${toExtract.length} messages need memory extraction`);
+
+  // ── Step 2: batch extraction — LLM_BATCH_SIZE messages per call ─────────────
+  // Map messageId → saved memory IDs so the event pipeline can link them
+  const savedIdsByMessage = new Map<string, number[]>();
+
+  for (let i = 0; i < toExtract.length; i += LLM_BATCH_SIZE) {
+    const batch = toExtract.slice(i, i + LLM_BATCH_SIZE);
+    batchCalls++;
+    try {
+      const results = await withRetry(() => brain.extractMemoriesBatch(batch, BATCH_MODEL));
+      for (const item of batch) {
+        const candidates = results.get(item.event.messageId) ?? [];
+        const ids: number[] = [];
+        for (const memory of candidates) {
+          const saved = await store.saveMemory(item.event, memory, config.candidateConfidenceThreshold);
+          ids.push(saved.id);
+          memoriesSaved++;
+        }
+        savedIdsByMessage.set(item.event.messageId, ids);
+      }
+    } catch (err) {
+      llmErrors++;
+      console.error(`  [batch extraction error] batch ${batchCalls}:`, (err as Error).message.slice(0, 120));
+      for (const item of batch) savedIdsByMessage.set(item.event.messageId, []);
+    }
+    const done = Math.min(i + LLM_BATCH_SIZE, toExtract.length);
+    console.log(`  extraction ${done}/${toExtract.length} | ${memoriesSaved} memories | ${llmErrors} errors`);
+    await sleep(BATCH_DELAY_MS);
+  }
+
+  // ── Step 3: event pipeline — run in chronological order across all messages ──
+  console.log("Running event pipeline...");
+  let pipelineCount = 0;
+  for (const msg of backlog as Parameters<typeof archiveAndFilter>[0]) {
+    if (msg.author.bot || !msg.content.trim()) continue;
+    const event = toEvent(msg);
+    const savedMemoryIds = savedIdsByMessage.get(event.messageId) ?? [];
+    const replyToId = msg.reference?.messageId ?? undefined;
+    await runEventPipeline(event, savedMemoryIds, replyToId);
+    pipelineCount++;
+    if (pipelineCount % 100 === 0) {
+      console.log(`  pipeline ${pipelineCount}/${total} | ${eventsCreated} events`);
     }
   }
 
-  console.log(`\nDone. ${total} total | ${archived} archived | ${memoriesSaved} memories | ${eventsCreated} candidate events | ${llmErrors} LLM errors`);
+  console.log(`\nDone. ${total} total | ${archived} archived | ${batchCalls} batch calls | ${memoriesSaved} memories | ${eventsCreated} candidate events | ${llmErrors} LLM errors`);
 
   // Run event maintenance to close open windows and score candidates
   console.log("Running event maintenance...");
