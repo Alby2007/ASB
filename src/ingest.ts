@@ -12,9 +12,9 @@ import type { MessageEvent } from "./types.js";
 const CHANNEL_NAME = process.env.INGEST_CHANNEL ?? "general-chat";
 const DISCORD_BATCH_SIZE = 100;     // Discord API max per fetch
 const LLM_BATCH_SIZE = 5;           // Messages per LLM call (batched extraction)
-// llama-4-scout has 30K TPM — 3.75x headroom vs gpt-oss-20b. At ~1500 tokens per 5-msg batch we
-// can safely fire a call every 3s without hitting the per-minute token ceiling.
-const BATCH_MODEL = process.env.INGEST_MODEL ?? "meta-llama/llama-4-scout-17b-16e-instruct";
+// qwen3.8-27b gets 60 RPM on Groq free tier — 2x the rate limit of gpt-oss-20b.
+// Combined with 5-msg batching this gives ~10x effective throughput vs single-message calls.
+const BATCH_MODEL = process.env.INGEST_MODEL ?? "qwen/qwen3.8-27b";
 const BATCH_DELAY_MS = 3000;        // Delay between batch LLM calls
 const EVENT_DELAY_MS = 3000;        // Pipeline LLM calls get the same pacing
 
