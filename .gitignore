@@ -4,3 +4,4 @@ data/
 *.sqlite
 *.sqlite-journal
 .devin/config.local.json
+*.key
