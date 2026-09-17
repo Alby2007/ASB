@@ -156,3 +156,113 @@ test("replayed message after a fuzzy match stays idempotent", async () => {
     assert.equal((await store.evidence("test-guild", first.id)).length, 2);
   } finally { await sql.end(); }
 });
+
+// ── Semantic dedup (LLM maintenance pass) ────────────────────────────────────
+
+test("mergeDuplicate moves evidence, supersedes the dup, and keeps canonical status", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    // Lexically disjoint content so the trigram fast-path leaves both rows.
+    const canon = await store.saveMemory(ev("I'm allergic to peanuts", "m1"), candidate("User is allergic to peanuts", { kind: "person_fact", evidenceType: "explicit_fact" }));
+    const dup = await store.saveMemory(ev("I can't eat nuts", "m2"), candidate("User can't eat nuts", { kind: "person_fact", evidenceType: "explicit_fact" }));
+    assert.notEqual(canon.id, dup.id);
+    assert.equal(canon.status, "candidate");
+
+    assert.equal(await store.mergeDuplicate("test-guild", canon.id, dup.id, "same allergy"), true);
+    const canonAfter = (await store.getMemory("test-guild", canon.id))!;
+    const dupAfter = (await store.getMemory("test-guild", dup.id))!;
+    // Merging is not promotion — a candidate canonical stays candidate
+    assert.equal(canonAfter.status, "candidate");
+    assert.equal(canonAfter.confirmationCount, 2);
+    assert.equal(dupAfter.status, "superseded");
+    assert.equal(dupAfter.supersededBy, canon.id);
+    assert.equal((await store.evidence("test-guild", canon.id)).length, 2);
+    const actions = (await store.history("test-guild", dup.id)).map(h => h.action);
+    assert.ok(actions.includes("dedup_merged"));
+    // Idempotent — the dup is no longer live
+    assert.equal(await store.mergeDuplicate("test-guild", canon.id, dup.id, "again"), false);
+  } finally { await sql.end(); }
+});
+
+test("mergeDuplicate drops colliding evidence instead of violating the unique key", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    // Same source message m1 is evidence for both rows → collision on merge.
+    const a = await store.saveMemory(ev("peanuts", "m1"), candidate("User is allergic to peanuts", { kind: "person_fact", evidenceType: "explicit_fact" }));
+    const b = await store.saveMemory(ev("peanuts", "m1"), candidate("User can't eat nuts", { kind: "person_fact", evidenceType: "explicit_fact" }));
+    assert.notEqual(a.id, b.id);
+    assert.equal(await store.mergeDuplicate("test-guild", a.id, b.id, "same allergy"), true);
+    assert.equal((await store.evidence("test-guild", a.id)).length, 1);
+    assert.equal((await store.evidence("test-guild", b.id)).length, 0);
+  } finally { await sql.end(); }
+});
+
+test("applyDedupGroups merges valid groups and rejects invalid ones", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const save = (content: string, overrides: Partial<MemoryCandidate> = {}) =>
+      store.saveMemory(ev(content, `m-${Math.random()}`), candidate(content, { kind: "person_fact", evidenceType: "explicit_fact", ...overrides }));
+
+    // Valid: same subject+kind, one active — active wins as canonical
+    const active = await save("User is allergic to peanuts");
+    await store.confirm("test-guild", active.id);
+    const dup = await save("User can't eat nuts");
+    const r1 = await store.applyDedupGroups("test-guild", [{ ids: [active.id, dup.id], reason: "same allergy" }]);
+    assert.equal(r1.merged, 1);
+    assert.equal((await store.getMemory("test-guild", dup.id))?.supersededBy, active.id);
+
+    // Cross-subject group → skipped
+    const s2a = await save("User likes tea", { subjectId: "other-user" });
+    const s2b = await save("User likes herbal tea");
+    const r2 = await store.applyDedupGroups("test-guild", [{ ids: [s2a.id, s2b.id], reason: "cross-subject" }]);
+    assert.equal(r2.merged, 0);
+    assert.equal(r2.skipped, 1);
+
+    // Cross-kind group → skipped
+    const k2 = await save("User likes cats", { kind: "person_preference" });
+    const r3 = await store.applyDedupGroups("test-guild", [{ ids: [s2b.id, k2.id], reason: "cross-kind" }]);
+    assert.equal(r3.merged, 0);
+    assert.equal(r3.skipped, 1);
+
+    // Singleton → skipped; dead-status member poisons the whole group → skipped
+    const dead = await save("User likes dogs");
+    await store.forget("test-guild", dead.id);
+    const live = await save("User likes puppies");
+    const r4 = await store.applyDedupGroups("test-guild", [
+      { ids: [live.id], reason: "singleton" },
+      { ids: [dead.id, live.id], reason: "mixed status" },
+    ]);
+    assert.equal(r4.merged, 0);
+    assert.equal(r4.skipped, 2);
+    assert.equal((await store.getMemory("test-guild", live.id))?.status, "candidate");
+  } finally { await sql.end(); }
+});
+
+test("listDedupCandidates returns only resolved subjects with live non-episode rows", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    await store.saveMemory(ev("a1", "m1"), candidate("User is allergic to peanuts", { kind: "person_fact", evidenceType: "explicit_fact" }));
+    await store.saveMemory(ev("a2", "m2"), candidate("User can't eat nuts", { kind: "person_fact", evidenceType: "explicit_fact" }));
+    // unknown subject — excluded even with two rows
+    await store.saveMemory(ev("b1", "m3"), candidate("Sage likes pizza", { subjectId: "unknown", subjectName: "Sage" }));
+    await store.saveMemory(ev("b2", "m4"), candidate("Sage loves pizza", { subjectId: "unknown", subjectName: "Sage" }));
+    // episodes — excluded
+    await store.saveMemory(ev("c1", "m5"), candidate("User went for a run", { kind: "episode" }));
+    await store.saveMemory(ev("c2", "m6"), candidate("User went for a jog", { kind: "episode" }));
+    // solo member — excluded
+    await store.saveMemory(ev("d1", "m7"), candidate("User has a cat", { subjectId: "solo-user", kind: "person_fact", evidenceType: "explicit_fact" }));
+    // forgotten — excluded
+    const f = await store.saveMemory(ev("e1", "m8"), candidate("User likes dogs", { kind: "person_fact", evidenceType: "explicit_fact" }));
+    await store.forget("test-guild", f.id);
+
+    const members = await store.listDedupCandidates("test-guild");
+    assert.equal(members.length, 1);
+    assert.equal(members[0].subjectId, "test-user");
+    const contents = members[0].memories.map(m => m.content).sort();
+    assert.deepEqual(contents, ["User can't eat nuts", "User is allergic to peanuts"].sort());
+  } finally { await sql.end(); }
+});

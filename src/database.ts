@@ -733,7 +733,7 @@ export class MemoryStore {
       //  - contested/superseded/forgotten targets: a forgotten memory must not be
       //    resurrected by a near-duplicate.
       let trigramMatch: { id: number; score: number; content: string } | null = null;
-      let nearMiss: { id: number; score: number } | null = null;
+      let nearMiss: { id: number; score: number; content: string } | null = null;
       if (!existing[0] && effect !== "correct" && memory.kind !== "episode" && memory.subjectId !== "unknown" && PROMOTABLE_EVIDENCE_TYPES.includes(evidenceType)) {
         const simRows = await sql<Array<{ id: number; sim: number; content: string }>>`
           SELECT id, similarity(content, ${memory.content}) AS sim, content
@@ -788,7 +788,7 @@ export class MemoryStore {
         await this._logHistory(sql, saved.id, "dedup_matched", saved.confidence, applied.confidence, saved.status, applied.status, null, { similarity: trigramMatch.score, incomingContent: memory.content, effect, appliedEffect: effectiveEffect });
       }
       if (nearMiss) {
-        await this._logHistory(sql, saved.id, "dedup_near_miss", null, null, null, null, null, { similarity: nearMiss.score, existingMemoryId: nearMiss.id });
+        await this._logHistory(sql, saved.id, "dedup_near_miss", null, null, null, null, null, { similarity: nearMiss.score, existingMemoryId: nearMiss.id, incomingContent: memory.content, existingContent: nearMiss.content });
       }
       return applied ?? saved;
     }) as Memory;
@@ -1045,6 +1045,116 @@ export class MemoryStore {
     await this.sql`UPDATE memories SET supersedes_memory_id = ${oldId}, status = 'active', updated_at = NOW() WHERE guild_id = ${guildId} AND id = ${replacementId}`;
     await this.logHistory(oldId, "superseded", old.confidence, old.confidence, old.status, "superseded", null, { replacementId });
     await this.logHistory(replacementId, "correction_activated", replacement.confidence, replacement.confidence, replacement.status, "active", null, { supersedesMemoryId: oldId });
+  }
+
+  // ── Semantic dedup ─────────────────────────────────────────────────────────
+  // The trigram fast-path in saveMemory() catches lexically-similar rephrasings;
+  // the maintenance pass below catches semantic duplicates with no trigram
+  // overlap ("allergic to peanuts" / "can't eat nuts") by handing each member's
+  // memory list to the LLM. The LLM proposes groups; applyDedupGroups() enforces
+  // the guards and merges. Same-subject merges only — unresolved names could be
+  // different people, and 'episode' rows accumulate by design.
+
+  /** Per-member memory lists for the dedup LLM pass: live rows on resolved
+   * subjects only, grouped by subject. Bounded per member and per run. */
+  async listDedupCandidates(guildId: string, maxMembers = 50, maxPerMember = 30): Promise<Array<{
+    subjectId: string; label: string; memories: Array<{ memoryId: number; kind: string; status: string; content: string }>;
+  }>> {
+    const rows = await this.sql<Array<{ id: number | string; subject_id: string; kind: string; status: string; content: string }>>`
+      SELECT id, subject_id, kind, status, content FROM memories
+      WHERE guild_id = ${guildId}
+        AND status IN ('candidate', 'active')
+        AND kind != 'episode'
+        AND subject_id != 'unknown'
+      ORDER BY subject_id, id
+    `;
+    const bySubject = new Map<string, Array<{ id: number | string; subject_id: string; kind: string; status: string; content: string }>>();
+    for (const r of rows) {
+      const list = bySubject.get(r.subject_id) ?? [];
+      list.push(r);
+      bySubject.set(r.subject_id, list);
+    }
+    const members = [...bySubject.entries()]
+      .filter(([, list]) => list.length >= 2)          // nothing to dedup solo
+      .sort((a, b) => b[1].length - a[1].length)
+      .slice(0, maxMembers);
+    return await Promise.all(members.map(async ([subjectId, list]) => ({
+      subjectId,
+      label: await this.displayNameFor(guildId, subjectId),
+      memories: list.slice(0, maxPerMember).map(r => ({ memoryId: Number(r.id), kind: r.kind, status: r.status, content: r.content })),
+    })));
+  }
+
+  /** Merge a duplicate memory into its canonical row: the dup's evidence moves
+   * over (rows colliding on message_id drop — one copy suffices), counters are
+   * recounted from evidence, and the dup becomes 'superseded' with a link back.
+   * Canonical status/confidence are untouched — a merge must not launder
+   * promotion. Idempotent: a dup no longer candidate/active is a no-op. */
+  async mergeDuplicate(guildId: string, canonicalId: number, dupId: number, reason = ""): Promise<boolean> {
+    if (canonicalId === dupId) return false;
+    return await this.sql.begin(async sql => {
+      const rows = await sql<Array<{ id: number | string; status: string }>>`
+        SELECT id, status FROM memories WHERE guild_id = ${guildId} AND id IN (${canonicalId}, ${dupId})
+      `;
+      const canon = rows.find(r => Number(r.id) === canonicalId);
+      const dup = rows.find(r => Number(r.id) === dupId);
+      if (!canon || !dup) return false;
+      if (canon.status !== "candidate" && canon.status !== "active") return false;
+      if (dup.status !== "candidate" && dup.status !== "active") return false;
+
+      await sql`
+        UPDATE memory_evidence ev SET memory_id = ${canonicalId}
+        WHERE ev.memory_id = ${dupId}
+          AND NOT EXISTS (SELECT 1 FROM memory_evidence e WHERE e.memory_id = ${canonicalId} AND e.message_id = ev.message_id)
+      `;
+      await sql`DELETE FROM memory_evidence WHERE memory_id = ${dupId}`;
+      await sql`
+        UPDATE memories SET
+          confirmation_count = (SELECT COUNT(*)::int FROM memory_evidence WHERE memory_id = ${canonicalId} AND effect = 'support'),
+          mentions           = (SELECT COUNT(*)::int FROM memory_evidence WHERE memory_id = ${canonicalId} AND effect = 'support'),
+          contradiction_count = (SELECT COUNT(*)::int FROM memory_evidence WHERE memory_id = ${canonicalId} AND effect = 'contradict'),
+          updated_at = NOW()
+        WHERE id = ${canonicalId}
+      `;
+      await sql`UPDATE memories SET status = 'superseded', superseded_by = ${canonicalId}, updated_at = NOW() WHERE id = ${dupId}`;
+      await this._logHistory(sql, canonicalId, "dedup_merged", null, null, null, null, null, { mergedMemoryId: dupId, reason });
+      await this._logHistory(sql, dupId, "dedup_merged", null, null, dup.status, "superseded", null, { mergedInto: canonicalId, reason });
+      return true;
+    });
+  }
+
+  /** Apply LLM-proposed duplicate groups with guards: every id must share the
+   * same (subject_id, kind) and be candidate/active; singletons and
+   * cross-member/kind groups are dropped. Canonical = active over candidate,
+   * then higher confidence, then lowest id. Returns merge/skip counts. */
+  async applyDedupGroups(guildId: string, groups: Array<{ ids: number[]; reason: string }>, maxMerges = 30): Promise<{ merged: number; skipped: number }> {
+    let merged = 0, skipped = 0;
+    for (const g of groups) {
+      if (merged >= maxMerges) break;
+      const ids = [...new Set(g.ids)];
+      if (ids.length < 2) { skipped++; continue; }
+      const rows = await this.sql<Array<{ id: number | string; subject_id: string; kind: string; status: string; confidence: number }>>`
+        SELECT id, subject_id, kind, status, confidence FROM memories
+        WHERE guild_id = ${guildId} AND id IN ${this.sql(ids)}
+      `;
+      const live = rows.filter(r => (r.status === "candidate" || r.status === "active") && r.kind !== "episode" && r.subject_id !== "unknown");
+      if (live.length !== ids.length || new Set(live.map(r => r.subject_id)).size !== 1 || new Set(live.map(r => r.kind)).size !== 1) {
+        skipped++;
+        continue;
+      }
+      live.sort((a, b) =>
+        (b.status === "active" ? 1 : 0) - (a.status === "active" ? 1 : 0)
+        || b.confidence - a.confidence
+        || Number(a.id) - Number(b.id)
+      );
+      const canonicalId = Number(live[0].id);
+      for (const dup of live.slice(1)) {
+        if (merged >= maxMerges) break;
+        if (await this.mergeDuplicate(guildId, canonicalId, Number(dup.id), g.reason)) merged++;
+        else skipped++;
+      }
+    }
+    return { merged, skipped };
   }
 
   async resolveContested(guildId: string, memoryId: number, now = new Date()): Promise<{ resolved: boolean; netScore: number }> {

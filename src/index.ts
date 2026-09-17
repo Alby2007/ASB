@@ -105,6 +105,36 @@ async function applyRetention() {
       const edgeCount = await store.recomputeEdges(guild.id);
       if (unverified.length) console.log(`Verified ${judged} relationship observations in ${guild.name}; recomputed ${edgeCount} edges`);
     } catch (error) { console.error("Relationship verification failed", error); }
+    // Semantic dedup — the LLM scans each member's memory list for rephrased
+    // duplicates the trigram fast-path can't see ("allergic to peanuts" /
+    // "can't eat nuts"). It proposes groups; applyDedupGroups enforces
+    // same-subject/kind, live-status guards and merges into a canonical row.
+    try {
+      const members = await store.listDedupCandidates(guild.id);
+      if (members.length) {
+        let index = 0;
+        const idByIndex = new Map<number, number>();
+        const indexed = members.map(m => ({
+          label: m.label,
+          memories: m.memories.map(mm => { const i = index++; idByIndex.set(i, mm.memoryId); return { index: i, kind: mm.kind, status: mm.status, content: mm.content }; }),
+        }));
+        const groups = await brain.dedupMemoriesBatch(indexed, process.env.VERIFY_MODEL ?? process.env.PROFILE_MODEL ?? config.model);
+        const dupGroups = groups.filter(g => g.relation === "duplicate")
+          .map(g => ({ ids: g.indices.map(i => idByIndex.get(i)).filter((x): x is number => x !== undefined), reason: g.reason }));
+        const { merged, skipped } = await store.applyDedupGroups(guild.id, dupGroups);
+        let contradictions = 0;
+        for (const g of groups) {
+          if (g.relation !== "contradicts") continue;
+          const ids = g.indices.map(i => idByIndex.get(i)).filter((x): x is number => x !== undefined);
+          for (const id of ids) {
+            await store.logHistory(id, "dedup_contradiction", null, null, null, null, null, { otherIds: ids.filter(x => x !== id), reason: g.reason });
+          }
+          contradictions++;
+        }
+        if (merged || skipped || contradictions) console.log(`Dedup in ${guild.name}: ${merged} merged | ${skipped} groups skipped | ${contradictions} contradictions logged`);
+        inc("dedup.merged", merged);
+      }
+    } catch (error) { console.error("Dedup pass failed", error); inc("dedup.errors"); }
     // v0.3: rebuild per-chatter profile cards + dossiers (LLM calls only when inputs changed)
     try {
       const profiles = await profileStore.buildProfiles(guild.id, brain, store, eventStore, process.env.PROFILE_MODEL);

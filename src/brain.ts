@@ -449,6 +449,46 @@ export class Brain {
   }
 
   /**
+   * Semantic dedup: given each member's memory list, identify groups that are the
+   * same claim rephrased (lexically disjoint pairs like "allergic to peanuts" /
+   * "can't eat nuts" are exactly what the trigram fast-path can't see) and pairs
+   * that contradict. Returns index groups — the caller maps indices back to
+   * memoryIds and applies guards before merging.
+   */
+  async dedupMemoriesBatch(
+    members: Array<{ label: string; memories: Array<{ index: number; kind: string; status: string; content: string }> }>,
+    model: string
+  ): Promise<Array<{ indices: number[]; relation: "duplicate" | "contradicts"; reason: string }>> {
+    const sections = members.map(m =>
+      `${m.label}:\n${m.memories.map(mm => `  [${mm.index}] (${mm.kind}, ${mm.status}) ${mm.content}`).join("\n")}`
+    ).join("\n");
+
+    const response = await this.client.chat.completions.create({
+      model,
+      messages: [{
+        role: "user",
+        content: `Each section lists stored memory claims about one person. Find claims within a section that should be reconciled:\n- "duplicate": the same fact/preference/trait expressed with different wording or detail level — one claim, stored twice (e.g. "allergic to peanuts" vs "can't eat nuts", "love cold weather" vs "I love cold weather"). Group ALL duplicates together.\n- "contradicts": two claims that cannot both be currently true about the same thing (e.g. "has gallstones" vs "gallbladder removed").\nDo NOT group claims that merely share a topic — different facts about receipts are different claims. Only flag pairs within the same person's section. If nothing is duplicated or contradictory, return an empty results array.\n\nSections:\n${sections}`,
+      }],
+      response_format: { type: "json_schema", json_schema: { name: "dedup", strict: true, schema: {
+        type: "object", properties: {
+          results: { type: "array", items: { type: "object", properties: {
+            indices: { type: "array", items: { type: "number" } },
+            relation: { type: "string", enum: ["duplicate", "contradicts"] },
+            reason: { type: "string" },
+          }, required: ["indices", "relation", "reason"], additionalProperties: false } },
+        }, required: ["results"], additionalProperties: false,
+      } } },
+    });
+
+    const raw = JSON.parse(response.choices[0].message.content ?? "{}") as {
+      results?: Array<{ indices?: number[]; relation?: string; reason?: string }>;
+    };
+    return (raw.results ?? [])
+      .filter(r => Array.isArray(r.indices) && (r.relation === "duplicate" || r.relation === "contradicts"))
+      .map(r => ({ indices: r.indices!.map(i => Number(i)).filter(i => Number.isFinite(i)), relation: r.relation as "duplicate" | "contradicts", reason: r.reason ?? "" }));
+  }
+
+  /**
    * Contest detection: a message addressed at the bot may deny or confirm one of
    * the author's own memories ("I never said that" / "Correction: I did say X").
    * Returns the memory relations found — caller applies them as evidence.

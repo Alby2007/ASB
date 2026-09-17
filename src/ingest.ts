@@ -336,6 +336,37 @@ client.once("ready", async () => {
     console.error("Edge recompute failed:", (err as Error).message.slice(0, 120));
   }
 
+  // Semantic dedup — LLM finds rephrased duplicates across each member's memory
+  // list; applyDedupGroups merges confirmed groups into a canonical row.
+  try {
+    const members = await store.listDedupCandidates(guild.id);
+    if (members.length) {
+      let index = 0;
+      const idByIndex = new Map<number, number>();
+      const indexed = members.map(m => ({
+        label: m.label,
+        memories: m.memories.map(mm => { const i = index++; idByIndex.set(i, mm.memoryId); return { index: i, kind: mm.kind, status: mm.status, content: mm.content }; }),
+      }));
+      const groups = await withRetry(() => brain.dedupMemoriesBatch(indexed, process.env.VERIFY_MODEL ?? BATCH_MODEL));
+      const dupGroups = groups.filter(g => g.relation === "duplicate")
+        .map(g => ({ ids: g.indices.map(i => idByIndex.get(i)).filter((x): x is number => x !== undefined), reason: g.reason }));
+      const { merged, skipped } = await store.applyDedupGroups(guild.id, dupGroups);
+      let contradictions = 0;
+      for (const g of groups) {
+        if (g.relation !== "contradicts") continue;
+        const ids = g.indices.map(i => idByIndex.get(i)).filter((x): x is number => x !== undefined);
+        for (const id of ids) {
+          await store.logHistory(id, "dedup_contradiction", null, null, null, null, null, { otherIds: ids.filter(x => x !== id), reason: g.reason });
+        }
+        contradictions++;
+      }
+      console.log(`Dedup: ${merged} merged | ${skipped} groups skipped | ${contradictions} contradictions logged`);
+    }
+  } catch (err) {
+    llmErrors++;
+    console.error("Dedup pass failed:", (err as Error).message.slice(0, 120));
+  }
+
   // Build per-chatter profile cards (bounded: one LLM call per changed member)
   console.log("Building member profiles...");
   try {

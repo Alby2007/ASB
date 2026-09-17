@@ -64,6 +64,8 @@ One row per curated fact, preference, episode, or piece of server lore. The core
 
 **Indexes:** `memories_lookup (guild_id, subject_id, status, importance DESC)`; `memories_content_trgm` — GIN trigram index (v11) powering the near-duplicate fallback in `saveMemory()`: when the exact key misses, the best `similarity(content)` row in the same `(guild_id, subject_id, kind)` scope is reinforced instead. Matches and near-misses are audited in `memory_history` as `dedup_matched` / `dedup_near_miss`.
 
+**Semantic dedup:** the trigram path only catches lexically similar rephrasings. A nightly maintenance pass (`applyRetention`, also at end of ingest) hands each member's memory list to `Brain.dedupMemoriesBatch`, which returns `duplicate` groups and `contradicts` pairs. Confirmed duplicate groups merge via `applyDedupGroups`/`mergeDuplicate`: evidence moves to a deterministic canonical row (active > candidate, then confidence, then lowest id), the losers become `superseded` with `superseded_by` pointing at the canonical — never deleted. Canonical status/confidence are untouched (merging cannot promote). Guards drop groups that mix subjects, kinds, or non-live statuses; `episode` kind and `unknown` subjects are never offered. `contradicts` verdicts only log `dedup_contradiction` history rows — no status change.
+
 #### Memory lifecycle statuses
 
 | Status | Meaning |
@@ -72,7 +74,7 @@ One row per curated fact, preference, episode, or piece of server lore. The core
 | `active` | Confirmed and surfaced in replies |
 | `contested` | Contradicting evidence received; confidence frozen; `net_score` drives resolution |
 | `quarantined` | Old candidate (>7 days) or old low-confidence active (>90 days, confidence <0.75) |
-| `superseded` | Replaced by a correction; linked to replacement via `superseded_by` |
+| `superseded` | Replaced by a correction **or** merged as a duplicate; linked to the surviving row via `superseded_by` |
 | `forgotten` | Manually forgotten via `/forget`; never used in replies |
 
 ---
@@ -111,7 +113,7 @@ Append-only audit trail of every lifecycle transition.
 |--------|------|-------|
 | `id` | INTEGER PK | Auto-increment |
 | `memory_id` | INTEGER | FK → `memories.id` |
-| `action` | TEXT | e.g. `support`, `promote`, `contradict`, `conflict_resolved`, `superseded`, `correction_activated` |
+| `action` | TEXT | e.g. `support`, `promote`, `contradict`, `conflict_resolved`, `superseded`, `correction_activated`, `dedup_matched`, `dedup_near_miss`, `dedup_merged`, `dedup_contradiction` |
 | `previous_confidence` | REAL | Confidence before the action |
 | `new_confidence` | REAL | Confidence after the action |
 | `previous_status` | TEXT | Status before the action |
