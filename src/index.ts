@@ -171,7 +171,7 @@ async function sweepMissedSignals(windowMs: number) {
         mentionsBot: m.content.includes(`<@${client.user!.id}>`) || m.content.includes(`<@!${client.user!.id}>`),
       });
       const marks: Array<{ id: string; result: string }> = [];
-      const queue: Array<{ event: MessageEvent; replyToId?: string; replyToContent?: string }> = [];
+      const queue: Array<{ event: MessageEvent; replyToId?: string; replyToContent?: string; note?: string }> = [];
       const triageQueue: typeof pending = [];
       for (const m of pending) {
         const event = toEvent(m);
@@ -206,6 +206,7 @@ async function sweepMissedSignals(windowMs: number) {
       if (!queue.length) continue;
       const members = await store.listMembers(guild.id);
       const optedOut = new Set(members.filter(m => m.optedOut).map(m => m.userId));
+      const memberNames = new Map(members.map(m => [m.userId, m.knownNames]));
       const aliases = await buildAliasMap(guild.id, store);
       for (let i = 0; i < queue.length; i += SWEEP_EXTRACT_BATCH) {
         const batch = queue.slice(i, i + SWEEP_EXTRACT_BATCH);
@@ -213,6 +214,20 @@ async function sweepMissedSignals(windowMs: number) {
           if (item.replyToId) {
             const ref = await store.getMessage(item.replyToId);
             if (ref) item.replyToContent = `${ref.authorName}: ${ref.content}`;
+          }
+          // Alias learning must not be live-path-only: naming requests archived
+          // while the bot was down (or on an older build) reach the sweep only
+          // through this queue. Mirror the live order — explicit request first.
+          const authorNames = memberNames.get(item.event.authorId) ?? [item.event.authorName];
+          const requested = detectNamingRequest(item.event.content, authorNames);
+          const named = requested ?? detectSelfNaming(item.event.content, authorNames);
+          if (named) {
+            await store.learnAlias(guild.id, item.event.authorId, named, requested ? "naming_request" : "self_naming", item.event.messageId);
+            memberNames.set(item.event.authorId, [...authorNames, named]);
+            aliases.set(named.toLowerCase(), item.event.authorId);
+            item.note = requested
+              ? `the author asked to be called "${requested}" — treat it as their preferred name`
+              : `the author may be naming themselves "${named}" (a previously unknown alias) or quoting/describing "${named}" — attribute accordingly`;
           }
         }
         try {

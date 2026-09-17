@@ -5,7 +5,7 @@ import { config } from "./config.js";
 import { MemoryStore } from "./database.js";
 import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
-import { detectSelfNaming, shouldInspectForMemory } from "./perception.js";
+import { detectNamingRequest, detectSelfNaming, shouldInspectForMemory } from "./perception.js";
 import { runContestCheck } from "./contest.js";
 import { ProfileStore } from "./profiles.js";
 import { buildAliasMap, resolveSubject } from "./entity-resolution.js";
@@ -207,10 +207,16 @@ client.once("ready", async () => {
     const batch = toExtract.slice(i, i + LLM_BATCH_SIZE);
     batchCalls++;
     for (const item of batch) {
-      const named = detectSelfNaming(item.event.content, memberNames.get(item.event.authorId) ?? [item.event.authorName]);
+      const authorNames = memberNames.get(item.event.authorId) ?? [item.event.authorName];
+      const requested = detectNamingRequest(item.event.content, authorNames);
+      const named = requested ?? detectSelfNaming(item.event.content, authorNames);
       if (named) {
-        await store.learnAlias(item.event.guildId, item.event.authorId, named, "self_naming", item.event.messageId);
-        item.note = `the author may be naming themselves "${named}" (a previously unknown alias) or quoting/describing "${named}" — attribute accordingly`;
+        await store.learnAlias(item.event.guildId, item.event.authorId, named, requested ? "naming_request" : "self_naming", item.event.messageId);
+        memberNames.set(item.event.authorId, [...authorNames, named]);
+        aliasMap.set(named.toLowerCase(), item.event.authorId);
+        item.note = requested
+          ? `the author asked to be called "${requested}" — treat it as their preferred name`
+          : `the author may be naming themselves "${named}" (a previously unknown alias) or quoting/describing "${named}" — attribute accordingly`;
       }
     }
     try {
