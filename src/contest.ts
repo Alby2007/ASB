@@ -1,6 +1,7 @@
 import type { Brain } from "./brain.js";
 import type { MemoryStore } from "./database.js";
 import { botMemoryCue, contestCue } from "./perception.js";
+import { inc } from "./metrics.js";
 import type { MessageEvent } from "./types.js";
 
 // ── Contest detection ─────────────────────────────────────────────────────────
@@ -29,6 +30,7 @@ export async function runContestCheck(
   if (!contestCue(event.content)) {
     const hasContestable = (await store.contestableMemories(event.guildId, event.authorId)).length > 0;
     if (hasContestable) {
+      inc("contest.cue_miss");
       console.warn(`[contest] cue miss with contestable memories — guild ${event.guildId} author ${event.authorId}: "${event.content.slice(0, 200)}"`);
     }
     return { contests: 0, confirms: 0 };
@@ -61,7 +63,7 @@ export async function runContestCheck(
       }
       continue;
     }
-    if (rel.relation === "contests") contests++; else confirms++;
+    if (rel.relation === "contests") { contests++; inc("contest.contested"); } else { confirms++; inc("contest.confirmed"); }
     if (updated.status !== "contested") continue;
     const r = await store.resolveContested(event.guildId, rel.memoryId);
     // Subject adjudication: when net_score can't settle it but the person the

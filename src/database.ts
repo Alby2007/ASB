@@ -172,17 +172,26 @@ export class MemoryStore {
     `;
   }
 
+  // settings() runs on every message, so it's cached per guild; setPaused is the
+  // only writer and invalidates. The TTL bounds staleness from out-of-band edits.
+  private settingsCache = new Map<string, { value: { guildId: string; memoryEnabled: number; replyEnabled: number; rawRetentionDays: number }; at: number }>();
+
   async settings(guildId: string, defaultRetentionDays = 30): Promise<{ guildId: string; memoryEnabled: number; replyEnabled: number; rawRetentionDays: number }> {
+    const cached = this.settingsCache.get(guildId);
+    if (cached && Date.now() - cached.at < 60_000) return cached.value;
     await this.ensureSettings(guildId, defaultRetentionDays);
     const rows = await this.sql<SettingsRow[]>`SELECT guild_id, memory_enabled, reply_enabled, raw_retention_days FROM server_settings WHERE guild_id = ${guildId}`;
     const r = rows[0];
-    return { guildId: r.guild_id, memoryEnabled: Number(r.memory_enabled), replyEnabled: Number(r.reply_enabled), rawRetentionDays: Number(r.raw_retention_days) };
+    const value = { guildId: r.guild_id, memoryEnabled: Number(r.memory_enabled), replyEnabled: Number(r.reply_enabled), rawRetentionDays: Number(r.raw_retention_days) };
+    this.settingsCache.set(guildId, { value, at: Date.now() });
+    return value;
   }
 
   async setPaused(guildId: string, paused: boolean, defaultRetentionDays = 30): Promise<void> {
     await this.ensureSettings(guildId, defaultRetentionDays);
     const v = paused ? 0 : 1;
     await this.sql`UPDATE server_settings SET memory_enabled = ${v}, reply_enabled = ${v} WHERE guild_id = ${guildId}`;
+    this.settingsCache.delete(guildId);
   }
 
   // ── Messages ───────────────────────────────────────────────────────────────

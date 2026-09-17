@@ -234,6 +234,8 @@ client.once("ready", async () => {
           if (optedOut.has(subjectId) || optedOut.has(otherId)) continue;
           if (subjectId === "unknown" && rel.subjectName) await store.logUnresolvedName(item.event.guildId, rel.subjectName, item.event.messageId);
           if (otherId === "unknown" && rel.otherName) await store.logUnresolvedName(item.event.guildId, rel.otherName, item.event.messageId);
+          // Don't record edges to "unknown" — they'd smear whoever later claims that slot.
+          if (subjectId === "unknown" || otherId === "unknown") continue;
           if (await store.recordRelationship(item.event.guildId, subjectId, otherId, item.event.messageId, rel.nature, rel.valence, rel.reason ?? "")) {
             relationshipsRecorded++;
           }

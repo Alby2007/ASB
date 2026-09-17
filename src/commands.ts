@@ -3,6 +3,7 @@ import type { Brain } from "./brain.js";
 import type { Memory, MemoryStore } from "./database.js";
 import type { EventStore } from "./events.js";
 import { ProfileStore } from "./profiles.js";
+import { metricsSnapshot } from "./metrics.js";
 import type { MessageEvent } from "./types.js";
 
 export const commandDefinitions = [
@@ -20,6 +21,7 @@ export const commandDefinitions = [
   { name: "memory-pause", description: "Admin: immediately pause observing and replying", default_member_permissions: PermissionFlagsBits.ManageGuild.toString() },
   { name: "memory-resume", description: "Admin: resume observing and replying", default_member_permissions: PermissionFlagsBits.ManageGuild.toString() },
   { name: "memory-settings", description: "Admin: view memory and retention settings", default_member_permissions: PermissionFlagsBits.ManageGuild.toString() },
+  { name: "status", description: "Admin: bot uptime and operational counters", default_member_permissions: PermissionFlagsBits.ManageGuild.toString() },
   { name: "event", description: "Inspect the event linked to one of your memories", options: [
     { name: "memory_id", description: "A memory number returned by /memory", type: 4, required: true }
   ] },
@@ -112,6 +114,14 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     const paused = interaction.commandName === "memory-pause";
     await store.setPaused(guildId, paused);
     return interaction.reply({ content: paused ? "Memory collection and bot replies are now paused for this server." : "Memory collection and bot replies are now enabled for this server.", ephemeral: true });
+  }
+  if (interaction.commandName === "status") {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content: "Only server administrators can view bot status.", ephemeral: true });
+    const { uptimeSec, counts } = metricsSnapshot();
+    const value = await store.stats(guildId);
+    const uptime = `${Math.floor(uptimeSec / 3600)}h ${Math.floor((uptimeSec % 3600) / 60)}m ${uptimeSec % 60}s`;
+    const counterLines = Object.entries(counts).map(([k, v]) => `**${k}:** ${v.toLocaleString()}`).join("\n") || "No events recorded yet.";
+    return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setTitle("Bot status").setDescription(`**Uptime:** ${uptime}\n\n${counterLines}\n\n*${value.messages.toLocaleString()} raw messages · ${value.memories.toLocaleString()} active memories · ${value.lore.toLocaleString()} lore*`)] });
   }
   if (interaction.commandName === "memory-settings") {
     if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content: "Only server administrators can view settings.", ephemeral: true });

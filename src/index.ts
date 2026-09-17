@@ -10,6 +10,7 @@ import { EventPipeline } from "./event-detection.js";
 import { ProfileStore } from "./profiles.js";
 import { buildAliasMap, findMentionedUsers, resolveSubject, type AliasMap } from "./entity-resolution.js";
 import { withRetry } from "./retry.js";
+import { inc } from "./metrics.js";
 import type { MessageEvent } from "./types.js";
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
@@ -111,6 +112,7 @@ client.on(Events.InteractionCreate, async interaction => {
     if (interaction.isChatInputCommand()) await handleMemoryCommand(interaction, store, brain, eventStore);
     if (interaction.isButton()) await handleMemoryButton(interaction, store);
   } catch (error) {
+    inc("handler.interaction_error");
     console.error("Interaction handling failed", error);
     // Best-effort user-facing error; ignore failures (already replied/expired).
     try {
@@ -124,8 +126,24 @@ client.on(Events.InteractionCreate, async interaction => {
 client.on(Events.MessageCreate, message => {
   // Outer catch lives here, not inline: an unhandled rejection in a listener
   // crashes the process, so every failure mode lands in this log instead.
-  handleMessage(message).catch(error => console.error("Message handling failed", error));
+  handleMessage(message).catch(error => { inc("handler.message_error"); console.error("Message handling failed", error); });
 });
+
+// Alias maps are shared per guild rather than built per message — the same map
+// object also feeds the compiled-regex cache in entity-resolution, so caching it
+// means the alternation pattern compiles once per rebuild, not per message.
+// learnAlias invalidates immediately; display-name drift via upsertMember is
+// bounded by the TTL.
+const aliasMapCache = new Map<string, { map: AliasMap; at: number }>();
+const ALIAS_MAP_TTL_MS = 5 * 60_000;
+
+async function guildAliasMap(guildId: string): Promise<AliasMap> {
+  const cached = aliasMapCache.get(guildId);
+  if (cached && Date.now() - cached.at < ALIAS_MAP_TTL_MS) return cached.map;
+  const map = await buildAliasMap(guildId, store);
+  aliasMapCache.set(guildId, { map, at: Date.now() });
+  return map;
+}
 
 async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   if (!message.guild || message.author.bot || !message.content.trim()) return;
@@ -148,7 +166,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   }
   // The alias map is built lazily on first use so ordinary chatter costs no extra queries.
   let aliasMap: Promise<AliasMap> | undefined;
-  const getAliasMap = () => (aliasMap ??= buildAliasMap(event.guildId, store));
+  const getAliasMap = () => (aliasMap ??= guildAliasMap(event.guildId));
   if (settings.memoryEnabled && shouldInspectForMemory(event)) {
     try {
       // Flag pasted/echoed self-naming ("I am Sage, a dragon lover…") so the
@@ -157,7 +175,10 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
       const named = detectSelfNaming(event.content, member?.knownNames ?? [event.authorName]);
       // Self-naming with an unknown name is the bot's alias-learning signal:
       // "I am Sage" posted by tinyriot teaches sage → tinyriot.
-      if (named) await store.learnAlias(event.guildId, event.authorId, named, "self_naming", event.messageId);
+      if (named) {
+        await store.learnAlias(event.guildId, event.authorId, named, "self_naming", event.messageId);
+        aliasMapCache.delete(event.guildId); // so this message resolves the new alias
+      }
       const note = named ? `the author may be naming themselves "${named}" (a previously unknown alias) or quoting/describing "${named}" — attribute accordingly` : undefined;
       const { memories: candidates, relationships } = await withRetry(() => brain.extractMemories(event, replyToContent, note), 3);
       const aliases = (candidates.length || relationships.length) ? await getAliasMap() : new Map<string, string>();
@@ -181,6 +202,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
         }
         const saved = await store.saveMemory(event, memory, config.candidateConfidenceThreshold);
         savedMemoryIds.push(saved.id);
+        inc("memory.saved");
       }
       for (const rel of relationships) {
         const subjectId = rel.subjectName ? resolveSubject({ subjectName: rel.subjectName }, aliases, event) : event.authorId;
@@ -188,22 +210,25 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
         if (await isOptedOut(subjectId) || await isOptedOut(otherId)) continue;
         if (subjectId === "unknown" && rel.subjectName) await store.logUnresolvedName(event.guildId, rel.subjectName, event.messageId);
         if (otherId === "unknown" && rel.otherName) await store.logUnresolvedName(event.guildId, rel.otherName, event.messageId);
+        // Edges to "unknown" would smear whoever later claims that slot — the
+        // name is already logged for resolution, so just don't record the edge.
+        if (subjectId === "unknown" || otherId === "unknown") continue;
         await store.recordRelationship(event.guildId, subjectId, otherId, event.messageId, rel.nature, rel.valence, rel.reason ?? "");
       }
-    } catch (error) { console.error("Memory extraction failed", error); }
+    } catch (error) { inc("llm.extract_error"); console.error("Memory extraction failed", error); }
   }
   // Contest detection: bot-addressed denials/corrections update the memories they target
   if (settings.memoryEnabled) {
     try {
       await runContestCheck(event, brain, store, client.user!.id, process.env.CONTEST_MODEL ?? process.env.VERIFY_MODEL ?? process.env.INGEST_MODEL ?? config.model);
-    } catch (error) { console.error("Contest check failed", error); }
+    } catch (error) { inc("contest.error"); console.error("Contest check failed", error); }
   }
   // v0.2: event detection pipeline (runs regardless of whether memories were extracted,
   // so back-references and reply chains are tracked even for ordinary messages)
   if (settings.memoryEnabled) {
     try {
       await pipeline.process(event, savedMemoryIds, eventStore, store, brain, replyToId);
-    } catch (error) { console.error("Event pipeline failed", error); }
+    } catch (error) { inc("pipeline.error"); console.error("Event pipeline failed", error); }
   }
 
   const key = `${event.guildId}:${event.channelId}`;
@@ -223,8 +248,8 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     const profiles = (await profileStore.getProfiles(event.guildId, [...peopleIds]))
       .map(p => ({ name: p.displayName, summary: p.summary, traits: p.facets.traits }));
     const reply = await brain.reply(event, await store.recentContext(event.guildId, event.channelId), await store.relevantMemories(event.guildId, event.authorId), profiles, process.env.REPLY_MODEL, process.env.REPLY_TOOLS === "1" && toolCues(event.content));
-    if (reply) { await message.reply({ content: reply, allowedMentions: { repliedUser: false } }); botActivity.set(key, Date.now()); }
-  } catch (error) { console.error("Reply generation failed", error); }
+    if (reply) { await message.reply({ content: reply, allowedMentions: { repliedUser: false } }); botActivity.set(key, Date.now()); inc("reply.sent"); }
+  } catch (error) { inc("llm.reply_error"); console.error("Reply generation failed", error); }
 }
 
 client.login(config.discordToken);
