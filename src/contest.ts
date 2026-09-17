@@ -21,7 +21,18 @@ export async function runContestCheck(
     || event.content.includes(`<@${botUserId}>`)
     || event.content.includes(`<@!${botUserId}>`)
     || botMemoryCue(event.content);
-  if (!addressesBot || !contestCue(event.content)) return { contests: 0, confirms: 0 };
+  if (!addressesBot) return { contests: 0, confirms: 0 };
+  // Cue miss on a bot-addressed message: only worth logging when the author has
+  // contestable memories — otherwise every ordinary bot-directed reply would log
+  // as a "near miss" and the signal would be pure noise. These misses are the
+  // data for tuning contestCue later; logged per occurrence, not deduped.
+  if (!contestCue(event.content)) {
+    const hasContestable = (await store.contestableMemories(event.guildId, event.authorId)).length > 0;
+    if (hasContestable) {
+      console.warn(`[contest] cue miss with contestable memories — guild ${event.guildId} author ${event.authorId}: "${event.content.slice(0, 200)}"`);
+    }
+    return { contests: 0, confirms: 0 };
+  }
 
   const memories = await store.contestableMemories(event.guildId, event.authorId);
   if (memories.length === 0) return { contests: 0, confirms: 0 };

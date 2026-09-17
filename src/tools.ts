@@ -13,6 +13,14 @@ const MAX_SEARCH_RESULTS = 5;
 
 // ── URL safety ────────────────────────────────────────────────────────────────
 
+// Assumption: this blocklist checks the hostname as parsed by Node's URL class and
+// resolved via node:dns — it does NOT decode decimal/octal/hex IP-literal forms
+// (e.g. http://2130706433/ == 127.0.0.1, or http://0x7f.0.0.1/). curl and some
+// browsers normalize these before connecting; Node's fetch/URL do not, so today
+// they fail DNS resolution rather than reaching a private address. If the fetch
+// implementation or runtime ever changes that behavior, this check needs to
+// explicitly decode and normalize those forms before testing them.
+
 const blockedSuffixes = ["localhost", ".local", ".internal", ".lan", ".home", ".corp", ".test", ".invalid"];
 
 function isPrivateIpv4(host: string): boolean {
