@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { demangleMentions, findMentionedUsers, resolveSubject, scrubMentions, type AliasMap } from "./entity-resolution.js";
+import { aliasKeyVariants, demangleMentions, findMentionedUsers, resolveSubject, scrubMentions, type AliasMap } from "./entity-resolution.js";
 import type { MessageEvent } from "./types.js";
 
 // Pure-function tests only — this file imports nothing that transitively reaches
@@ -58,6 +58,17 @@ test("findMentionedUsers: a longer alias wins over a different user's prefix-wor
   assert.deepEqual(findMentionedUsers("al smith is here", map), ["u-alsmith"]);
   // A standalone "al" elsewhere in the text still resolves to the nickname owner.
   assert.deepEqual(findMentionedUsers("al smith and al talked", map).sort(), ["u-al", "u-alsmith"]);
+});
+
+test("aliasKeyVariants expands nicknames: tokens ≥4 and first-token prefixes ≥4", () => {
+  assert.deepEqual(aliasKeyVariants("paarthurnax").sort(),
+    ["paar", "paart", "paarth", "paarthu", "paarthur", "paarthurn", "paarthurna", "paarthurnax"].sort());
+  // Multi-token: full name + each long token + first-token prefixes
+  assert.deepEqual(aliasKeyVariants("Starz is a Muslim").sort(),
+    ["Starz is a Muslim", "Starz", "Muslim", "Star"].sort());
+  // Short names get no variants
+  assert.deepEqual(aliasKeyVariants("al"), ["al"]);
+  assert.deepEqual(aliasKeyVariants("  "), []);
 });
 
 // ── Mention sanitization ──────────────────────────────────────────────────────

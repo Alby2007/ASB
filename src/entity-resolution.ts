@@ -18,6 +18,24 @@ function escapeRegExp(s: string): string {
 }
 
 /**
+ * Alias-map keys for a display name: the full name, every token ≥4 chars, and
+ * every prefix ≥4 of the first token — nickname shortenings ("paarth" for
+ * "paarthurnax", "starz" for "Starz is a Muslim") resolve without a learned
+ * alias. Variants funnel through buildAliasMap's uniqueness rule, so an
+ * ambiguous variant resolves unknown rather than guessing.
+ */
+export function aliasKeyVariants(name: string): string[] {
+  const out = new Set<string>();
+  const trimmed = name.trim();
+  if (trimmed) out.add(trimmed);
+  const tokens = trimmed.split(/\s+/);
+  for (const t of tokens) if (t.length >= 4) out.add(t);
+  const first = tokens[0] ?? "";
+  for (let i = 4; i < first.length; i++) out.add(first.slice(0, i));
+  return [...out];
+}
+
+/**
  * Build the guild alias map from `members.known_names`, falling back to
  * `messages` author pairs for rows archived before the members table existed.
  * Also maps each user_id to itself so raw IDs pass through resolution.
@@ -31,14 +49,13 @@ export async function buildAliasMap(guildId: string, store: MemoryStore): Promis
     if (!ids) byName.set(key, (ids = new Set()));
     ids.add(userId);
   };
-
   for (const member of await store.listMembers(guildId)) {
     add(member.userId, member.userId);
-    for (const name of member.knownNames) add(name, member.userId);
+    for (const name of member.knownNames) for (const key of aliasKeyVariants(name)) add(key, member.userId);
   }
   for (const row of await store.listAuthorNames(guildId)) {
     add(row.authorId, row.authorId);
-    add(row.authorName, row.authorId);
+    for (const key of aliasKeyVariants(row.authorName)) add(key, row.authorId);
   }
 
   const map: AliasMap = new Map();
