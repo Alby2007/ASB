@@ -598,7 +598,7 @@ export class Brain {
    */
   async reply(event: MessageEvent, context: Array<{ authorName: string; content: string }>, memories: Memory[], profiles: Array<{ name: string; summary: string; traits?: string[] }> = [], model?: string, toolsEnabled = false): Promise<string> {
     const people = profiles.map(p => `- ${p.name}: ${p.summary}${p.traits?.length ? ` (traits: ${p.traits.join(", ")})` : ""}`).join("\n");
-    const persona = "You are a persistent, socially aware Discord server member. Be concise, warm, and a little witty. You only know what is in the supplied context and memories. Never claim certainty beyond them; do not expose private internal data or explain the memory system. Do not invent facts. Address people by their display names — never emit <@...> mention markup. If you use web results, work them in naturally — don't dump citations.";
+    const persona = "You are a long-standing member of this Discord server — not an assistant. Talk like a regular: short messages, casual register, lowercase is fine, emoji sparingly. Be warm, a bit dry, and willing to have opinions and push back. You only know what is in the supplied context and memories — never claim certainty beyond them, never expose or explain the memory system, never invent facts. Address people by display name — never emit <@...> mention markup. If you use web results, work them in naturally — don't dump citations.";
     const situation = `Recent conversation:\n${context.map(x => `${x.authorName}: ${x.content}`).join("\n")}\n\nPeople:\n${people || "None"}\n\nRelevant memories:\n${memories.map(m => `- ${m.content} (confidence ${(m.confidence ?? 0).toFixed(2)})`).join("\n") || "None"}\n\nRespond to ${event.authorName}'s latest message: ${event.content}`;
     const useModel = model ?? this.model;
 
@@ -608,6 +608,7 @@ export class Brain {
         // forwards unknown body params, so the cast is all that's needed.
         const params = {
           model: useModel,
+          temperature: 0.9,
           messages: [
             { role: "system" as const, content: persona },
             { role: "user" as const, content: situation },
@@ -637,7 +638,7 @@ export class Brain {
         ];
         for (let round = 0; round < 3; round++) {
           const res = await this.client.chat.completions.create({
-            model: useModel, messages,
+            model: useModel, messages, temperature: 0.9,
             tools: replyToolDefs as unknown as OpenAI.ChatCompletionTool[],
             tool_choice: "auto",
           });
@@ -653,7 +654,7 @@ export class Brain {
           }
         }
         // Rounds exhausted — final call without tools forces a plain answer.
-        const res = await this.client.chat.completions.create({ model: useModel, messages });
+        const res = await this.client.chat.completions.create({ model: useModel, messages, temperature: 0.9 });
         return (res.choices[0]?.message?.content ?? "").trim().slice(0, 1800);
       } catch (err) {
         console.warn(`[reply] tool path failed, falling back to plain reply:`, (err as Error).message.slice(0, 120));
@@ -661,7 +662,8 @@ export class Brain {
     }
 
     const response = await this.client.responses.create({
-      model: this.model,
+      model: useModel,
+      temperature: 0.9,
       input: `${persona}\n\n${situation}`
     });
     return response.output_text.trim().slice(0, 1800);

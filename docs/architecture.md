@@ -84,7 +84,9 @@ Discord MessageCreate
     memories: active plus candidates with promotable primary evidence types
   • author addressed by freshest known name (learned aliases apply instantly)
   • reply output scrubbed: known <@id> → plain @Name, unknown ids stripped
-  • max 1800 chars
+  • temperature 0.9, max 1800 chars
+  • REPLY_MODEL overrides the reply model on every path (default GROQ_MODEL);
+    prefer a non-reasoning conversational model — reasoning models read flat
   • REPLY_MODEL=groq/compound* switches to Groq's agentic system: server-side
     web_search + visit_website tools, executed_tools logged, falls back to
     GROQ_MODEL on failure
