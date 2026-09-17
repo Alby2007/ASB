@@ -184,6 +184,22 @@ test("setMemberOptOut upserts a row for never-posted members, forgetAllFor clear
   } finally { await sql.end(); }
 });
 
+test("relevantMemories surfaces promotable-type candidates but keeps weak evidence gated", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const active = await store.saveMemory(msg("x"), { subjectId: "u1", kind: "person_fact", content: "Lives in Leeds", reason: "t", evidenceType: "explicit_fact", effect: "support" });
+    await store.confirm("g1", active.id);
+    await store.saveMemory(msg("y"), { subjectId: "u1", kind: "person_preference", content: "Wants to be called Alby", reason: "t", evidenceType: "clear_preference", effect: "support" });
+    await store.saveMemory(msg("z"), { subjectId: "u1", kind: "person_fact", content: "Is a great guy lol", reason: "t", evidenceType: "sarcasm_or_joke", effect: "support" });
+
+    const contents = (await store.relevantMemories("g1", "u1")).map(m => m.content);
+    assert.ok(contents.includes("Lives in Leeds"));
+    assert.ok(contents.includes("Wants to be called Alby")); // fresh preference reaches replies pre-verification
+    assert.ok(!contents.includes("Is a great guy lol"));      // sarcasm stays gated
+  } finally { await sql.end(); }
+});
+
 test("saveMemory persists the extracted subject name even when unresolved", async () => {
   const sql = makeTestSql();
   try {

@@ -558,7 +558,7 @@ export class Brain {
    */
   async reply(event: MessageEvent, context: Array<{ authorName: string; content: string }>, memories: Memory[], profiles: Array<{ name: string; summary: string; traits?: string[] }> = [], model?: string, toolsEnabled = false): Promise<string> {
     const people = profiles.map(p => `- ${p.name}: ${p.summary}${p.traits?.length ? ` (traits: ${p.traits.join(", ")})` : ""}`).join("\n");
-    const persona = "You are a persistent, socially aware Discord server member. Be concise, warm, and a little witty. You only know what is in the supplied context and memories. Never claim certainty beyond them; do not expose private internal data or explain the memory system. Do not invent facts. If you use web results, work them in naturally — don't dump citations.";
+    const persona = "You are a persistent, socially aware Discord server member. Be concise, warm, and a little witty. You only know what is in the supplied context and memories. Never claim certainty beyond them; do not expose private internal data or explain the memory system. Do not invent facts. Address people by their display names — never emit <@...> mention markup. If you use web results, work them in naturally — don't dump citations.";
     const situation = `Recent conversation:\n${context.map(x => `${x.authorName}: ${x.content}`).join("\n")}\n\nPeople:\n${people || "None"}\n\nRelevant memories:\n${memories.map(m => `- ${m.content} (confidence ${(m.confidence ?? 0).toFixed(2)})`).join("\n") || "None"}\n\nRespond to ${event.authorName}'s latest message: ${event.content}`;
     const useModel = model ?? this.model;
 

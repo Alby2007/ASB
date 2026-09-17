@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { findMentionedUsers, resolveSubject, type AliasMap } from "./entity-resolution.js";
+import { demangleMentions, findMentionedUsers, resolveSubject, scrubMentions, type AliasMap } from "./entity-resolution.js";
 import type { MessageEvent } from "./types.js";
 
 // Pure-function tests only — this file imports nothing that transitively reaches
@@ -58,4 +58,21 @@ test("findMentionedUsers: a longer alias wins over a different user's prefix-wor
   assert.deepEqual(findMentionedUsers("al smith is here", map), ["u-alsmith"]);
   // A standalone "al" elsewhere in the text still resolves to the nickname owner.
   assert.deepEqual(findMentionedUsers("al smith and al talked", map).sort(), ["u-al", "u-alsmith"]);
+});
+
+// ── Mention sanitization ──────────────────────────────────────────────────────
+
+test("demangleMentions resolves <@id> tokens to display names for prompt context", () => {
+  const names = new Map([["123", "Alice"], ["999", "ASB"]]);
+  assert.equal(demangleMentions("<@123> told <@999> hi", names), "@Alice told @ASB hi");
+  assert.equal(demangleMentions("<@!123> legacy nick format", names), "@Alice legacy nick format");
+  assert.equal(demangleMentions("hi <@456>", names), "hi @member"); // unresolved id
+});
+
+test("scrubMentions maps known ids to plain @Name and strips hallucinated ids", () => {
+  const names = new Map([["123", "Alice"]]);
+  assert.equal(scrubMentions("Hey <@123>!", names), "Hey @Alice!");
+  // A fabricated snowflake resolves to nothing — strip it, don't ping a stranger.
+  assert.equal(scrubMentions("Hey <@1549171765056638>! Glad you're here", names), "Hey! Glad you're here");
+  assert.equal(scrubMentions("plain text stays", names), "plain text stays");
 });

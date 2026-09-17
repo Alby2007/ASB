@@ -122,3 +122,28 @@ export function findMentionedUsers(content: string, aliasMap: AliasMap): string[
   }
   return [...found];
 }
+
+const MENTION_TOKEN = /<@!?(\d+)>/g;
+
+/**
+ * Replace `<@id>` mention tokens with `@DisplayName` for LLM-facing text.
+ * Raw snowflakes in prompts teach the model to answer in mention markup — or
+ * worse, to invent plausible-looking IDs. Unknown ids become a generic
+ * "@member" so a real-but-unresolved mention doesn't look like a name.
+ */
+export function demangleMentions(content: string, names: Map<string, string>): string {
+  return content.replace(MENTION_TOKEN, (_m, id) => `@${names.get(id) ?? "member"}`);
+}
+
+/**
+ * Neutralize mention markup in model output before posting: known ids become
+ * plain `@Name` text (allowedMentions already prevents pings); unknown ids —
+ * e.g. hallucinated snowflakes — are stripped with whitespace cleaned up.
+ */
+export function scrubMentions(text: string, names: Map<string, string>): string {
+  return text
+    .replace(MENTION_TOKEN, (_m, id) => (names.has(id) ? `@${names.get(id)}` : ""))
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\s+([,.!?])/g, "$1")
+    .trim();
+}

@@ -698,6 +698,24 @@ export class MemoryStore {
     });
   }
 
+  /** Recent messages the pipeline never classified — no triage mark and no
+   * evidence row. The periodic sweep re-examines these: regex-passed ones get
+   * extracted directly, the rest go through LLM triage. Note: `messages` has
+   * no bot flag, so other bots' messages are included — bounded noise. */
+  async listUninspectedMessages(guildId: string, since: Date, excludeAuthorId: string, limit = 500): Promise<Array<{ id: string; channelId: string; authorId: string; authorName: string; content: string; createdAt: Date | string; replyToId: string | null; triageResult: string | null }>> {
+    const rows = await this.sql<Array<{ id: string; channel_id: string; author_id: string; author_name: string; content: string; created_at: Date | string; reply_to_id: string | null; triage_result: string | null }>>`
+      SELECT m.id, m.channel_id, m.author_id, m.author_name, m.content, m.created_at, m.reply_to_id, m.triage_result
+      FROM messages m
+      WHERE m.guild_id = ${guildId} AND m.created_at > ${since.toISOString()}
+        AND (m.triage_result IS NULL OR m.triage_result = 'durable')
+        AND m.author_id <> ${excludeAuthorId}
+        AND m.content <> ''
+        AND NOT EXISTS (SELECT 1 FROM memory_evidence e WHERE e.message_id = m.id)
+      ORDER BY m.created_at ASC LIMIT ${limit}
+    `;
+    return rows.map(r => ({ id: r.id, channelId: r.channel_id, authorId: r.author_id, authorName: r.author_name, content: r.content, createdAt: r.created_at, replyToId: r.reply_to_id, triageResult: r.triage_result }));
+  }
+
   // ── Core memory persistence ────────────────────────────────────────────────
   // Phase 1 authoritative update: the LLM supplies language interpretation only. Confidence,
   // lifecycle, counters, and history are all determined here after an idempotent evidence insert.
@@ -905,8 +923,14 @@ export class MemoryStore {
   }
 
   async relevantMemories(guildId: string, subjectId: string, limit = 8): Promise<Memory[]> {
+    // Candidates with promotable primary evidence are included so fresh direct
+    // self-reports ("call me Alby") reach replies before nightly verification
+    // promotes them; sarcasm/joke/uncertain candidates stay gated out. The reply
+    // prompt annotates each memory's confidence so the model can weigh them.
     const rows = await this.sql<MemoryRow[]>`
-      SELECT * FROM memories WHERE guild_id = ${guildId} AND status = 'active' AND (subject_id = ${subjectId} OR subject_id = 'server')
+      SELECT * FROM memories WHERE guild_id = ${guildId}
+        AND (status = 'active' OR (status = 'candidate' AND primary_evidence_type IN ('explicit_fact', 'clear_preference', 'correction')))
+        AND (subject_id = ${subjectId} OR subject_id = 'server')
       ORDER BY importance * confidence DESC, last_confirmed_at DESC LIMIT ${limit}
     `;
     return rows.map(rowToMemory);

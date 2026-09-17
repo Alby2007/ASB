@@ -3,12 +3,12 @@ import { Brain } from "./brain.js";
 import { config } from "./config.js";
 import { MemoryStore } from "./database.js";
 import { commandDefinitions, handleMemoryButton, handleMemoryCommand } from "./commands.js";
-import { detectSelfNaming, shouldInspectForMemory, toolCues } from "./perception.js";
+import { detectNamingRequest, detectSelfNaming, shouldInspectForMemory, toolCues } from "./perception.js";
 import { runContestCheck } from "./contest.js";
 import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
 import { ProfileStore } from "./profiles.js";
-import { buildAliasMap, findMentionedUsers, resolveSubject, type AliasMap } from "./entity-resolution.js";
+import { buildAliasMap, demangleMentions, findMentionedUsers, resolveSubject, scrubMentions, type AliasMap } from "./entity-resolution.js";
 import { withRetry } from "./retry.js";
 import { inc } from "./metrics.js";
 import type { MessageEvent } from "./types.js";
@@ -34,6 +34,7 @@ client.once(Events.ClientReady, async ready => {
   if (config.guildId) await ready.application.commands.set(commandDefinitions, config.guildId);
   else await ready.application.commands.set(commandDefinitions);
   applyRetention();
+  sweepMissedSignals(24 * 60 * 60_000); // wide window on boot to cover downtime
   console.log(`ASM online as ${ready.user.tag}`);
 });
 
@@ -113,6 +114,106 @@ async function applyRetention() {
 }
 setInterval(applyRetention, 24 * 60 * 60 * 1000).unref();
 
+const SWEEP_INTERVAL_MS = 15 * 60_000;
+const SWEEP_WINDOW_MS = 2 * 60 * 60_000;
+const SWEEP_TRIAGE_BATCH = 10;
+const SWEEP_EXTRACT_BATCH = 5;
+
+setInterval(() => sweepMissedSignals(SWEEP_WINDOW_MS), SWEEP_INTERVAL_MS).unref();
+
+// Live traffic that fails the durableSignals regex is never inspected inline —
+// this sweep gives it the same LLM triage ingest already uses, so durable
+// preferences in unpatterned phrasing ("can you just call me Alby from now on",
+// said to nobody in particular) still land within ~15 minutes. Marks persist on
+// messages.triage_result, so each message is classified once; a durable verdict
+// with no evidence is re-extracted on the next pass (crash-safe).
+async function sweepMissedSignals(windowMs: number) {
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      const settings = await store.settings(guild.id, config.rawMessageRetentionDays);
+      if (!settings.memoryEnabled) continue;
+      const pending = await store.listUninspectedMessages(guild.id, new Date(Date.now() - windowMs), client.user!.id);
+      if (!pending.length) continue;
+      const toEvent = (m: (typeof pending)[number]): MessageEvent => ({
+        guildId: guild.id, channelId: m.channelId, messageId: m.id,
+        authorId: m.authorId, authorName: m.authorName, content: m.content,
+        createdAt: new Date(m.createdAt),
+        mentionsBot: m.content.includes(`<@${client.user!.id}>`) || m.content.includes(`<@!${client.user!.id}>`),
+      });
+      const marks: Array<{ id: string; result: string }> = [];
+      const queue: Array<{ event: MessageEvent; replyToId?: string; replyToContent?: string }> = [];
+      const triageQueue: typeof pending = [];
+      for (const m of pending) {
+        const event = toEvent(m);
+        if (m.triageResult === "durable") {
+          queue.push({ event, replyToId: m.replyToId ?? undefined }); // marked durable earlier but never extracted
+        } else if (shouldInspectForMemory(event)) {
+          marks.push({ id: m.id, result: "regex" });
+          queue.push({ event, replyToId: m.replyToId ?? undefined });
+        } else if (m.content.trim().length >= 4) {
+          triageQueue.push(m);
+        } else {
+          marks.push({ id: m.id, result: "noise" });
+        }
+      }
+      for (let i = 0; i < triageQueue.length; i += SWEEP_TRIAGE_BATCH) {
+        const batch = triageQueue.slice(i, i + SWEEP_TRIAGE_BATCH);
+        try {
+          const verdicts = await withRetry(() => brain.triageBatch(
+            batch.map(b => ({ messageId: b.id, authorName: b.authorName, content: b.content })),
+            process.env.INGEST_TRIAGE_MODEL ?? config.model
+          ), 3);
+          for (const item of batch) {
+            const durable = verdicts.get(item.id)?.durable ?? false;
+            marks.push({ id: item.id, result: durable ? "durable" : "noise" });
+            if (durable) queue.push({ event: toEvent(item), replyToId: item.replyToId ?? undefined });
+          }
+        } catch { /* batch stays unmarked — next sweep retries it */ }
+      }
+      // Persist marks before extraction: durable marks survive a crash and are
+      // picked back up on the next pass via the no-evidence filter.
+      await store.setTriageResults(marks);
+      if (!queue.length) continue;
+      const members = await store.listMembers(guild.id);
+      const optedOut = new Set(members.filter(m => m.optedOut).map(m => m.userId));
+      const aliases = await buildAliasMap(guild.id, store);
+      for (let i = 0; i < queue.length; i += SWEEP_EXTRACT_BATCH) {
+        const batch = queue.slice(i, i + SWEEP_EXTRACT_BATCH);
+        for (const item of batch) {
+          if (item.replyToId) {
+            const ref = await store.getMessage(item.replyToId);
+            if (ref) item.replyToContent = `${ref.authorName}: ${ref.content}`;
+          }
+        }
+        try {
+          const results = await withRetry(() => brain.extractMemoriesBatch(batch, process.env.INGEST_MODEL ?? config.model), 3);
+          for (const item of batch) {
+            const result = results.get(item.event.messageId) ?? { memories: [], relationships: [] };
+            for (const memory of result.memories) {
+              memory.subjectId = resolveSubject(memory, aliases, item.event);
+              if (optedOut.has(memory.subjectId)) continue;
+              if (memory.subjectId === "unknown" && memory.subjectName) {
+                await store.logUnresolvedName(guild.id, memory.subjectName, item.event.messageId);
+              }
+              await store.saveMemory(item.event, memory, config.candidateConfidenceThreshold);
+            }
+            for (const rel of result.relationships) {
+              const subjectId = rel.subjectName ? resolveSubject({ subjectName: rel.subjectName }, aliases, item.event) : item.event.authorId;
+              const otherId = resolveSubject({ subjectName: rel.otherName }, aliases, item.event);
+              if (optedOut.has(subjectId) || optedOut.has(otherId)) continue;
+              if (subjectId === "unknown" && rel.subjectName) await store.logUnresolvedName(guild.id, rel.subjectName, item.event.messageId);
+              if (otherId === "unknown" && rel.otherName) await store.logUnresolvedName(guild.id, rel.otherName, item.event.messageId);
+              if (subjectId === "unknown" || otherId === "unknown") continue;
+              await store.recordRelationship(guild.id, subjectId, otherId, item.event.messageId, rel.nature, rel.valence, rel.reason ?? "");
+            }
+          }
+        } catch (error) { inc("sweep.extract_error"); console.error("Sweep extraction failed", error); }
+      }
+      inc("sweep.runs");
+    } catch (error) { inc("sweep.error"); console.error(`Missed-signal sweep failed in ${guild.name}`, error); }
+  }
+}
+
 client.on(Events.InteractionCreate, async interaction => {
   try {
     if (interaction.isChatInputCommand()) await handleMemoryCommand(interaction, store, brain, eventStore);
@@ -139,16 +240,21 @@ client.on(Events.MessageCreate, message => {
 // object also feeds the compiled-regex cache in entity-resolution, so caching it
 // means the alternation pattern compiles once per rebuild, not per message.
 // learnAlias invalidates immediately; display-name drift via upsertMember is
-// bounded by the TTL.
-const aliasMapCache = new Map<string, { map: AliasMap; at: number }>();
-const ALIAS_MAP_TTL_MS = 5 * 60_000;
+// bounded by the TTL. The same cache carries an id→display-name map used to
+// demangle <@id> tokens before they reach the LLM.
+const lookupCache = new Map<string, { map: AliasMap; names: Map<string, string>; at: number }>();
+const LOOKUP_TTL_MS = 5 * 60_000;
 
-async function guildAliasMap(guildId: string): Promise<AliasMap> {
-  const cached = aliasMapCache.get(guildId);
-  if (cached && Date.now() - cached.at < ALIAS_MAP_TTL_MS) return cached.map;
-  const map = await buildAliasMap(guildId, store);
-  aliasMapCache.set(guildId, { map, at: Date.now() });
-  return map;
+async function guildLookups(guildId: string): Promise<{ map: AliasMap; names: Map<string, string> }> {
+  const cached = lookupCache.get(guildId);
+  if (cached && Date.now() - cached.at < LOOKUP_TTL_MS) return cached;
+  const [map, members] = await Promise.all([buildAliasMap(guildId, store), store.listMembers(guildId)]);
+  const names = new Map<string, string>();
+  for (const m of members) names.set(m.userId, m.knownNames.at(-1) ?? m.userId);
+  if (client.user) names.set(client.user.id, client.user.username);
+  const entry = { map, names, at: Date.now() };
+  lookupCache.set(guildId, entry);
+  return entry;
 }
 
 async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
@@ -172,20 +278,24 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   }
   // The alias map is built lazily on first use so ordinary chatter costs no extra queries.
   let aliasMap: Promise<AliasMap> | undefined;
-  const getAliasMap = () => (aliasMap ??= guildAliasMap(event.guildId));
+  const getAliasMap = () => (aliasMap ??= guildLookups(event.guildId).then(e => e.map));
   if (settings.memoryEnabled && shouldInspectForMemory(event)) {
     try {
-      // Flag pasted/echoed self-naming ("I am Sage, a dragon lover…") so the
-      // extractor attributes the text to the named person, not the poster.
+      // Naming signals: "call me Alby" is an explicit request (strong);
+      // "I am Sage" from a non-matching name is a pasted/quoted-bio tell (weak).
       const member = await store.getMember(event.guildId, event.authorId);
-      const named = detectSelfNaming(event.content, member?.knownNames ?? [event.authorName]);
-      // Self-naming with an unknown name is the bot's alias-learning signal:
-      // "I am Sage" posted by tinyriot teaches sage → tinyriot.
+      const authorNames = member?.knownNames ?? [event.authorName];
+      const requested = detectNamingRequest(event.content, authorNames);
+      const named = requested ?? detectSelfNaming(event.content, authorNames);
+      // An unknown self-name is the bot's alias-learning signal: "I am Sage"
+      // posted by tinyriot teaches sage → tinyriot.
       if (named) {
-        await store.learnAlias(event.guildId, event.authorId, named, "self_naming", event.messageId);
-        aliasMapCache.delete(event.guildId); // so this message resolves the new alias
+        await store.learnAlias(event.guildId, event.authorId, named, requested ? "naming_request" : "self_naming", event.messageId);
+        lookupCache.delete(event.guildId); // so this message resolves the new alias
       }
-      const note = named ? `the author may be naming themselves "${named}" (a previously unknown alias) or quoting/describing "${named}" — attribute accordingly` : undefined;
+      const note = requested
+        ? `the author asked to be called "${requested}" — treat it as their preferred name`
+        : named ? `the author may be naming themselves "${named}" (a previously unknown alias) or quoting/describing "${named}" — attribute accordingly` : undefined;
       const { memories: candidates, relationships } = await withRetry(() => brain.extractMemories(event, replyToContent, note), 3);
       const aliases = (candidates.length || relationships.length) ? await getAliasMap() : new Map<string, string>();
       // Opted-out members accrue no new derived data: memories or relationship
@@ -245,16 +355,25 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   try {
     await message.channel.sendTyping();
     // Inject profile cards for the author, @-mentioned users, and name-referenced members.
-    const aliases = await getAliasMap();
+    const lookups = await guildLookups(event.guildId);
     const peopleIds = new Set<string>([
       event.authorId,
       ...message.mentions.users.keys(),
-      ...findMentionedUsers(event.content, aliases).slice(0, 3),
+      ...findMentionedUsers(event.content, lookups.map).slice(0, 3),
     ]);
     const profiles = (await profileStore.getProfiles(event.guildId, [...peopleIds]))
       .map(p => ({ name: p.displayName, summary: p.summary, traits: p.facets.traits }));
-    const reply = await brain.reply(event, await store.recentContext(event.guildId, event.channelId), await store.relevantMemories(event.guildId, event.authorId), profiles, process.env.REPLY_MODEL, process.env.REPLY_TOOLS === "1" && toolCues(event.content));
-    if (reply) { await message.reply({ content: reply, allowedMentions: { repliedUser: false } }); botActivity.set(key, Date.now()); inc("reply.sent"); }
+    // Model-facing text carries names, never raw <@id> markup — real mention
+    // tokens in stored content taught the model to greet users with fabricated
+    // snowflakes ("Hey <@1549171765056638>!").
+    const context = (await store.recentContext(event.guildId, event.channelId))
+      .map(x => ({ ...x, content: demangleMentions(x.content, lookups.names) }));
+    // Address the author by their freshest known name so a "call me X" learned
+    // moments ago takes effect immediately, not after the next profile build.
+    const authorName = await store.displayNameFor(event.guildId, event.authorId);
+    const reply = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, process.env.REPLY_MODEL, process.env.REPLY_TOOLS === "1" && toolCues(event.content));
+    const clean = reply ? scrubMentions(reply, lookups.names) : "";
+    if (clean) { await message.reply({ content: clean, allowedMentions: { repliedUser: false } }); botActivity.set(key, Date.now()); inc("reply.sent"); }
   } catch (error) { inc("llm.reply_error"); console.error("Reply generation failed", error); }
 }
 

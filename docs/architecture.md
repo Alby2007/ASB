@@ -17,7 +17,7 @@ ASB (Artificial Server Member) is a single TypeScript/Node process that connects
 | `src/events.ts` | `EventStore` | Postgres persistence: event CRUD, participants, message/memory attachments |
 | `src/migrations.ts` | `runMigrations`, `getMigrationVersion` | Versioned schema migrations (v1–v5) with rollback support |
 | `src/confidence.ts` | `calculateInitialConfidence`, `updateConfidence`, `calculateDefaultImportance`, `calculateDefaultExplicitness` | Deterministic numeric formulas; no LLM involvement |
-| `src/perception.ts` | `shouldInspectForMemory` | Cheap regex pre-filter: prevents LLM calls for ordinary chat |
+| `src/perception.ts` | `shouldInspectForMemory`, `detectNamingRequest`, `detectSelfNaming` | Cheap pre-filter: prevents LLM calls for ordinary chat; detects explicit naming requests and self-naming |
 | `src/event-detection.ts` | `EventPipeline` | Heuristic + LLM continuity decisions; nightly maintenance |
 | `src/event-significance.ts` | `calculateSignificance` | Deterministic significance score and tier assignment |
 | `src/entity-resolution.ts` | `buildAliasMap`, `resolveSubject`, `findMentionedUsers` | Maps display names to real user IDs; ambiguous names resolve to `unknown` |
@@ -38,12 +38,11 @@ Discord MessageCreate
         ▼
   perception.ts: shouldInspectForMemory()?
         │ yes                     no ──────────────────────────────┐
-        ▼                                                           │
-  brain.ts: extractMemories()                                       │
+        ▼   (passes durableSignals regex, or any bot-addressed msg) │
+  brain.ts: extractMemories()                                      │
   (LLM — returns subjectId, subjectName, kind, content,            │
    reason, evidenceType, effect + relationship assertions;         │
    no numeric values)                                              │
-        │                                                           │
         ▼                                                           │
   entity-resolution.ts: resolveSubject()                           │
   • subjectName → real user ID via the members alias map           │
@@ -64,7 +63,10 @@ Discord MessageCreate
   • history row appended                                           │
         │                                                           │
         ▼◄──────────────────────────────────────────────────────────┘
-  event-detection.ts: EventPipeline.process()
+  event-detection.ts: EventPipeline.process()                          │
+  • regex-failed messages aren't dropped: a 15-min sweep in index.ts   │
+    re-triages recent uninspected messages via brain.triageBatch and   │
+    routes durable verdicts into the same extraction path            │
   • scoreOpenEvents() heuristic (no LLM)
   • if ambiguous: brain.assessContinuity() (LLM)
   • attach / new / reference / bridge
@@ -77,7 +79,10 @@ Discord MessageCreate
         │
         ▼ (only if shouldSpeak && replyEnabled)
   brain.ts: reply()
-  • recent channel context + relevant active memories
+  • recent channel context (<@id> tokens demangled to @names) + relevant
+    memories: active plus candidates with promotable primary evidence types
+  • author addressed by freshest known name (learned aliases apply instantly)
+  • reply output scrubbed: known <@id> → plain @Name, unknown ids stripped
   • max 1800 chars
   • REPLY_MODEL=groq/compound* switches to Groq's agentic system: server-side
     web_search + visit_website tools, executed_tools logged, falls back to
