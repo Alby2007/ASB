@@ -185,17 +185,19 @@ test("mergeDuplicate moves evidence, supersedes the dup, and keeps canonical sta
   } finally { await sql.end(); }
 });
 
-test("mergeDuplicate drops colliding evidence instead of violating the unique key", async () => {
+test("mergeDuplicate leaves colliding evidence on the superseded row", async () => {
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
     // Same source message m1 is evidence for both rows → collision on merge.
+    // The row can't move (unique key) and can't be deleted (memory_history
+    // references it) — it stays on the superseded memory for audit.
     const a = await store.saveMemory(ev("peanuts", "m1"), candidate("User is allergic to peanuts", { kind: "person_fact", evidenceType: "explicit_fact" }));
     const b = await store.saveMemory(ev("peanuts", "m1"), candidate("User can't eat nuts", { kind: "person_fact", evidenceType: "explicit_fact" }));
     assert.notEqual(a.id, b.id);
     assert.equal(await store.mergeDuplicate("test-guild", a.id, b.id, "same allergy"), true);
     assert.equal((await store.evidence("test-guild", a.id)).length, 1);
-    assert.equal((await store.evidence("test-guild", b.id)).length, 0);
+    assert.equal((await store.evidence("test-guild", b.id)).length, 1);
   } finally { await sql.end(); }
 });
 

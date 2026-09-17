@@ -1086,10 +1086,12 @@ export class MemoryStore {
   }
 
   /** Merge a duplicate memory into its canonical row: the dup's evidence moves
-   * over (rows colliding on message_id drop — one copy suffices), counters are
-   * recounted from evidence, and the dup becomes 'superseded' with a link back.
-   * Canonical status/confidence are untouched — a merge must not launder
-   * promotion. Idempotent: a dup no longer candidate/active is a no-op. */
+   * over, except rows colliding on message_id, which stay on the superseded
+   * dup — memory_history.evidence_id references them (FK, no cascade) and the
+   * dup's audit trail stays complete. Counters are recounted from evidence,
+   * and the dup becomes 'superseded' with a link back. Canonical
+   * status/confidence are untouched — a merge must not launder promotion.
+   * Idempotent: a dup no longer candidate/active is a no-op. */
   async mergeDuplicate(guildId: string, canonicalId: number, dupId: number, reason = ""): Promise<boolean> {
     if (canonicalId === dupId) return false;
     return await this.sql.begin(async sql => {
@@ -1107,7 +1109,6 @@ export class MemoryStore {
         WHERE ev.memory_id = ${dupId}
           AND NOT EXISTS (SELECT 1 FROM memory_evidence e WHERE e.memory_id = ${canonicalId} AND e.message_id = ev.message_id)
       `;
-      await sql`DELETE FROM memory_evidence WHERE memory_id = ${dupId}`;
       await sql`
         UPDATE memories SET
           confirmation_count = (SELECT COUNT(*)::int FROM memory_evidence WHERE memory_id = ${canonicalId} AND effect = 'support'),
