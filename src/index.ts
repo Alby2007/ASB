@@ -79,31 +79,31 @@ async function applyRetention() {
       }
       if (vPromoted || vFlagged) console.log(`Verified candidates in ${guild.name}: ${vPromoted} promoted, ${vFlagged} flagged as jokes`);
     } catch (error) { console.error("Verification failed", error); }
-    // Verify unverified relationship observations — joke assertions are excluded
-    // from the durable edge roll-up. Bounded per run; recompute only when needed.
+    // Verify unverified relationship observations, then rebuild edges — the
+    // relationships table is derived from 'literal'-verdicted observations
+    // only, so unverified assertions never surface as edges. Recompute runs
+    // every pass so opted-out deletions and pre-existing edges stay consistent.
     try {
       const unverified = await store.listUnverifiedObservations(guild.id, 50);
-      if (unverified.length) {
-        let judged = 0;
-        for (let i = 0; i < unverified.length; i += 10) {
-          const batch = unverified.slice(i, i + 10);
-          const items = await Promise.all(batch.map(async b => ({
-            observationId: b.observationId, authorName: b.authorName, authorNames: b.authorNames,
-            nature: b.nature, otherName: await store.displayNameFor(guild.id, b.otherId),
-            sourceMessage: b.sourceMessage, contextBefore: b.contextBefore,
-          })));
-          const verdicts = await brain.verifyRelationshipsBatch(
-            items,
-            process.env.VERIFY_MODEL ?? process.env.PROFILE_MODEL ?? config.model
-          );
-          for (const b of batch) {
-            const v = verdicts.get(b.observationId);
-            if (v) { await store.setObservationVerdict(b.observationId, v.verdict); judged++; }
-          }
+      let judged = 0;
+      for (let i = 0; i < unverified.length; i += 10) {
+        const batch = unverified.slice(i, i + 10);
+        const items = await Promise.all(batch.map(async b => ({
+          observationId: b.observationId, authorName: b.authorName, authorNames: b.authorNames,
+          nature: b.nature, otherName: await store.displayNameFor(guild.id, b.otherId),
+          sourceMessage: b.sourceMessage, contextBefore: b.contextBefore,
+        })));
+        const verdicts = await brain.verifyRelationshipsBatch(
+          items,
+          process.env.VERIFY_MODEL ?? process.env.PROFILE_MODEL ?? config.model
+        );
+        for (const b of batch) {
+          const v = verdicts.get(b.observationId);
+          if (v) { await store.setObservationVerdict(b.observationId, v.verdict); judged++; }
         }
-        const edgeCount = await store.recomputeEdges(guild.id);
-        console.log(`Verified ${judged} relationship observations in ${guild.name}; recomputed ${edgeCount} edges`);
       }
+      const edgeCount = await store.recomputeEdges(guild.id);
+      if (unverified.length) console.log(`Verified ${judged} relationship observations in ${guild.name}; recomputed ${edgeCount} edges`);
     } catch (error) { console.error("Relationship verification failed", error); }
     // v0.3: rebuild per-chatter profile cards + dossiers (LLM calls only when inputs changed)
     try {

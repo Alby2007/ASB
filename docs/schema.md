@@ -247,7 +247,7 @@ Member registry — one row per (guild, user). Built by `recordMessage()` so bot
 
 ### `relationship_observations`
 
-Raw LLM relationship assertions. One row per (subject, other, message) — idempotent evidence for the rolled-up edges in `relationships`.
+Raw LLM relationship assertions. One row per (subject, other, message) — idempotent evidence for the derived edges in `relationships`. This is the holding state: an assertion stays invisible until verification.
 
 | Column | Type | Notes |
 |--------|------|-------|
@@ -259,6 +259,7 @@ Raw LLM relationship assertions. One row per (subject, other, message) — idemp
 | `nature` | TEXT | Free-text dynamic: "close friends", "antagonizes", "dating", … |
 | `valence` | REAL \| NULL | −1 hostile … 0 neutral … +1 close |
 | `reason` | TEXT | LLM-supplied explanation |
+| `verdict` | TEXT \| NULL | Sincerity verdict (v8): `'literal'` counts toward edges; `'joke'`/`'unclear'`/NULL never do. NULL = not yet verified |
 | `created_at` | TEXT | ISO-8601 |
 
 **Unique constraint:** `(subject_id, other_id, message_id)`. **Index:** `relationship_obs_lookup (guild_id, subject_id, other_id)`.
@@ -267,7 +268,7 @@ Raw LLM relationship assertions. One row per (subject, other, message) — idemp
 
 ### `relationships`
 
-Durable relationship edges rolled up from observations. `observation_count` increments and `valence` is a running average on each new observation.
+Durable relationship edges — fully derived. `recomputeEdges()` deletes and rebuilds this table from `literal`-verdicted observations only, so unverified, `unclear`, or `joke` assertions never form or feed an edge. New edges materialize at the next verification pass, not at record time.
 
 | Column | Type | Notes |
 |--------|------|-------|
@@ -275,9 +276,9 @@ Durable relationship edges rolled up from observations. `observation_count` incr
 | `guild_id` | TEXT | Server scope |
 | `subject_id` | TEXT | Discord user ID |
 | `other_id` | TEXT | Discord user ID |
-| `summary` | TEXT | Latest observed nature of the relationship |
-| `valence` | REAL \| NULL | Running-average valence |
-| `observation_count` | INTEGER | Number of supporting observations; edges surface in profiles at ≥2 |
+| `summary` | TEXT | Latest nature among literal-verdicted observations |
+| `valence` | REAL \| NULL | Average valence over literal-verdicted observations |
+| `observation_count` | INTEGER | Count of literal-verdicted observations; `/profile` and profile synthesis surface edges at ≥2 |
 | `last_observed_at` | TEXT | ISO-8601 |
 | `updated_at` | TEXT | ISO-8601 |
 

@@ -308,35 +308,21 @@ export class MemoryStore {
 
   // ── Relationships ──────────────────────────────────────────────────────────
   // Relationship assertions are stored as idempotent observations keyed by
-  // (subject_id, other_id, message_id); each new observation rolls up into a
-  // durable edge in `relationships` with a running-average valence.
+  // (subject_id, other_id, message_id). Observations carry a sincerity verdict;
+  // the `relationships` edge table is fully derived — rebuilt by
+  // recomputeEdges() from 'literal'-verdicted observations only, so an
+  // unverified assertion never surfaces in profiles or dossiers. Edges
+  // materialize at the next maintenance pass, not at record time.
 
   async recordRelationship(guildId: string, subjectId: string, otherId: string, messageId: string, nature: string, valence: number | null, reason = ""): Promise<boolean> {
     if (subjectId === otherId || subjectId === "unknown" || otherId === "unknown" || subjectId === "server" || otherId === "server") return false;
-    return await this.sql.begin(async sql => {
-      const inserted = await sql`
-        INSERT INTO relationship_observations (guild_id, subject_id, other_id, message_id, nature, valence, reason)
-        VALUES (${guildId}, ${subjectId}, ${otherId}, ${messageId}, ${nature}, ${valence}, ${reason})
-        ON CONFLICT (subject_id, other_id, message_id) DO NOTHING
-        RETURNING id
-      `;
-      if (inserted.length === 0) return false;
-      await sql`
-        INSERT INTO relationships (guild_id, subject_id, other_id, summary, valence, observation_count, last_observed_at, updated_at)
-        VALUES (${guildId}, ${subjectId}, ${otherId}, ${nature}, ${valence}, 1, NOW(), NOW())
-        ON CONFLICT (guild_id, subject_id, other_id) DO UPDATE SET
-          summary           = EXCLUDED.summary,
-          observation_count = relationships.observation_count + 1,
-          valence           = CASE
-            WHEN relationships.valence IS NULL THEN EXCLUDED.valence
-            WHEN EXCLUDED.valence IS NULL THEN relationships.valence
-            ELSE relationships.valence + (EXCLUDED.valence - relationships.valence) / (relationships.observation_count + 1)
-          END,
-          last_observed_at  = NOW(),
-          updated_at        = NOW()
-      `;
-      return true;
-    });
+    const inserted = await this.sql`
+      INSERT INTO relationship_observations (guild_id, subject_id, other_id, message_id, nature, valence, reason)
+      VALUES (${guildId}, ${subjectId}, ${otherId}, ${messageId}, ${nature}, ${valence}, ${reason})
+      ON CONFLICT (subject_id, other_id, message_id) DO NOTHING
+      RETURNING id
+    `;
+    return inserted.length > 0;
   }
 
   /** All edges where the subject is either side of the relationship, strongest first. */
@@ -482,9 +468,10 @@ export class MemoryStore {
     return out;
   }
 
-  /** Raw relationship observations (with reasons) involving a member — either as
-   * the asserting side ("member_subject") or the observed side ("member_other").
-   * otherId is always the counterparty. Dossier relationship_map input. */
+  /** Literal-verdicted relationship observations (with reasons) involving a
+   * member — either as the asserting side ("member_subject") or the observed
+   * side ("member_other"). otherId is always the counterparty. Dossier
+   * relationship_map input; unverified assertions stay invisible here too. */
   async relationshipObservationsFor(guildId: string, subjectId: string): Promise<Array<{
     otherId: string; nature: string; valence: number | null; reason: string;
     direction: "member_subject" | "member_other"; createdAt: string;
@@ -494,7 +481,7 @@ export class MemoryStore {
     }>>`
       SELECT subject_id, other_id, nature, valence, reason, created_at FROM relationship_observations
       WHERE guild_id = ${guildId} AND (subject_id = ${subjectId} OR other_id = ${subjectId})
-        AND verdict IS DISTINCT FROM 'joke'
+        AND verdict = 'literal'
       ORDER BY created_at DESC
     `;
     return rows.map(r => ({
@@ -645,8 +632,10 @@ export class MemoryStore {
     await this.sql`UPDATE relationship_observations SET verdict = ${verdict} WHERE id = ${observationId}`;
   }
 
-  /** Rebuild the durable edges from non-joke observations. Delete + re-aggregate
-   * in one transaction; returns the edge count. */
+  /** Rebuild the durable edges from literal-verdicted observations only —
+   * unverified, unclear, and joke rows never form or feed an edge. This is the
+   * sole writer to `relationships`. Delete + re-aggregate in one transaction;
+   * returns the edge count. */
   async recomputeEdges(guildId: string): Promise<number> {
     return await this.sql.begin(async sql => {
       await sql`DELETE FROM relationships WHERE guild_id = ${guildId}`;
@@ -658,7 +647,7 @@ export class MemoryStore {
                COUNT(*)::int,
                MAX(created_at), NOW()
         FROM relationship_observations
-        WHERE guild_id = ${guildId} AND verdict IS DISTINCT FROM 'joke'
+        WHERE guild_id = ${guildId} AND verdict = 'literal'
         GROUP BY guild_id, subject_id, other_id
         RETURNING id
       `;

@@ -48,8 +48,9 @@ Discord MessageCreate
   • subjectName → real user ID via the members alias map           │
   • ambiguous names → "unknown" (correctness over recall)          │
   • relationship assertions → relationship_observations            │
-    → rolled up into relationships edges; verdict column (v8)      │
-    excludes joke assertions from roll-up via recomputeEdges()      │
+    → verdict column (v8) records sincerity; recomputeEdges()      │
+    rebuilds relationships edges from 'literal' verdicts only —    │
+    unverified/joke assertions never surface as edges              │
         │                                                           │
         ▼                                                           │
   database.ts: saveMemory()                                         │
@@ -118,6 +119,8 @@ Members with ≥3 active memories or ≥50 messages additionally get a **dossier
 Degenerate LLM output (repeated glyphs, JSON blobs) is detected per section and never overwrites existing data. Dossiers surface via `/dossier` (self or admin); `reply()` only ever injects the card.
 
 Candidate memories pass a **sincerity verification** gate before they can activate: `Brain.verifyMemoriesBatch` re-judges each promotable candidate against its stored source message, the author's known names, and the preceding chat lines (literal / joke / unclear / misattributed). Verified literal self-reports promote to `active`; jokes are re-classified `sarcasm_or_joke` (confidence → 0.10, never promotable); `misattributed` verdicts — pasted/quoted text describing someone other than the poster — are forgotten outright; third-party literals stay candidate pending corroboration. Verification runs in `applyRetention()` and at the end of ingest before profile builds.
+
+Relationship assertions pass the analogous gate: `Brain.verifyRelationshipsBatch` labels each observation `literal` / `joke` / `unclear` against its source message and preceding lines, and `recomputeEdges()` rebuilds the derived `relationships` table from `literal` verdicts alone — an unverified or ironic claim ("we're basically married") never surfaces in `/profile`, dossier inputs, or the reply prompt. New edges therefore materialize at the next maintenance pass rather than at record time.
 
 **Paste/quote attribution.** Extraction instructs the model not to attribute quoted, pasted, or persona text to the poster ("I am \<other person\>", reposted bios, copied bot output) — it should attribute to the named person via `subjectName` or skip it. A deterministic guard (`detectSelfNaming`) flags "I am \<Capitalized Name\>" patterns where the name isn't one of the author's `known_names` and annotates the extraction input.
 

@@ -326,6 +326,16 @@ client.once("ready", async () => {
     console.error("Contest sweep failed:", (err as Error).message.slice(0, 120));
   }
 
+  // Rebuild relationship edges from literal-verdicted observations — ingest
+  // doesn't verify observations itself, so only already-verified ones form
+  // edges here; the rest surface after the next nightly verification pass.
+  try {
+    const edgeCount = await store.recomputeEdges(guild.id);
+    console.log(`Relationship edges: ${edgeCount}`);
+  } catch (err) {
+    console.error("Edge recompute failed:", (err as Error).message.slice(0, 120));
+  }
+
   // Build per-chatter profile cards (bounded: one LLM call per changed member)
   console.log("Building member profiles...");
   try {

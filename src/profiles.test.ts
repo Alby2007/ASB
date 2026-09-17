@@ -74,15 +74,19 @@ test("buildAliasMap drops ambiguous names shared by multiple users", async () =>
 
 // ── Relationships ─────────────────────────────────────────────────────────────
 
-test("recordRelationship is idempotent per message and rolls up edges", async () => {
+test("recordRelationship is idempotent per message; edges roll up only after literal verdicts", async () => {
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
     // Same (subject, other, message) twice → one observation
     assert.equal(await store.recordRelationship("g1", "u1", "u2", "m1", "close friends", 0.8), true);
     assert.equal(await store.recordRelationship("g1", "u1", "u2", "m1", "close friends", 0.8), false);
-    // Second message → count 2, running-average valence
     await store.recordRelationship("g1", "u1", "u2", "m2", "close friends", 0.4);
+    // Unverified observations never surface as an edge
+    assert.deepEqual(await store.relationshipsFor("g1", "u1"), []);
+    // Literal verdicts + recompute → edge with stats over literal observations
+    await sql`UPDATE relationship_observations SET verdict = 'literal' WHERE guild_id = 'g1'`;
+    await store.recomputeEdges("g1");
     const edges = await store.relationshipsFor("g1", "u1");
     assert.equal(edges.length, 1);
     assert.equal(edges[0].observationCount, 2);
@@ -192,6 +196,8 @@ test("forgetRelationshipsFor deletes observations and edges on both sides of the
     await store.recordRelationship("g1", "u1", "u2", "m1", "close friends", 0.8, "t");
     await store.recordRelationship("g1", "u3", "u1", "m2", "rivals", -0.5, "t");
     await store.recordRelationship("g1", "u2", "u3", "m3", "siblings", 0.9, "t"); // control — u1 not involved
+    await sql`UPDATE relationship_observations SET verdict = 'literal' WHERE guild_id = 'g1'`;
+    await store.recomputeEdges("g1");
 
     assert.equal(await store.forgetRelationshipsFor("g1", "u1"), 2);
     assert.deepEqual(await store.relationshipsFor("g1", "u1"), []);
@@ -453,6 +459,8 @@ test("mergedEdges collapses directed edges into one counterparty view", async ()
     // A→B and B→A are stored as separate directed edges…
     await store.recordRelationship("g1", "u1", "u2", "m1", "close friends", 0.8, "said so");
     await store.recordRelationship("g1", "u2", "u1", "m2", "trusts them", 0.4, "returned it");
+    await sql`UPDATE relationship_observations SET verdict = 'literal' WHERE guild_id = 'g1'`;
+    await store.recomputeEdges("g1");
     const edges = await store.mergedEdges("g1", "u1");
     // …but surface as one merged edge with summed counts + weighted valence
     assert.equal(edges.length, 1);
@@ -487,6 +495,9 @@ test("relationshipObservationsFor returns both directions with labels", async ()
     const { store } = await makeStore(sql);
     await store.recordRelationship("g1", "u1", "u2", "m1", "antagonizes", -0.5, "mocked them");
     await store.recordRelationship("g1", "u2", "u1", "m2", "defends", 0.7, "stood up for them");
+    // Only literal-verdicted observations are surfaced
+    assert.equal((await store.relationshipObservationsFor("g1", "u1")).length, 0);
+    await sql`UPDATE relationship_observations SET verdict = 'literal' WHERE guild_id = 'g1'`;
     const obs = await store.relationshipObservationsFor("g1", "u1");
     assert.equal(obs.length, 2);
     const byDir = Object.fromEntries(obs.map(o => [o.direction, o]));
@@ -496,17 +507,23 @@ test("relationshipObservationsFor returns both directions with labels", async ()
   } finally { await sql.end(); }
 });
 
-test("recomputeEdges excludes joke-verdict observations", async () => {
+test("recomputeEdges builds edges only from literal-verdicted observations", async () => {
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
     await store.recordRelationship("g1", "u1", "u2", "m1", "dating", 0.9, "joke ship");
     await store.recordRelationship("g1", "u1", "u2", "m2", "close friends", 0.8, "real signal");
-    assert.equal((await store.relationshipsFor("g1", "u1")).length, 1);
+    await store.recordRelationship("g1", "u1", "u2", "m3", "flirts", 0.5, "ambiguous bit");
+    // Nothing is visible while all observations are unverified
+    await store.recomputeEdges("g1");
+    assert.equal((await store.relationshipsFor("g1", "u1")).length, 0);
 
-    // Mark the first observation a joke → recompute drops its contribution
-    const [obs] = await sql<Array<{ id: number }>>`SELECT id FROM relationship_observations WHERE message_id = 'm1'`;
-    await store.setObservationVerdict(obs.id, "joke");
+    // joke + literal + unclear → edge aggregates the literal observation alone
+    const obs = await sql<Array<{ id: number; message_id: string }>>`SELECT id, message_id FROM relationship_observations WHERE guild_id = 'g1'`;
+    const idOf = (mid: string) => obs.find(o => o.message_id === mid)!.id;
+    await store.setObservationVerdict(idOf("m1"), "joke");
+    await store.setObservationVerdict(idOf("m2"), "literal");
+    await store.setObservationVerdict(idOf("m3"), "unclear");
     const edgeCount = await store.recomputeEdges("g1");
     assert.equal(edgeCount, 1);
     const edge = (await store.relationshipsFor("g1", "u1"))[0];
@@ -514,9 +531,8 @@ test("recomputeEdges excludes joke-verdict observations", async () => {
     assert.equal(edge.summary, "close friends");
     assert.equal(edge.valence, 0.8);
 
-    // Joking the remaining observation empties the edge entirely
-    const [obs2] = await sql<Array<{ id: number }>>`SELECT id FROM relationship_observations WHERE message_id = 'm2'`;
-    await store.setObservationVerdict(obs2.id, "joke");
+    // Joking the remaining literal observation empties the edge entirely
+    await store.setObservationVerdict(idOf("m2"), "joke");
     await store.recomputeEdges("g1");
     assert.equal((await store.relationshipsFor("g1", "u1")).length, 0);
   } finally { await sql.end(); }
