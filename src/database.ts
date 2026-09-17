@@ -232,7 +232,13 @@ export class MemoryStore {
   }
 
   async setMemberOptOut(guildId: string, userId: string, optedOut: boolean): Promise<void> {
-    await this.sql`UPDATE members SET opted_out = ${optedOut ? 1 : 0} WHERE guild_id = ${guildId} AND user_id = ${userId}`;
+    // Upsert: a member who has never posted has no row yet, and opt-out must
+    // still stick for when they do.
+    await this.sql`
+      INSERT INTO members (guild_id, user_id, known_names, first_seen_at, last_seen_at, message_count, opted_out)
+      VALUES (${guildId}, ${userId}, '{}', NOW(), NOW(), 0, ${optedOut ? 1 : 0})
+      ON CONFLICT (guild_id, user_id) DO UPDATE SET opted_out = ${optedOut ? 1 : 0}
+    `;
   }
 
   /** Learn a new name for a member from evidence (self-naming, manual /alias).
@@ -350,7 +356,7 @@ export class MemoryStore {
   /** Candidate memories with promotable evidence types, joined to their first source message.
    * Carries the author's known names and the messages preceding the source so the
    * verifier can spot pasted/quoted text and jokes that only read literal in isolation. */
-  async listVerifiableCandidates(guildId: string): Promise<Array<{
+  async listVerifiableCandidates(guildId: string, limit = 200): Promise<Array<{
     memoryId: number; subjectId: string; kind: Memory["kind"]; content: string;
     evidenceType: string; selfReport: boolean; authorName: string; authorNames: string[];
     sourceMessage: string; contextBefore: Array<{ authorName: string; content: string }>;
@@ -376,6 +382,7 @@ export class MemoryStore {
       WHERE m.guild_id = ${guildId} AND m.status = 'candidate'
         AND m.primary_evidence_type IN ('explicit_fact', 'clear_preference', 'correction')
       ORDER BY m.id
+      LIMIT ${limit}
     `;
     return await Promise.all(rows.map(async r => {
       let contextBefore: Array<{ authorName: string; content: string }> = [];
@@ -967,6 +974,15 @@ export class MemoryStore {
 
   async forget(guildId: string, id: number): Promise<number> {
     const result = await this.sql`UPDATE memories SET status = 'forgotten' WHERE guild_id = ${guildId} AND id = ${id} AND status != 'forgotten'`;
+    return result.count;
+  }
+
+  /** Opt-out bulk forget: every live memory about a subject → forgotten. */
+  async forgetAllFor(guildId: string, subjectId: string): Promise<number> {
+    const result = await this.sql`
+      UPDATE memories SET status = 'forgotten', updated_at = NOW()
+      WHERE guild_id = ${guildId} AND subject_id = ${subjectId} AND status != 'forgotten'
+    `;
     return result.count;
   }
 

@@ -1,4 +1,4 @@
-import { Client, Events, GatewayIntentBits } from "discord.js";
+import { Client, Events, GatewayIntentBits, type Message, type OmitPartialGroupDMChannel } from "discord.js";
 import { Brain } from "./brain.js";
 import { config } from "./config.js";
 import { MemoryStore } from "./database.js";
@@ -9,6 +9,7 @@ import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
 import { ProfileStore } from "./profiles.js";
 import { buildAliasMap, findMentionedUsers, resolveSubject, type AliasMap } from "./entity-resolution.js";
+import { withRetry } from "./retry.js";
 import type { MessageEvent } from "./types.js";
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
@@ -106,11 +107,27 @@ async function applyRetention() {
 setInterval(applyRetention, 24 * 60 * 60 * 1000).unref();
 
 client.on(Events.InteractionCreate, async interaction => {
-  if (interaction.isChatInputCommand()) await handleMemoryCommand(interaction, store, brain, eventStore);
-  if (interaction.isButton()) await handleMemoryButton(interaction, store);
+  try {
+    if (interaction.isChatInputCommand()) await handleMemoryCommand(interaction, store, brain, eventStore);
+    if (interaction.isButton()) await handleMemoryButton(interaction, store);
+  } catch (error) {
+    console.error("Interaction handling failed", error);
+    // Best-effort user-facing error; ignore failures (already replied/expired).
+    try {
+      if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: "Something went wrong handling that.", ephemeral: true });
+      }
+    } catch { /* interaction no longer replyable */ }
+  }
 });
 
-client.on(Events.MessageCreate, async message => {
+client.on(Events.MessageCreate, message => {
+  // Outer catch lives here, not inline: an unhandled rejection in a listener
+  // crashes the process, so every failure mode lands in this log instead.
+  handleMessage(message).catch(error => console.error("Message handling failed", error));
+});
+
+async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   if (!message.guild || message.author.bot || !message.content.trim()) return;
   if (config.guildId && message.guild.id !== config.guildId) return;
   const event: MessageEvent = {
@@ -142,10 +159,23 @@ client.on(Events.MessageCreate, async message => {
       // "I am Sage" posted by tinyriot teaches sage → tinyriot.
       if (named) await store.learnAlias(event.guildId, event.authorId, named, "self_naming", event.messageId);
       const note = named ? `the author may be naming themselves "${named}" (a previously unknown alias) or quoting/describing "${named}" — attribute accordingly` : undefined;
-      const { memories: candidates, relationships } = await brain.extractMemories(event, replyToContent, note);
+      const { memories: candidates, relationships } = await withRetry(() => brain.extractMemories(event, replyToContent, note), 3);
       const aliases = (candidates.length || relationships.length) ? await getAliasMap() : new Map<string, string>();
+      // Opted-out members accrue no new derived data: memories or relationship
+      // observations about them are skipped (raw archive is unaffected — that's
+      // covered by message retention, not opt-out).
+      const optOutCache = new Map<string, boolean>();
+      const isOptedOut = async (userId: string) => {
+        if (userId === "unknown" || userId === "server") return false;
+        const cached = optOutCache.get(userId);
+        if (cached !== undefined) return cached;
+        const opted = (await store.getMember(event.guildId, userId))?.optedOut ?? false;
+        optOutCache.set(userId, opted);
+        return opted;
+      };
       for (const memory of candidates) {
         memory.subjectId = resolveSubject(memory, aliases, event);
+        if (await isOptedOut(memory.subjectId)) continue;
         if (memory.subjectId === "unknown" && memory.subjectName) {
           await store.logUnresolvedName(event.guildId, memory.subjectName, event.messageId);
         }
@@ -155,6 +185,7 @@ client.on(Events.MessageCreate, async message => {
       for (const rel of relationships) {
         const subjectId = rel.subjectName ? resolveSubject({ subjectName: rel.subjectName }, aliases, event) : event.authorId;
         const otherId = resolveSubject({ subjectName: rel.otherName }, aliases, event);
+        if (await isOptedOut(subjectId) || await isOptedOut(otherId)) continue;
         if (subjectId === "unknown" && rel.subjectName) await store.logUnresolvedName(event.guildId, rel.subjectName, event.messageId);
         if (otherId === "unknown" && rel.otherName) await store.logUnresolvedName(event.guildId, rel.otherName, event.messageId);
         await store.recordRelationship(event.guildId, subjectId, otherId, event.messageId, rel.nature, rel.valence, rel.reason ?? "");
@@ -194,6 +225,6 @@ client.on(Events.MessageCreate, async message => {
     const reply = await brain.reply(event, await store.recentContext(event.guildId, event.channelId), await store.relevantMemories(event.guildId, event.authorId), profiles, process.env.REPLY_MODEL, process.env.REPLY_TOOLS === "1" && toolCues(event.content));
     if (reply) { await message.reply({ content: reply, allowedMentions: { repliedUser: false } }); botActivity.set(key, Date.now()); }
   } catch (error) { console.error("Reply generation failed", error); }
-});
+}
 
 client.login(config.discordToken);

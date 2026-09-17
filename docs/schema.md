@@ -241,7 +241,7 @@ Member registry — one row per (guild, user). Built by `recordMessage()` so bot
 | `first_seen_at` | TEXT | ISO-8601 |
 | `last_seen_at` | TEXT | ISO-8601 |
 | `message_count` | INTEGER | Total recorded messages |
-| `opted_out` | INTEGER | 1 = excluded from profile building; any existing profile is deleted |
+| `opted_out` | INTEGER | 1 = excluded from profile building and new memory/relationship extraction; `/opt-out` also forgets existing memories and deletes the profile |
 
 ---
 

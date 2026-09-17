@@ -161,6 +161,29 @@ test("buildProfiles skips opted-out members and deletes their existing profile",
   } finally { await sql.end(); }
 });
 
+test("setMemberOptOut upserts a row for never-posted members, forgetAllFor clears their memories", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    // No member row exists yet — opt-out must still stick.
+    await store.setMemberOptOut("g1", "u-lurker", true);
+    assert.equal((await store.getMember("g1", "u-lurker"))?.optedOut, true);
+
+    const m1 = await store.saveMemory(msg("x"), { subjectId: "u1", kind: "person_fact", content: "Fact one", reason: "t", evidenceType: "explicit_fact", effect: "support" });
+    const m2 = await store.saveMemory(msg("y"), { subjectId: "u1", kind: "person_fact", content: "Fact two", reason: "t", evidenceType: "explicit_fact", effect: "support" });
+    const other = await store.saveMemory(msg("z"), { subjectId: "u2", kind: "person_fact", content: "Other user's fact", reason: "t", evidenceType: "explicit_fact", effect: "support" });
+    assert.equal(await store.forgetAllFor("g1", "u1"), 2);
+    assert.equal((await store.getMemory("g1", m1.id))!.status, "forgotten");
+    assert.equal((await store.getMemory("g1", m2.id))!.status, "forgotten");
+    assert.equal((await store.getMemory("g1", other.id))!.status, "candidate"); // untouched
+
+    // Opt-in flips the flag back; forgotten memories stay forgotten.
+    await store.setMemberOptOut("g1", "u-lurker", false);
+    assert.equal((await store.getMember("g1", "u-lurker"))?.optedOut, false);
+    assert.equal((await store.getMemory("g1", m1.id))!.status, "forgotten");
+  } finally { await sql.end(); }
+});
+
 test("saveMemory persists the extracted subject name even when unresolved", async () => {
   const sql = makeTestSql();
   try {

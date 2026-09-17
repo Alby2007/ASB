@@ -9,6 +9,7 @@ import { detectSelfNaming, shouldInspectForMemory } from "./perception.js";
 import { runContestCheck } from "./contest.js";
 import { ProfileStore } from "./profiles.js";
 import { buildAliasMap, resolveSubject } from "./entity-resolution.js";
+import { sleep, withRetry } from "./retry.js";
 import type { MessageEvent } from "./types.js";
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -24,24 +25,7 @@ const TRIAGE_MODEL = process.env.INGEST_TRIAGE_MODEL ?? "qwen/qwen3.8-27b";
 const TRIAGE_BATCH_SIZE = 10;       // Messages per triage call
 const TRIAGE_DELAY_MS = 1500;       // Triage prompts are small — 40 RPM is safe
 
-async function withRetry<T>(fn: () => Promise<T>, retries = 6): Promise<T> {
-  for (let i = 0; i < retries; i++) {
-    try { return await fn(); } catch (err) {
-      const msg = (err as Error).message;
-      if (msg.includes("429") && i < retries - 1) {
-        const headers = (err as { headers?: Headers }).headers;
-        const tokenReset = headers?.get("x-ratelimit-reset-tokens");
-        const retryAfter = headers?.get("retry-after");
-        const wait = tokenReset
-          ? Math.ceil(parseFloat(tokenReset) * 1000) + 1000
-          : retryAfter ? parseInt(retryAfter) * 1000 + 1000 : (i + 1) * 30_000;
-        console.log(`  [429] rate limit — waiting ${(wait / 1000).toFixed(1)}s...`);
-        await sleep(wait);
-      } else throw err;
-    }
-  }
-  throw new Error("exhausted retries");
-}
+
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const brain = new Brain(config.groqKey, config.model, config.groqBaseUrl);
@@ -52,7 +36,7 @@ let eventStore: EventStore;
 
 let total = 0, archived = 0, batchCalls = 0, memoriesSaved = 0, eventsCreated = 0, llmErrors = 0, relationshipsRecorded = 0;
 
-function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+
 
 type RawMsg = { id: string; author: { id: string; bot: boolean; username: string; displayName?: string }; member?: { displayName?: string } | null; content: string; createdAt: Date; reference?: { messageId?: string | null } | null; channel: { id: string }; guild: { id: string } };
 
@@ -214,7 +198,10 @@ client.once("ready", async () => {
   // can resolve names like "Starz" to real user IDs throughout extraction.
   const aliasMap = await buildAliasMap(guild.id, store);
   // userId → known display names, for the pasted/echoed self-naming guard
-  const memberNames = new Map((await store.listMembers(guild.id)).map(m => [m.userId, m.knownNames]));
+  const members = await store.listMembers(guild.id);
+  const memberNames = new Map(members.map(m => [m.userId, m.knownNames]));
+  // Opted-out members get no memories or relationship observations, same as live.
+  const optedOut = new Set(members.filter(m => m.optedOut).map(m => m.userId));
 
   for (let i = 0; i < toExtract.length; i += LLM_BATCH_SIZE) {
     const batch = toExtract.slice(i, i + LLM_BATCH_SIZE);
@@ -233,6 +220,7 @@ client.once("ready", async () => {
         const ids: number[] = [];
         for (const memory of result.memories) {
           memory.subjectId = resolveSubject(memory, aliasMap, item.event);
+          if (optedOut.has(memory.subjectId)) continue;
           if (memory.subjectId === "unknown" && memory.subjectName) {
             await store.logUnresolvedName(item.event.guildId, memory.subjectName, item.event.messageId);
           }
@@ -243,6 +231,7 @@ client.once("ready", async () => {
         for (const rel of result.relationships) {
           const subjectId = rel.subjectName ? resolveSubject({ subjectName: rel.subjectName }, aliasMap, item.event) : item.event.authorId;
           const otherId = resolveSubject({ subjectName: rel.otherName }, aliasMap, item.event);
+          if (optedOut.has(subjectId) || optedOut.has(otherId)) continue;
           if (subjectId === "unknown" && rel.subjectName) await store.logUnresolvedName(item.event.guildId, rel.subjectName, item.event.messageId);
           if (otherId === "unknown" && rel.otherName) await store.logUnresolvedName(item.event.guildId, rel.otherName, item.event.messageId);
           if (await store.recordRelationship(item.event.guildId, subjectId, otherId, item.event.messageId, rel.nature, rel.valence, rel.reason ?? "")) {

@@ -28,7 +28,9 @@ export const commandDefinitions = [
   ] },
   { name: "dossier", description: "View a member's detailed profile dossier", options: [
     { name: "user", description: "Member to inspect (admins can view anyone)", type: 6, required: false }
-  ] }
+  ] },
+  { name: "opt-out", description: "Stop the bot forming memories or a profile about you, and forget what it already holds" },
+  { name: "opt-in", description: "Re-enable memory and profile building about you" }
 ];
 
 const confidence = (value: number | undefined) => {
@@ -234,6 +236,17 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     if (tl?.entries?.length) embeds.push(new EmbedBuilder().setTitle("Timeline").setDescription(tl.entries.map(e => `• ${e.date ?? "?"} — ${e.title ?? "Untitled"} *(${e.role ?? "participant"})*`).join("\n")));
 
     return interaction.reply({ ephemeral: true, embeds: embeds.slice(0, 10) });
+  }
+  if (interaction.commandName === "opt-out") {
+    const userId = interaction.user.id;
+    await store.setMemberOptOut(guildId, userId, true);
+    const forgotten = await store.forgetAllFor(guildId, userId);
+    await new ProfileStore().deleteProfile(guildId, userId);
+    return interaction.reply({ content: `Opted out. ${forgotten} memor${forgotten === 1 ? "y" : "ies"} about you ${forgotten === 1 ? "was" : "were"} forgotten and your profile was deleted — no new memories, relationships, or profile data will be formed about you while you're opted out. Your messages still appear in the raw archive until the server's retention window removes them. Use /opt-in to re-enable.`, ephemeral: true });
+  }
+  if (interaction.commandName === "opt-in") {
+    await store.setMemberOptOut(guildId, interaction.user.id, false);
+    return interaction.reply({ content: "Opted back in. Previously forgotten memories stay forgotten, but new memories and your profile can be built again from future activity.", ephemeral: true });
   }
 }
 

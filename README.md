@@ -24,6 +24,7 @@ All replies are private (ephemeral) by default.
 - `/correct statement:"I don't support Arsenal anymore"` — creates the replacement memory and supersedes genuinely contradictory active memories.
 - `/memory-export` — download every memory and its evidence held about you.
 - `/memory stats:true` and `/memory-purge` — server-administrator controls for counts and raw-message retention.
+- `/opt-out` and `/opt-in` — forget everything remembered about you, delete your profile, and stop the bot forming new memories or relationships about you (raw messages still age out via retention).
 - `/memory-pause`, `/memory-resume`, and `/memory-settings` — server-administrator emergency and operational controls.
 - `/event memory_id:42` — inspect the server event linked to a memory: participants, significance score, summary, and message count.
 

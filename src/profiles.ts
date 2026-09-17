@@ -88,7 +88,8 @@ export class ProfileStore {
     return rows.map(rowToProfile);
   }
 
-  private async deleteProfile(guildId: string, subjectId: string): Promise<void> {
+  /** Public for /opt-out — removes card + dossier sections. */
+  async deleteProfile(guildId: string, subjectId: string): Promise<void> {
     await this.sql`DELETE FROM profiles WHERE guild_id = ${guildId} AND subject_id = ${subjectId}`;
   }
 
