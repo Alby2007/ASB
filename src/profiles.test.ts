@@ -54,6 +54,17 @@ test("findMentionedUsers matches longest names first and respects word boundarie
   assert.deepEqual(findMentionedUsers("nobody mentioned", map), []);
 });
 
+test("findMentionedUsers: a longer alias wins over a different user's prefix-word alias", () => {
+  // "al" is one member's nickname; "al smith" is a different member's name.
+  // The combined pattern consumes the longest match at each position, so only
+  // Al Smith is flagged — the text almost certainly refers to them, not also
+  // to whoever happens to be nicknamed "al".
+  const map = alias([["al", "u-al"], ["al smith", "u-alsmith"]]);
+  assert.deepEqual(findMentionedUsers("al smith is here", map), ["u-alsmith"]);
+  // A standalone "al" elsewhere in the text still resolves to the nickname owner.
+  assert.deepEqual(findMentionedUsers("al smith and al talked", map).sort(), ["u-al", "u-alsmith"]);
+});
+
 // ── Member registry ───────────────────────────────────────────────────────────
 
 test("recordMessage upserts members: names accumulate and message_count increments", async () => {

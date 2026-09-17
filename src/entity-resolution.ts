@@ -84,19 +84,41 @@ export function resolveSubject(
 }
 
 /**
- * Find user IDs referenced by name in message text. Aliases are scanned
- * longest-first with word boundaries so "al" can't match inside "alby".
- * Discord <@ID> mentions are handled separately via message.mentions.
+ * All aliases compiled into a single `\b(a1|a2|…)\b` pattern, cached per map
+ * instance (WeakMap — patterns GC with their maps). One regex construction and
+ * one scan per message regardless of alias count. Longest-first ordering inside
+ * the alternation is load-bearing: a longer alias wins over its proper
+ * word-prefix ("al smith" beats "al"), so a shorter alias belonging to someone
+ * else never fires on the same span.
+ */
+const patternCache = new WeakMap<AliasMap, RegExp | null>();
+
+function aliasPattern(aliasMap: AliasMap): RegExp | null {
+  let pattern = patternCache.get(aliasMap);
+  if (pattern === undefined) {
+    const aliases = [...aliasMap.keys()]
+      .filter(a => !DISCORD_ID.test(a))
+      .sort((a, b) => b.length - a.length);
+    pattern = aliases.length
+      ? new RegExp(`\\b(${aliases.map(escapeRegExp).join("|")})\\b`, "gi")
+      : null;
+    patternCache.set(aliasMap, pattern);
+  }
+  return pattern;
+}
+
+/**
+ * Find user IDs referenced by name in message text. Word boundaries apply so
+ * "al" can't match inside "alby". Discord <@ID> mentions are handled separately
+ * via message.mentions.
  */
 export function findMentionedUsers(content: string, aliasMap: AliasMap): string[] {
+  const pattern = aliasPattern(aliasMap);
+  if (!pattern) return [];
   const found = new Set<string>();
-  const aliases = [...aliasMap.keys()]
-    .filter(a => !DISCORD_ID.test(a))
-    .sort((a, b) => b.length - a.length);
-  for (const alias of aliases) {
-    if (new RegExp(`\\b${escapeRegExp(alias)}\\b`, "i").test(content)) {
-      found.add(aliasMap.get(alias)!);
-    }
+  for (const m of content.matchAll(pattern)) {
+    const id = aliasMap.get(m[1].toLowerCase());
+    if (id) found.add(id);
   }
   return [...found];
 }
