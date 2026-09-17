@@ -1192,13 +1192,24 @@ export class MemoryStore {
 
   // ── Context helpers ────────────────────────────────────────────────────────
 
-  async recentContext(guildId: string, channelId: string, limit = 12): Promise<Array<{ authorName: string; content: string; createdAt: string }>> {
-    const rows = await this.sql<MessageRow[]>`
-      SELECT author_name, content, created_at FROM messages
-      WHERE guild_id = ${guildId} AND channel_id = ${channelId}
-      ORDER BY created_at DESC LIMIT ${limit}
+  /** Recent channel transcript with reply edges resolved — "call her a bitch"
+   * only makes sense if the model can see it was a reply to a specific line.
+   * Bot-authored rows carry authorId so the reply path can render them as
+   * "you:" and member→bot reply edges resolve instead of dangling. */
+  async recentContext(guildId: string, channelId: string, limit = 25): Promise<Array<{ authorName: string; authorId: string; content: string; createdAt: string; replyToAuthorId?: string; replyToAuthor?: string; replyToSnippet?: string }>> {
+    const rows = await this.sql<Array<{ author_name: string; author_id: string; content: string; created_at: string; reply_to_author_id: string | null; reply_to_author: string | null; reply_to_snippet: string | null }>>`
+      SELECT m.author_name, m.author_id, m.content, m.created_at,
+             ref.author_id AS reply_to_author_id, ref.author_name AS reply_to_author,
+             LEFT(ref.content, 80) AS reply_to_snippet
+      FROM messages m
+      LEFT JOIN messages ref ON ref.id = m.reply_to_id
+      WHERE m.guild_id = ${guildId} AND m.channel_id = ${channelId}
+      ORDER BY m.created_at DESC LIMIT ${limit}
     `;
-    return rows.reverse().map(r => ({ authorName: r.author_name, content: r.content, createdAt: ts(r.created_at) }));
+    return rows.reverse().map(r => ({
+      authorName: r.author_name, authorId: r.author_id, content: r.content, createdAt: ts(r.created_at),
+      ...(r.reply_to_author ? { replyToAuthorId: r.reply_to_author_id ?? undefined, replyToAuthor: r.reply_to_author, replyToSnippet: r.reply_to_snippet ?? "" } : {}),
+    }));
   }
 
   async messagesByIds(messageIds: string[]): Promise<Array<{ authorName: string; content: string; createdAt: string }>> {

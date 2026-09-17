@@ -137,7 +137,7 @@ async function applyRetention() {
     } catch (error) { console.error("Dedup pass failed", error); inc("dedup.errors"); }
     // v0.3: rebuild per-chatter profile cards + dossiers (LLM calls only when inputs changed)
     try {
-      const profiles = await profileStore.buildProfiles(guild.id, brain, store, eventStore, process.env.PROFILE_MODEL);
+      const profiles = await profileStore.buildProfiles(guild.id, brain, store, eventStore, process.env.PROFILE_MODEL, { excludeIds: [client.user!.id] });
       if (profiles.built) console.log(`Profiles in ${guild.name}: ${profiles.built} rebuilt, ${profiles.unchanged} unchanged of ${profiles.considered}`);
     } catch (error) { console.error("Profile build failed", error); }
   }
@@ -412,13 +412,23 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     // tokens in stored content taught the model to greet users with fabricated
     // snowflakes ("Hey <@1549171765056638>!").
     const context = (await store.recentContext(event.guildId, event.channelId))
-      .map(x => ({ ...x, content: demangleMentions(x.content, lookups.names) }));
+      .map(x => ({ ...x, content: demangleMentions(x.content, lookups.names), replyToSnippet: x.replyToSnippet ? demangleMentions(x.replyToSnippet, lookups.names) : undefined }));
     // Address the author by their freshest known name so a "call me X" learned
     // moments ago takes effect immediately, not after the next profile build.
     const authorName = await store.displayNameFor(event.guildId, event.authorId);
-    const reply = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, process.env.REPLY_MODEL, process.env.REPLY_TOOLS === "1" && toolCues(event.content));
+    const reply = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, process.env.REPLY_MODEL, process.env.REPLY_TOOLS === "1" && toolCues(event.content), client.user!.id);
     const clean = reply ? scrubMentions(reply, lookups.names) : "";
-    if (clean) { await message.reply({ content: clean, allowedMentions: { repliedUser: false } }); botActivity.set(key, Date.now()); inc("reply.sent"); }
+    if (clean) {
+      const sent = await message.reply({ content: clean, allowedMentions: { repliedUser: false } });
+      botActivity.set(key, Date.now()); inc("reply.sent");
+      // Archive the bot's own line so the transcript carries its voice and
+      // member→bot reply edges resolve — otherwise reply_to_id dangles.
+      await store.recordMessage({
+        guildId: event.guildId, channelId: event.channelId, messageId: sent.id,
+        authorId: client.user!.id, authorName: message.guild.members.me?.displayName ?? client.user!.username,
+        content: clean, createdAt: sent.createdAt ?? new Date(), mentionsBot: false,
+      }, event.messageId);
+    }
   } catch (error) { inc("llm.reply_error"); console.error("Reply generation failed", error); }
 }
 

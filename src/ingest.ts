@@ -377,7 +377,7 @@ client.once("ready", async () => {
   console.log("Building member profiles...");
   try {
     const profileStore = new ProfileStore();
-    const profiles = await withRetry(() => profileStore.buildProfiles(guild.id, brain, store, eventStore, process.env.PROFILE_MODEL ?? BATCH_MODEL));
+    const profiles = await withRetry(() => profileStore.buildProfiles(guild.id, brain, store, eventStore, process.env.PROFILE_MODEL ?? BATCH_MODEL, { excludeIds: [client.user!.id] }));
     console.log(`Profiles: ${profiles.built} built | ${profiles.unchanged} unchanged | ${profiles.considered} considered`);
   } catch (err) {
     console.error("Profile build failed:", (err as Error).message.slice(0, 120));
