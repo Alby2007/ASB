@@ -13,6 +13,17 @@ const env = z.object({
   SPEAK_THRESHOLD: z.coerce.number().min(0).max(1).default(0.7),
   RAW_MESSAGE_RETENTION_DAYS: z.coerce.number().int().min(1).max(365).default(30),
   CANDIDATE_CONFIDENCE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.7),
+  // Model overrides — all optional; per-feature fallback chains live in the
+  // derived config below so a typo'd name or value is visible in one place.
+  VERIFY_MODEL: z.string().optional(),
+  PROFILE_MODEL: z.string().optional(),
+  DOSSIER_MODEL: z.string().optional(),
+  CONTEST_MODEL: z.string().optional(),
+  INGEST_MODEL: z.string().optional(),
+  INGEST_TRIAGE_MODEL: z.string().optional(),
+  REPLY_MODEL: z.string().optional(),
+  REPLY_TOOLS: z.string().optional(),
+  INGEST_CHANNEL: z.string().optional(),
 }).parse(process.env);
 
 export const config = {
@@ -25,4 +36,15 @@ export const config = {
   speakThreshold: env.SPEAK_THRESHOLD,
   rawMessageRetentionDays: env.RAW_MESSAGE_RETENTION_DAYS,
   candidateConfidenceThreshold: env.CANDIDATE_CONFIDENCE_THRESHOLD,
+  // Model override chains — terminal default stays at each call site because
+  // index.ts and ingest.ts intentionally differ (config.model vs qwen).
+  verifyModel: env.VERIFY_MODEL ?? env.PROFILE_MODEL,
+  profileModel: env.PROFILE_MODEL,
+  dossierModel: env.DOSSIER_MODEL,
+  contestModel: env.CONTEST_MODEL ?? env.VERIFY_MODEL ?? env.INGEST_MODEL,
+  ingestModel: env.INGEST_MODEL,
+  triageModel: env.INGEST_TRIAGE_MODEL,
+  replyModel: env.REPLY_MODEL,
+  replyTools: env.REPLY_TOOLS === "1",
+  ingestChannel: env.INGEST_CHANNEL ?? "general-chat",
 };

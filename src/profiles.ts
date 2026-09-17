@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { config } from "./config.js";
 import { sql as defaultSql, type Sql } from "./db.js";
 import type { Brain } from "./brain.js";
 import type { MemoryStore } from "./database.js";
@@ -292,7 +293,7 @@ export class ProfileStore {
           continue;
         }
         const validIds = collectSourceIds(sectionInput.payload);
-        const sectionModel = process.env.DOSSIER_MODEL ?? model;
+        const sectionModel = config.dossierModel ?? model;
         try {
           let data = await brain.synthesizeDossierSection(sectionInput.section, displayName, sectionInput.payload, sectionModel);
           if (typeof data.prose === "string" && looksDegenerate(data.prose)) {

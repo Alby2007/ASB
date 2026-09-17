@@ -79,7 +79,7 @@ async function applyRetention() {
         const batch = verifiable.slice(i, i + 10);
         const verdicts = await brain.verifyMemoriesBatch(
           batch.map(b => ({ memoryId: b.memoryId, authorName: b.authorName, authorNames: b.authorNames, claim: b.content, sourceMessage: b.sourceMessage, contextBefore: b.contextBefore })),
-          process.env.VERIFY_MODEL ?? process.env.PROFILE_MODEL ?? config.model
+          config.verifyModel ?? config.model
         );
         for (const b of batch) {
           const v = verdicts.get(b.memoryId);
@@ -107,7 +107,7 @@ async function applyRetention() {
         })));
         const verdicts = await brain.verifyRelationshipsBatch(
           items,
-          process.env.VERIFY_MODEL ?? process.env.PROFILE_MODEL ?? config.model
+          config.verifyModel ?? config.model
         );
         for (const b of batch) {
           const v = verdicts.get(b.observationId);
@@ -130,7 +130,7 @@ async function applyRetention() {
           label: m.label,
           memories: m.memories.map(mm => { const i = index++; idByIndex.set(i, mm.memoryId); return { index: i, kind: mm.kind, status: mm.status, content: mm.content }; }),
         }));
-        const groups = await brain.dedupMemoriesBatch(indexed, process.env.VERIFY_MODEL ?? process.env.PROFILE_MODEL ?? config.model);
+        const groups = await brain.dedupMemoriesBatch(indexed, config.verifyModel ?? config.model);
         const dupGroups = groups.filter(g => g.relation === "duplicate")
           .map(g => ({ ids: g.indices.map(i => idByIndex.get(i)).filter((x): x is number => x !== undefined), reason: g.reason }));
         const { merged, skipped } = await store.applyDedupGroups(guild.id, dupGroups);
@@ -149,7 +149,7 @@ async function applyRetention() {
     } catch (error) { console.error("Dedup pass failed", error); inc("dedup.errors"); }
     // v0.3: rebuild per-chatter profile cards + dossiers (LLM calls only when inputs changed)
     try {
-      const profiles = await profileStore.buildProfiles(guild.id, brain, store, eventStore, process.env.PROFILE_MODEL, { excludeIds: [client.user!.id] });
+      const profiles = await profileStore.buildProfiles(guild.id, brain, store, eventStore, config.profileModel, { excludeIds: [client.user!.id] });
       if (profiles.built) console.log(`Profiles in ${guild.name}: ${profiles.built} rebuilt, ${profiles.unchanged} unchanged of ${profiles.considered}`);
     } catch (error) { console.error("Profile build failed", error); }
   }
@@ -207,7 +207,7 @@ async function sweepMissedSignals(windowMs: number) {
         try {
           const verdicts = await withRetry(() => brain.triageBatch(
             batch.map(b => ({ messageId: b.id, authorName: b.authorName, content: b.content })),
-            process.env.INGEST_TRIAGE_MODEL ?? config.model
+            config.triageModel ?? config.model
           ), 3);
           for (const item of batch) {
             const durable = verdicts.get(item.id)?.durable ?? false;
@@ -247,7 +247,7 @@ async function sweepMissedSignals(windowMs: number) {
           }
         }
         try {
-          const results = await withRetry(() => brain.extractMemoriesBatch(batch, process.env.INGEST_MODEL ?? config.model), 3);
+          const results = await withRetry(() => brain.extractMemoriesBatch(batch, config.ingestModel ?? config.model), 3);
           for (const item of batch) {
             const result = results.get(item.event.messageId) ?? { memories: [], relationships: [] };
             for (const memory of result.memories) {
@@ -407,7 +407,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   // Contest detection: bot-addressed denials/corrections update the memories they target
   if (settings.memoryEnabled) {
     try {
-      await runContestCheck(event, brain, store, client.user!.id, process.env.CONTEST_MODEL ?? process.env.VERIFY_MODEL ?? process.env.INGEST_MODEL ?? config.model);
+      await runContestCheck(event, brain, store, client.user!.id, config.contestModel ?? config.model);
     } catch (error) { inc("contest.error"); console.error("Contest check failed", error); }
   }
   // v0.2: event detection pipeline (runs regardless of whether memories were extracted,
@@ -443,7 +443,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     // moments ago takes effect immediately, not after the next profile build.
     const authorName = await store.displayNameFor(event.guildId, event.authorId);
     const ownerName = message.guild.ownerId ? await store.displayNameFor(event.guildId, message.guild.ownerId) : undefined;
-    const reply = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, process.env.REPLY_MODEL, process.env.REPLY_TOOLS === "1" && toolCues(event.content), client.user!.id, { guildName: message.guild.name, ownerName });
+    const reply = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, config.replyModel, config.replyTools && toolCues(event.content), client.user!.id, { guildName: message.guild.name, ownerName });
     const clean = reply ? scrubMentions(reply, lookups.names) : "";
     if (clean) {
       const sent = await message.reply({ content: clean, allowedMentions: { repliedUser: false } });

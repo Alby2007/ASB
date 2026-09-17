@@ -13,15 +13,15 @@ import { sleep, withRetry } from "./retry.js";
 import type { MessageEvent } from "./types.js";
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const CHANNEL_NAME = process.env.INGEST_CHANNEL ?? "general-chat";
+const CHANNEL_NAME = config.ingestChannel;
 const DISCORD_BATCH_SIZE = 100;     // Discord API max per fetch
 const LLM_BATCH_SIZE = 5;           // Messages per LLM call (batched extraction)
 // qwen3.8-27b gets 60 RPM on Groq free tier — 2x the rate limit of gpt-oss-20b.
 // Combined with 5-msg batching this gives ~10x effective throughput vs single-message calls.
-const BATCH_MODEL = process.env.INGEST_MODEL ?? "qwen/qwen3.8-27b";
+const BATCH_MODEL = config.ingestModel ?? "qwen/qwen3.8-27b";
 const BATCH_DELAY_MS = 3000;        // Delay between batch LLM calls
 const EVENT_DELAY_MS = 3000;        // Pipeline LLM calls get the same pacing
-const TRIAGE_MODEL = process.env.INGEST_TRIAGE_MODEL ?? "qwen/qwen3.8-27b";
+const TRIAGE_MODEL = config.triageModel ?? "qwen/qwen3.8-27b";
 const TRIAGE_BATCH_SIZE = 10;       // Messages per triage call
 const TRIAGE_DELAY_MS = 1500;       // Triage prompts are small — 40 RPM is safe
 
@@ -296,7 +296,7 @@ client.once("ready", async () => {
       try {
         const verdicts = await withRetry(() => brain.verifyMemoriesBatch(
           batch.map(b => ({ memoryId: b.memoryId, authorName: b.authorName, authorNames: b.authorNames, claim: b.content, sourceMessage: b.sourceMessage, contextBefore: b.contextBefore })),
-          process.env.VERIFY_MODEL ?? BATCH_MODEL
+          config.verifyModel ?? BATCH_MODEL
         ));
         for (const b of batch) {
           const v = verdicts.get(b.memoryId) ?? { verdict: "unclear" as const, reason: "omitted" };
@@ -324,7 +324,7 @@ client.once("ready", async () => {
       if (msg.author.bot || !msg.content.trim()) continue;
       if (!msg.content.includes(`<@${botId}>`) && !msg.content.includes(`<@!${botId}>`)) continue;
       try {
-        const r = await withRetry(() => runContestCheck(toEvent(msg), brain, store, botId, process.env.CONTEST_MODEL ?? BATCH_MODEL));
+        const r = await withRetry(() => runContestCheck(toEvent(msg), brain, store, botId, config.contestModel ?? BATCH_MODEL));
         contests += r.contests; confirms += r.confirms;
         if (r.contests || r.confirms) await sleep(EVENT_DELAY_MS);
       } catch (err) {
@@ -358,7 +358,7 @@ client.once("ready", async () => {
         label: m.label,
         memories: m.memories.map(mm => { const i = index++; idByIndex.set(i, mm.memoryId); return { index: i, kind: mm.kind, status: mm.status, content: mm.content }; }),
       }));
-      const groups = await withRetry(() => brain.dedupMemoriesBatch(indexed, process.env.VERIFY_MODEL ?? BATCH_MODEL));
+      const groups = await withRetry(() => brain.dedupMemoriesBatch(indexed, config.verifyModel ?? BATCH_MODEL));
       const dupGroups = groups.filter(g => g.relation === "duplicate")
         .map(g => ({ ids: g.indices.map(i => idByIndex.get(i)).filter((x): x is number => x !== undefined), reason: g.reason }));
       const { merged, skipped } = await store.applyDedupGroups(guild.id, dupGroups);
@@ -382,7 +382,7 @@ client.once("ready", async () => {
   console.log("Building member profiles...");
   try {
     const profileStore = new ProfileStore();
-    const profiles = await withRetry(() => profileStore.buildProfiles(guild.id, brain, store, eventStore, process.env.PROFILE_MODEL ?? BATCH_MODEL, { excludeIds: [client.user!.id] }));
+    const profiles = await withRetry(() => profileStore.buildProfiles(guild.id, brain, store, eventStore, config.profileModel ?? BATCH_MODEL, { excludeIds: [client.user!.id] }));
     console.log(`Profiles: ${profiles.built} built | ${profiles.unchanged} unchanged | ${profiles.considered} considered`);
   } catch (err) {
     console.error("Profile build failed:", (err as Error).message.slice(0, 120));

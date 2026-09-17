@@ -26,6 +26,13 @@ ASB is configured through environment variables validated at startup by `src/con
 | `CANDIDATE_CONFIDENCE_THRESHOLD` | `0.70` | Minimum confidence required to auto-promote a candidate memory to active status (subject to evidence type gates). Range 0–1. |
 | `REPLY_MODEL` | `GROQ_MODEL` | Model used for Discord replies, across all reply paths. Any Groq model id, or `groq/compound*` for Groq's agentic system with built-in web tools. Reasoning models (gpt-oss, qwen3) get `reasoning_effort=low` automatically to cut latency and flatten the register. |
 | `REPLY_TOOLS` | (off) | `1` attaches free local `web_search`/`visit_url` tools to replies when a message matches tool cues (links, "look up", etc.). |
+| `VERIFY_MODEL` | `PROFILE_MODEL` → `GROQ_MODEL` | Model for memory/relationship verification and dedup passes. |
+| `PROFILE_MODEL` | `GROQ_MODEL` | Model for profile card synthesis. |
+| `DOSSIER_MODEL` | `GROQ_MODEL` | Model for dossier section synthesis. |
+| `CONTEST_MODEL` | `VERIFY_MODEL` → `INGEST_MODEL` → `GROQ_MODEL` | Model for contest/denial detection. |
+| `INGEST_MODEL` | `qwen/qwen3.8-27b` (ingest), `GROQ_MODEL` (sweep) | Model for batch memory extraction. |
+| `INGEST_TRIAGE_MODEL` | `qwen/qwen3.8-27b` (ingest), `GROQ_MODEL` (sweep) | Model for the durability triage pass. |
+| `INGEST_CHANNEL` | `general-chat` | Channel name `npm run ingest` backfills from. |
 
 ---
 
