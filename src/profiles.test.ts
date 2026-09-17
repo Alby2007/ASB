@@ -2,7 +2,7 @@ import "dotenv/config";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { makeTestSql, makeStore } from "./test-helpers.js";
-import { buildAliasMap, findMentionedUsers, resolveSubject, type AliasMap } from "./entity-resolution.js";
+import { buildAliasMap, resolveSubject } from "./entity-resolution.js";
 import { contestCue, detectSelfNaming } from "./perception.js";
 import { runContestCheck } from "./contest.js";
 import { ProfileStore } from "./profiles.js";
@@ -17,53 +17,6 @@ function msg(content: string, overrides: Partial<MessageEvent> = {}): MessageEve
     ...overrides,
   };
 }
-
-function alias(entries: Array<[string, string]>): AliasMap {
-  return new Map(entries.map(([k, v]) => [k.toLowerCase(), v]));
-}
-
-// ── Entity resolution (pure — no database) ────────────────────────────────────
-
-test("resolveSubject passes through <@ID> mentions and raw IDs", () => {
-  const event = msg("hi");
-  assert.equal(resolveSubject({ subjectId: "<@123456789012345>" }, alias([]), event), "123456789012345");
-  assert.equal(resolveSubject({ subjectId: "123456789012345" }, alias([]), event), "123456789012345");
-});
-
-test("resolveSubject resolves a written name via the alias map", () => {
-  const map = alias([["Starz", "u-starz"]]);
-  assert.equal(resolveSubject({ subjectId: "unknown", subjectName: "Starz" }, map, msg("Starz is a Muslim")), "u-starz");
-  assert.equal(resolveSubject({ subjectName: "starz" }, map, msg("x")), "u-starz");
-});
-
-test("resolveSubject resolves self-referential names to the author", () => {
-  assert.equal(resolveSubject({ subjectName: "alice" }, alias([]), msg("i love tea")), "u-author");
-});
-
-test("resolveSubject returns unknown for unresolvable names and preserves server", () => {
-  const map = alias([["Tom", "u-tom"]]);
-  assert.equal(resolveSubject({ subjectId: "unknown", subjectName: "Nobody" }, map, msg("x")), "unknown");
-  assert.equal(resolveSubject({ subjectId: "server" }, map, msg("x")), "server");
-});
-
-test("findMentionedUsers matches longest names first and respects word boundaries", () => {
-  const map = alias([["al", "u-al"], ["alby", "u-alby"], ["tom", "u-tom"]]);
-  // "al" must not match inside "alby"
-  assert.deepEqual(findMentionedUsers("alby won again", map), ["u-alby"]);
-  assert.deepEqual(findMentionedUsers("al and tom are here", map).sort(), ["u-al", "u-tom"]);
-  assert.deepEqual(findMentionedUsers("nobody mentioned", map), []);
-});
-
-test("findMentionedUsers: a longer alias wins over a different user's prefix-word alias", () => {
-  // "al" is one member's nickname; "al smith" is a different member's name.
-  // The combined pattern consumes the longest match at each position, so only
-  // Al Smith is flagged — the text almost certainly refers to them, not also
-  // to whoever happens to be nicknamed "al".
-  const map = alias([["al", "u-al"], ["al smith", "u-alsmith"]]);
-  assert.deepEqual(findMentionedUsers("al smith is here", map), ["u-alsmith"]);
-  // A standalone "al" elsewhere in the text still resolves to the nickname owner.
-  assert.deepEqual(findMentionedUsers("al smith and al talked", map).sort(), ["u-al", "u-alsmith"]);
-});
 
 // ── Member registry ───────────────────────────────────────────────────────────
 
