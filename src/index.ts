@@ -30,20 +30,32 @@ async function init() {
 }
 
 client.once(Events.ClientReady, async ready => {
-  await init();
-  if (config.guildId) await ready.application.commands.set(commandDefinitions, config.guildId);
-  else await ready.application.commands.set(commandDefinitions);
-  applyRetention();
-  sweepMissedSignals(24 * 60 * 60_000); // wide window on boot to cover downtime
+  // init failure leaves a connected but braindead bot — exit so supervision
+  // restarts it rather than letting it sit mute.
+  try {
+    await init();
+  } catch (error) { console.error("Startup init failed", error); process.exit(1); }
+  try {
+    if (config.guildId) await ready.application.commands.set(commandDefinitions, config.guildId);
+    else await ready.application.commands.set(commandDefinitions);
+  } catch (error) { inc("init.commands_error"); console.error("Command registration failed", error); }
+  // Fire-and-forget: both loops must never reject into the event loop — on
+  // Node >=15 an unhandled rejection here is fatal to the process.
+  applyRetention().catch(error => { inc("maintenance.error"); console.error("Retention run failed", error); });
+  sweepMissedSignals(24 * 60 * 60_000).catch(error => { inc("sweep.error"); console.error("Boot sweep failed", error); }); // wide window on boot to cover downtime
   console.log(`ASM online as ${ready.user.tag}`);
 });
 
 async function applyRetention() {
   for (const guild of client.guilds.cache.values()) {
-    const settings = await store.settings(guild.id, config.rawMessageRetentionDays);
-    const deleted = await store.deleteRawMessagesOlderThan(guild.id, settings.rawRetentionDays);
-    await store.maintain(guild.id, config.candidateConfidenceThreshold);
-    if (deleted) console.log(`Retention deleted ${deleted} raw messages in ${guild.name}`);
+    // These three calls sit outside the feature-level try/catches below — a DB
+    // blip here must skip the guild, not reject the whole interval callback.
+    try {
+      const settings = await store.settings(guild.id, config.rawMessageRetentionDays);
+      const deleted = await store.deleteRawMessagesOlderThan(guild.id, settings.rawRetentionDays);
+      await store.maintain(guild.id, config.candidateConfidenceThreshold);
+      if (deleted) console.log(`Retention deleted ${deleted} raw messages in ${guild.name}`);
+    } catch (error) { inc("maintenance.retention_error"); console.error(`Retention/maintenance failed in ${guild.name}`, error); continue; }
     try {
       const pruned = await store.pruneDerivedData(guild.id);
       if (pruned.history + pruned.names + pruned.aliases + pruned.events) {
@@ -142,7 +154,9 @@ async function applyRetention() {
     } catch (error) { console.error("Profile build failed", error); }
   }
 }
-setInterval(applyRetention, 24 * 60 * 60 * 1000).unref();
+// Belt-and-braces: every guild body is try/caught, but an interval callback
+// rejection would still be an unhandled (fatal) rejection.
+setInterval(() => applyRetention().catch(error => { inc("maintenance.error"); console.error("Retention run failed", error); }), 24 * 60 * 60 * 1000).unref();
 
 const SWEEP_INTERVAL_MS = 15 * 60_000;
 const SWEEP_WINDOW_MS = 2 * 60 * 60_000;
@@ -155,8 +169,10 @@ setInterval(() => sweepMissedSignals(SWEEP_WINDOW_MS), SWEEP_INTERVAL_MS).unref(
 // this sweep gives it the same LLM triage ingest already uses, so durable
 // preferences in unpatterned phrasing ("can you just call me Alby from now on",
 // said to nobody in particular) still land within ~15 minutes. Marks persist on
-// messages.triage_result, so each message is classified once; a durable verdict
-// with no evidence is re-extracted on the next pass (crash-safe).
+// messages.triage_result, so each message is classified once; a durable or
+// regex verdict with no evidence is re-extracted on the next pass (crash-safe),
+// and 'extracted' marks the terminal state so empty results don't re-extract
+// forever.
 async function sweepMissedSignals(windowMs: number) {
   for (const guild of client.guilds.cache.values()) {
     try {
@@ -175,8 +191,8 @@ async function sweepMissedSignals(windowMs: number) {
       const triageQueue: typeof pending = [];
       for (const m of pending) {
         const event = toEvent(m);
-        if (m.triageResult === "durable") {
-          queue.push({ event, replyToId: m.replyToId ?? undefined }); // marked durable earlier but never extracted
+        if (m.triageResult === "durable" || m.triageResult === "regex") {
+          queue.push({ event, replyToId: m.replyToId ?? undefined }); // marked earlier but never extracted
         } else if (shouldInspectForMemory(event)) {
           marks.push({ id: m.id, result: "regex" });
           queue.push({ event, replyToId: m.replyToId ?? undefined });
@@ -252,6 +268,11 @@ async function sweepMissedSignals(windowMs: number) {
               await store.recordRelationship(guild.id, subjectId, otherId, item.event.messageId, rel.nature, rel.valence, rel.reason ?? "");
             }
           }
+          // Terminal mark: the batch returned and every item was processed, so
+          // these messages never qualify for re-extraction — even the ones that
+          // legitimately yielded nothing. A throw anywhere above leaves them
+          // 'durable'/'regex', which the no-evidence filter retries next pass.
+          await store.setTriageResults(batch.map(item => ({ id: item.event.messageId, result: "extracted" })));
         } catch (error) { inc("sweep.extract_error"); console.error("Sweep extraction failed", error); }
       }
       inc("sweep.runs");
@@ -312,9 +333,14 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     mentionsBot: message.mentions.has(client.user!) || message.mentions.repliedUser?.id === client.user!.id,
   };
   const settings = await store.settings(event.guildId, config.rawMessageRetentionDays);
+  // "Pause observing" must actually stop observing — a paused guild gets no
+  // raw archive rows or member-registry writes, not just no extraction. The
+  // sweep skips paused guilds anyway, so archive-during-pause rows would be
+  // orphaned the moment they're written.
+  if (!settings.memoryEnabled && !settings.replyEnabled) return;
   // Resolve the reply target first so it can be persisted with the raw message.
   const replyToId = message.reference?.messageId ?? undefined;
-  await store.recordMessage(event, replyToId);
+  if (settings.memoryEnabled) await store.recordMessage(event, replyToId);
   const savedMemoryIds: number[] = [];
   let replyToContent: string | undefined;
   if (replyToId) {
@@ -395,8 +421,8 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   const key = `${event.guildId}:${event.channelId}`;
   const lastSpoke = botActivity.get(key) ?? 0;
   const recentBotMessages = Date.now() - lastSpoke < 120_000 ? 1 : 0;
-  const decision = brain.decide(event, recentBotMessages);
-  if (!settings.replyEnabled || !decision.shouldSpeak || decision.score < config.speakThreshold) return;
+  const decision = brain.decide(event, recentBotMessages, config.speakThreshold);
+  if (!settings.replyEnabled || !decision.shouldSpeak) return;
   try {
     await message.channel.sendTyping();
     // Inject profile cards for the author, @-mentioned users, and name-referenced members.

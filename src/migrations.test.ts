@@ -2,7 +2,7 @@ import "dotenv/config";
 import assert from "node:assert/strict";
 import test from "node:test";
 import postgres from "postgres";
-import { runMigrations, getMigrationVersion } from "./migrations.js";
+import { runMigrations, getMigrationVersion, LATEST_MIGRATION_VERSION } from "./migrations.js";
 
 // ── Test DB connection ─────────────────────────────────────────────────────────
 // Tests require TEST_DATABASE_URL to be set to a Postgres DB.
@@ -16,7 +16,7 @@ function makeTestSql() {
 
 /** Drop all project tables so each test starts fresh. */
 async function resetSchema(sql: ReturnType<typeof postgres>) {
-  await sql`DROP TABLE IF EXISTS schema_migrations, profiles, relationships, relationship_observations, members, event_memories, event_messages, event_participants, events, behavioral_patterns, memory_history, memory_evidence, server_settings, memories, messages CASCADE`;
+  await sql`DROP TABLE IF EXISTS schema_migrations, profiles, profile_attributes, relationships, relationship_observations, members, event_memories, event_messages, event_participants, events, behavioral_patterns, memory_history, memory_evidence, server_settings, memories, messages CASCADE`;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -37,7 +37,7 @@ test("migrations are applied in order", async () => {
     await resetSchema(sql);
     await runMigrations(sql as any);
     const version = await getMigrationVersion(sql as any);
-    assert.equal(version, 7);
+    assert.equal(version, LATEST_MIGRATION_VERSION);
   } finally { await sql.end(); }
 });
 
@@ -168,7 +168,7 @@ test("rolling back to v1 removes behavioral_patterns table and index", async () 
   try {
     await resetSchema(sql);
     await runMigrations(sql as any);
-    assert.equal(await getMigrationVersion(sql as any), 7);
+    assert.equal(await getMigrationVersion(sql as any), LATEST_MIGRATION_VERSION);
     await runMigrations(sql as any, 1);
     assert.equal(await getMigrationVersion(sql as any), 1);
     const tables = await sql`SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name='behavioral_patterns'`;
@@ -231,5 +231,29 @@ test("migration v7 creates members, relationship_observations, relationships, pr
     for (const col of ["guild_id", "user_id", "known_names", "first_seen_at", "last_seen_at", "message_count", "opted_out"]) {
       assert.ok(mcols.includes(col), `Missing members column: ${col}`);
     }
+  } finally { await sql.end(); }
+});
+
+test("migration v12 creates profile_attributes + profiles.attr_hash, rolls back cleanly", async () => {
+  const sql = makeTestSql();
+  try {
+    await resetSchema(sql);
+    await runMigrations(sql as any);
+    const cols = await sql<Array<{ column_name: string }>>`SELECT column_name FROM information_schema.columns WHERE table_name='profile_attributes'`;
+    const names = cols.map(c => c.column_name);
+    for (const col of ["guild_id", "subject_id", "field", "value", "value_norm", "confidence", "memory_ids", "status", "superseded_by", "first_seen_at", "last_seen_at"]) {
+      assert.ok(names.includes(col), `Missing column: ${col}`);
+    }
+    const profileCols = await sql<Array<{ column_name: string }>>`SELECT column_name FROM information_schema.columns WHERE table_name='profiles'`;
+    assert.ok(profileCols.some(c => c.column_name === "attr_hash"), "profiles.attr_hash missing");
+    // Create-only: no rows are written by the migration itself.
+    const count = await sql<[{ n: number }]>`SELECT COUNT(*)::int AS n FROM profile_attributes`;
+    assert.equal(count[0].n, 0);
+
+    await runMigrations(sql as any, 11);
+    const tables = await sql<Array<{ table_name: string }>>`SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name='profile_attributes'`;
+    assert.equal(tables.length, 0, "profile_attributes should be dropped on rollback");
+    const remaining = await sql<Array<{ column_name: string }>>`SELECT column_name FROM information_schema.columns WHERE table_name='profiles' AND column_name='attr_hash'`;
+    assert.equal(remaining.length, 0, "attr_hash should be dropped on rollback");
   } finally { await sql.end(); }
 });

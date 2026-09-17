@@ -67,7 +67,7 @@ async function archiveAndFilter(msgs: RawMsg[]): Promise<{ toExtract: ExtractIte
     const replyToId = msg.reference?.messageId ?? undefined;
     await store.recordMessage(event, replyToId);
     archived++;
-    if (shouldInspectForMemory(event)) {
+    if (shouldInspectForMemory(event) && triaged.get(msg.id) !== "extracted") {
       // Regex-passed messages count as triaged too — record the path they took
       if (!triaged.has(msg.id)) regexMarked.push({ id: msg.id, result: "regex" });
       if (!(await store.hasEvidence(msg.id))) {
@@ -81,7 +81,8 @@ async function archiveAndFilter(msgs: RawMsg[]): Promise<{ toExtract: ExtractIte
     } else if (msg.content.trim().length >= 4 && !triaged.has(msg.id) && !(await store.hasEvidence(msg.id))) {
       toTriage.push({ event, replyToId });
     } else if (triaged.get(msg.id) === "durable" && !(await store.hasEvidence(msg.id))) {
-      // Marked durable in a previous run but never extracted (e.g. crash mid-run)
+      // Marked durable in a previous run but never extracted (e.g. crash
+      // mid-run). 'extracted' marks don't reach here — they skip above.
       let replyToContent: string | undefined;
       if (replyToId) {
         const ref = await store.getMessage(replyToId);
@@ -248,6 +249,10 @@ client.once("ready", async () => {
         }
         savedIdsByMessage.set(item.event.messageId, ids);
       }
+      // Terminal mark — a re-ingest never re-extracts these, even the ones that
+      // legitimately produced nothing. Batches that threw keep their verdict
+      // and are retried on the next run.
+      await store.setTriageResults(batch.map(item => ({ id: item.event.messageId, result: "extracted" })));
     } catch (err) {
       llmErrors++;
       console.error(`  [batch extraction error] batch ${batchCalls}:`, (err as Error).message.slice(0, 120));

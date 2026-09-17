@@ -111,9 +111,11 @@ test("opposite-polarity fuzzy match forces contradict even when the LLM says sup
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
-    const first = await store.saveMemory(ev("I love pizza", "m1"), candidate("User loves pizza"));
+    // The contents need enough trigram overlap to reach the fuzzy-match path;
+    // "loves pizza"/"hates pizza" alone scores ~0.55, below the 0.6 threshold.
+    const first = await store.saveMemory(ev("I really love pineapple pizza", "m1"), candidate("User really loves pineapple pizza"));
     // LLM mislabels the effect; the polarity check on the fuzzy match must force contradict.
-    const second = await store.saveMemory(ev("I hate pizza", "m2"), candidate("User hates pizza", { effect: "support" }));
+    const second = await store.saveMemory(ev("I really hate pineapple pizza", "m2"), candidate("User really hates pineapple pizza", { effect: "support" }));
     assert.equal(second.id, first.id);
     assert.equal(second.status, "contested");
     assert.equal(second.contradictionCount, 1);

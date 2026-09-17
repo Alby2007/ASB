@@ -103,6 +103,31 @@ export type RelationshipMapData = { entries: RelationshipMapEntry[] };
 export type TimelineEntry = { title: string; date: string; role: string; significance: number };
 export type TimelineData = { entries: TimelineEntry[] };
 
+// ── Structured profile attributes ────────────────────────────────────────────
+// The source of truth for profile facets: enumerated (field, value) rows with
+// memory_ids provenance. profiles.summary/facets_json are renderings of these.
+// Status is derived from cited memories except 'superseded', asserted via
+// superseded_by — a row can be superseded while its evidence is still live.
+
+export type AttributeStatus = "active" | "contested" | "superseded" | "forgotten";
+
+export type ProfileAttribute = {
+  id: number; guildId: string; subjectId: string;
+  field: string; value: string; valueNorm: string;
+  confidence: number; memoryIds: number[];
+  status: AttributeStatus; supersededBy: number | null;
+  firstSeenAt: string; lastSeenAt: string;
+};
+
+/** A candidate attribute before the upsert-diff decides insert/fold/revive. */
+export type AttributeProposal = {
+  field: string;
+  value: string;
+  memoryIds: number[];
+  /** value_norm of an existing row this proposal replaces (LLM multi-valued). */
+  replaces?: string;
+};
+
 /** Deterministic inputs gathered for one subject before profile synthesis. */
 export type ProfileSynthesisInput = {
   displayName: string;
@@ -113,18 +138,16 @@ export type ProfileSynthesisInput = {
     topChannel: string | null;
     activeHours: string;
   };
-  memories: Array<{ content: string; kind: string; confidence: number; confirmed: boolean }>;
+  /** Confirmed attributes — the structured source the bio renders from. */
+  attributes: Array<{ field: string; value: string; confidence: number }>;
   patterns: string[];
   relationships: Array<{ withName: string; summary: string; valence: number | null; observations: number }>;
   events: Array<{ title: string; role: string; significance: number }>;
 };
 
-/** LLM output of profile synthesis (camelCase form of the profile facets). */
+/** LLM output of profile rendering — prose only; facets come from attributes. */
 export type ProfileSynthesis = {
   bio: string;
-  traits: string[];
-  interests: string[];
-  notableRelationships: string[];
   roleInServer: string;
 };
 

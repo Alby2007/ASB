@@ -6,6 +6,7 @@ import { buildAliasMap, resolveSubject } from "./entity-resolution.js";
 import { contestCue, detectSelfNaming } from "./perception.js";
 import { runContestCheck } from "./contest.js";
 import { ProfileStore } from "./profiles.js";
+import { applyProposals, listAttributes } from "./attributes.js";
 import type { Brain } from "./brain.js";
 import type { MessageEvent, ProfileSynthesis } from "./types.js";
 
@@ -31,6 +32,23 @@ test("recordMessage upserts members: names accumulate and message_count incremen
     assert.ok(member);
     assert.equal(member.messageCount, 3);
     assert.deepEqual(member.knownNames.sort(), ["Al", "Alice"]);
+  } finally { await sql.end(); }
+});
+
+test("re-archiving the same message does not double-count message_count", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const ev = msg("hello", { messageId: "m-dup", authorId: "u1" });
+    await store.recordMessage(ev);
+    await store.recordMessage(ev); // re-ingest hits the PK conflict
+    const member = await store.getMember("g1", "u1");
+    assert.equal(member?.messageCount, 1);
+    // The reply edge still backfills on the repeat archive.
+    await store.recordMessage(ev, "m-orig");
+    const rows = await sql<Array<{ reply_to_id: string | null }>>`SELECT reply_to_id FROM messages WHERE id = 'm-dup'`;
+    assert.equal(rows[0].reply_to_id, "m-orig");
+    assert.equal((await store.getMember("g1", "u1"))?.messageCount, 1);
   } finally { await sql.end(); }
 });
 
@@ -101,11 +119,19 @@ test("recordRelationship is idempotent per message; edges roll up only after lit
 
 // ── Profile synthesis ─────────────────────────────────────────────────────────
 
-function stubBrain(calls: { profile: number; section: number; sections: Record<string, number> }, sectionResult?: Record<string, unknown>): Brain {
+function stubBrain(
+  calls: { profile: number; section: number; sections: Record<string, number>; extract: number },
+  sectionResult?: Record<string, unknown>,
+  extractResult?: Array<{ field: string; value: string; memoryIds: number[]; replaces?: string }>,
+): Brain {
   return {
     synthesizeProfile: async (): Promise<ProfileSynthesis> => {
       calls.profile++;
-      return { bio: "A test bio.", traits: ["witty"], interests: ["cricket"], notableRelationships: [], roleInServer: "regular" };
+      return { bio: "Alice is a regular member who keeps the conversation moving.", roleInServer: "regular" };
+    },
+    extractAttributes: async () => {
+      calls.extract++;
+      return extractResult ?? [];
     },
     synthesizeDossierSection: async (section: string): Promise<Record<string, unknown>> => {
       calls.section++;
@@ -122,7 +148,7 @@ test("buildProfiles builds a card and skips the LLM call when inputs are unchang
     const profileStore = new ProfileStore(sql as any);
     for (let i = 0; i < 5; i++) await store.recordMessage(msg(`msg ${i}`, { authorId: "u1", authorName: "Alice" }));
 
-    const calls = { profile: 0, section: 0, sections: {} as Record<string, number> };
+    const calls = { profile: 0, section: 0, sections: {} as Record<string, number>, extract: 0 };
     const brain = stubBrain(calls);
     const first = await profileStore.buildProfiles("g1", brain, store, eventStore);
     assert.equal(first.built, 1);
@@ -130,8 +156,8 @@ test("buildProfiles builds a card and skips the LLM call when inputs are unchang
 
     const profile = await profileStore.getProfile("g1", "u1");
     assert.ok(profile);
-    assert.equal(profile.summary, "A test bio.");
-    assert.deepEqual(profile.facets.traits, ["witty"]);
+    assert.equal(profile.summary, "Alice is a regular member who keeps the conversation moving.");
+    assert.deepEqual(profile.facets.traits, []); // no attributes yet — facets render from the structured set
 
     // Second run: identical inputs → source_hash match → no LLM call
     const second = await profileStore.buildProfiles("g1", brain, store, eventStore);
@@ -139,8 +165,14 @@ test("buildProfiles builds a card and skips the LLM call when inputs are unchang
     assert.equal(second.unchanged, 1);
     assert.equal(calls.profile, 1);
 
-    // New activity changes the fingerprint → rebuild
+    // Chatter alone is not a semantic change — nothing re-renders.
     await store.recordMessage(msg("new activity", { authorId: "u1", authorName: "Alice" }));
+    const churn = await profileStore.buildProfiles("g1", brain, store, eventStore);
+    assert.equal(churn.built, 0);
+    assert.equal(calls.profile, 1);
+
+    // A new memory that yields an attribute changes the render inputs → rebuild.
+    await activeFact(store, "Lives in Leeds");
     const third = await profileStore.buildProfiles("g1", brain, store, eventStore);
     assert.equal(third.built, 1);
     assert.equal(calls.profile, 2);
@@ -154,7 +186,7 @@ test("buildProfiles skips opted-out members and deletes their existing profile",
     const profileStore = new ProfileStore(sql as any);
     for (let i = 0; i < 5; i++) await store.recordMessage(msg(`msg ${i}`, { authorId: "u1", authorName: "Alice" }));
 
-    const brain = stubBrain({ profile: 0, section: 0, sections: {} });
+    const brain = stubBrain({ profile: 0, section: 0, sections: {}, extract: 0 });
     await profileStore.buildProfiles("g1", brain, store, eventStore);
     assert.ok(await profileStore.getProfile("g1", "u1"));
 
@@ -398,7 +430,7 @@ test("buildProfiles builds the voice section and skips unchanged sections on re-
     // ≥50 messages makes the member dossier-eligible and voice-buildable (≥20 msgs, ≥10 samples)
     for (let i = 0; i < 50; i++) await store.recordMessage(msg(`message number ${i} hello there`, { authorId: "u1", authorName: "Alice" }));
 
-    const calls = { profile: 0, section: 0, sections: {} as Record<string, number> };
+    const calls = { profile: 0, section: 0, sections: {} as Record<string, number>, extract: 0 };
     const brain = stubBrain(calls);
     const first = await profileStore.buildProfiles("g1", brain, store, eventStore);
     assert.equal(first.built, 1);
@@ -436,7 +468,7 @@ test("dossier items keep only citations to real input memory IDs", async () => {
     }
 
     const brain = stubBrain(
-      { profile: 0, section: 0, sections: {} },
+      { profile: 0, section: 0, sections: {}, extract: 0 },
       { items: [{ text: "Lives in Texas", source_ids: [ids[1], 99999] }, { text: "Invented", source_ids: [424242] }] }
     );
     await profileStore.buildProfiles("g1", brain, store, eventStore);
@@ -535,5 +567,266 @@ test("recomputeEdges builds edges only from literal-verdicted observations", asy
     await store.setObservationVerdict(idOf("m2"), "joke");
     await store.recomputeEdges("g1");
     assert.equal((await store.relationshipsFor("g1", "u1")).length, 0);
+  } finally { await sql.end(); }
+});
+
+// ── Structured attributes ─────────────────────────────────────────────────────
+
+async function activeFact(store: Awaited<ReturnType<typeof makeStore>>["store"], content: string, subjectId = "u1", kind: "person_fact" | "person_preference" | "server_lore" | "episode" = "person_fact") {
+  const m = await store.saveMemory(msg("x"), { subjectId, kind, content, reason: "t", evidenceType: "explicit_fact", effect: "support" });
+  await store.confirm("g1", m.id);
+  return m;
+}
+
+test("deterministic extraction inside buildProfiles produces a location attribute", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store, eventStore } = await makeStore(sql);
+    const profileStore = new ProfileStore(sql as any);
+    for (let i = 0; i < 5; i++) await store.recordMessage(msg(`msg ${i}`, { authorId: "u1", authorName: "Alice" }));
+    const m = await activeFact(store, "Lives in Leeds");
+
+    const brain = stubBrain({ profile: 0, section: 0, sections: {}, extract: 0 });
+    await profileStore.buildProfiles("g1", brain, store, eventStore);
+
+    const attrs = await listAttributes(sql, "g1", "u1");
+    const loc = attrs.find(a => a.field === "location");
+    assert.equal(loc?.value, "Leeds");
+    assert.equal(loc?.status, "active");
+    assert.deepEqual(loc?.memoryIds, [m.id]);
+    // The facet renders into the profile card too.
+    const profile = await profileStore.getProfile("g1", "u1");
+    assert.ok(profile);
+  } finally { await sql.end(); }
+});
+
+test("unchanged inputs produce zero attribute writes — the real continuity test", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store, eventStore } = await makeStore(sql);
+    const profileStore = new ProfileStore(sql as any);
+    for (let i = 0; i < 5; i++) await store.recordMessage(msg(`msg ${i}`, { authorId: "u1", authorName: "Alice" }));
+    await activeFact(store, "Lives in Leeds");
+    await activeFact(store, "Loves horror films", "u1", "person_preference");
+
+    const calls = { profile: 0, section: 0, sections: {} as Record<string, number>, extract: 0 };
+    const brain = stubBrain(calls);
+    await profileStore.buildProfiles("g1", brain, store, eventStore);
+    const before = await sql`SELECT * FROM profile_attributes WHERE guild_id = 'g1' ORDER BY id`;
+    assert.ok(before.length >= 2);
+
+    // Second run on identical inputs: same rows, byte-for-byte on the columns
+    // that carry meaning (status, provenance, confidence).
+    await profileStore.buildProfiles("g1", brain, store, eventStore);
+    const after = await sql`SELECT * FROM profile_attributes WHERE guild_id = 'g1' ORDER BY id`;
+    assert.deepEqual(
+      after.map(r => ({ id: r.id, status: r.status, memory_ids: r.memory_ids, confidence: r.confidence })),
+      before.map(r => ({ id: r.id, status: r.status, memory_ids: r.memory_ids, confidence: r.confidence })),
+    );
+    // And the render didn't fire again either.
+    assert.equal(calls.profile, 1);
+    assert.equal(calls.extract, 1);
+  } finally { await sql.end(); }
+});
+
+test("a paraphrased value folds into the existing row instead of creating a sibling", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    // Distinct contents — saveMemory's trigram dedup would fold near-identical
+    // strings into one row, and the point here is two separate citations.
+    const m1 = await activeFact(store, "Likes horror films", "u1", "person_preference");
+    const m2 = await activeFact(store, "Goes fishing most weekends", "u1", "person_fact");
+    await applyProposals(sql, "g1", "u1", [{ field: "interest", value: "likes horror films", memoryIds: [m1.id] }]);
+    await applyProposals(sql, "g1", "u1", [{ field: "interest", value: "loves horror films", memoryIds: [m2.id] }]);
+    const attrs = (await listAttributes(sql, "g1", "u1")).filter(a => a.field === "interest");
+    assert.equal(attrs.length, 1);
+    assert.deepEqual(attrs[0].memoryIds.slice().sort(), [m1.id, m2.id].sort());
+  } finally { await sql.end(); }
+});
+
+test("opposite-polarity values never fold — likes vs dislikes stay two rows", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const m1 = await activeFact(store, "Likes horror films", "u1", "person_preference");
+    const m2 = await activeFact(store, "Dislikes horror films", "u1", "person_preference");
+    await applyProposals(sql, "g1", "u1", [{ field: "interest", value: "likes horror films", memoryIds: [m1.id] }]);
+    await applyProposals(sql, "g1", "u1", [{ field: "interest", value: "dislikes horror films", memoryIds: [m2.id] }]);
+    const attrs = (await listAttributes(sql, "g1", "u1")).filter(a => a.field === "interest");
+    assert.equal(attrs.length, 2);
+  } finally { await sql.end(); }
+});
+
+test("uncited and candidate-only LLM proposals are dropped, not stored", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store, eventStore } = await makeStore(sql);
+    const profileStore = new ProfileStore(sql as any);
+    for (let i = 0; i < 5; i++) await store.recordMessage(msg(`msg ${i}`, { authorId: "u1", authorName: "Alice" }));
+    const real = await activeFact(store, "Likes fishing");
+    // A candidate-only memory — never confirmed.
+    const candidate = await store.saveMemory(msg("y"), { subjectId: "u1", kind: "person_fact", content: "Is secretly a dragon", reason: "t", evidenceType: "uncertain_inference", effect: "context" });
+
+    const brain = stubBrain(
+      { profile: 0, section: 0, sections: {}, extract: 0 },
+      undefined,
+      [
+        { field: "trait", value: "uncited invention", memoryIds: [999999] },       // id not in input → dropped
+        { field: "trait", value: "candidate-only", memoryIds: [candidate.id] },     // no active citation → dropped
+        { field: "trait", value: "competitive", memoryIds: [real.id, 999999] },     // valid cite survives filtering
+      ],
+    );
+    await profileStore.buildProfiles("g1", brain, store, eventStore);
+    const attrs = await listAttributes(sql, "g1", "u1");
+    const traits = attrs.filter(a => a.field === "trait");
+    assert.equal(traits.length, 1);
+    assert.equal(traits[0].value, "competitive");
+    assert.deepEqual(traits[0].memoryIds, [real.id]);
+  } finally { await sql.end(); }
+});
+
+test("singular field: a new timezone supersedes the prior one; interest accumulates", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const m1 = await activeFact(store, "timezone is GMT");
+    const m2 = await activeFact(store, "currently on eastern time");
+    const m3 = await activeFact(store, "Likes chess", "u1", "person_preference");
+    const m4 = await activeFact(store, "Likes go", "u1", "person_preference");
+    await applyProposals(sql, "g1", "u1", [{ field: "timezone", value: "GMT", memoryIds: [m1.id] }]);
+    await applyProposals(sql, "g1", "u1", [{ field: "timezone", value: "EST", memoryIds: [m2.id] }]);
+    await applyProposals(sql, "g1", "u1", [{ field: "interest", value: "chess", memoryIds: [m3.id] }]);
+    await applyProposals(sql, "g1", "u1", [{ field: "interest", value: "go", memoryIds: [m4.id] }]);
+
+    const attrs = await listAttributes(sql, "g1", "u1");
+    const gmt = attrs.find(a => a.value === "GMT")!;
+    const est = attrs.find(a => a.value === "EST")!;
+    assert.equal(gmt.status, "superseded");
+    assert.equal(gmt.supersededBy, est.id);
+    assert.equal(est.status, "active");
+    // Multi-valued fields accumulate side by side.
+    assert.equal(attrs.filter(a => a.field === "interest").length, 2);
+  } finally { await sql.end(); }
+});
+
+test("forget on a sole-cited memory flips the attribute to forgotten in the same call", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const m = await activeFact(store, "Lives in Leeds");
+    await applyProposals(sql, "g1", "u1", [{ field: "location", value: "Leeds", memoryIds: [m.id] }]);
+    await store.forget("g1", m.id);
+    const attrs = await listAttributes(sql, "g1", "u1");
+    assert.equal(attrs.length, 1);
+    assert.equal(attrs[0].status, "forgotten");
+    assert.deepEqual(attrs[0].memoryIds, []);
+  } finally { await sql.end(); }
+});
+
+test("supersede transfers provenance to the canonical memory and dedupes ids", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const m1 = await activeFact(store, "Has a cat");
+    const m2 = await activeFact(store, "Her cat is called Jinx");
+    // Attribute already cites BOTH memories — after transfer, m2 appears once.
+    await applyProposals(sql, "g1", "u1", [{ field: "trait", value: "cat owner", memoryIds: [m1.id, m2.id] }]);
+    await store.supersede("g1", m1.id, m2.id);
+    const attrs = await listAttributes(sql, "g1", "u1");
+    assert.deepEqual(attrs[0].memoryIds, [m2.id]);
+    assert.equal(attrs[0].status, "active");
+  } finally { await sql.end(); }
+});
+
+test("mergeDuplicate transfers attribute provenance like a supersede", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const m1 = await activeFact(store, "Has a cat");
+    const m2 = await activeFact(store, "Adopted a second kitten yesterday");
+    await applyProposals(sql, "g1", "u1", [{ field: "trait", value: "cat owner", memoryIds: [m1.id] }]);
+    assert.equal(await store.mergeDuplicate("g1", m2.id, m1.id, "dup"), true);
+    const attrs = await listAttributes(sql, "g1", "u1");
+    assert.deepEqual(attrs[0].memoryIds, [m2.id]);
+    assert.equal(attrs[0].status, "active");
+  } finally { await sql.end(); }
+});
+
+test("mixed dead provenance never renders active; re-citation revives a superseded row", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const m1 = await activeFact(store, "timezone is GMT");
+    const m2 = await activeFact(store, "currently on eastern time");
+    const m3 = await activeFact(store, "moved back to GMT");
+    await applyProposals(sql, "g1", "u1", [{ field: "timezone", value: "GMT", memoryIds: [m1.id] }]);
+    await applyProposals(sql, "g1", "u1", [{ field: "timezone", value: "EST", memoryIds: [m2.id] }]);
+    let attrs = await listAttributes(sql, "g1", "u1");
+    assert.equal(attrs.find(a => a.value === "GMT")!.status, "superseded");
+
+    // Forget the superseding evidence → EST's provenance dies, row forgets.
+    await store.forget("g1", m2.id);
+    attrs = await listAttributes(sql, "g1", "u1");
+    assert.equal(attrs.find(a => a.value === "EST")!.status, "forgotten");
+
+    // Re-citing GMT revives the superseded row — no UNIQUE violation.
+    await applyProposals(sql, "g1", "u1", [{ field: "timezone", value: "GMT", memoryIds: [m3.id] }]);
+    attrs = await listAttributes(sql, "g1", "u1");
+    const gmt = attrs.find(a => a.value === "GMT")!;
+    assert.equal(gmt.status, "active");
+    assert.deepEqual(gmt.memoryIds.slice().sort(), [m1.id, m3.id].sort());
+    assert.equal(attrs.filter(a => a.field === "timezone").length, 2); // revived + forgotten, no third row
+  } finally { await sql.end(); }
+});
+
+test("opt-out deletes attribute rows alongside the profile", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store, eventStore } = await makeStore(sql);
+    const profileStore = new ProfileStore(sql as any);
+    for (let i = 0; i < 5; i++) await store.recordMessage(msg(`msg ${i}`, { authorId: "u1", authorName: "Alice" }));
+    await activeFact(store, "Lives in Leeds");
+    await profileStore.buildProfiles("g1", stubBrain({ profile: 0, section: 0, sections: {}, extract: 0 }), store, eventStore);
+    assert.ok((await listAttributes(sql, "g1", "u1")).length > 0);
+
+    await store.setMemberOptOut("g1", "u1", true);
+    await profileStore.buildProfiles("g1", stubBrain({ profile: 0, section: 0, sections: {}, extract: 0 }), store, eventStore);
+    assert.equal((await listAttributes(sql, "g1", "u1")).length, 0);
+  } finally { await sql.end(); }
+});
+
+test("exportSubject includes derived attributes", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const m = await activeFact(store, "Lives in Leeds");
+    await applyProposals(sql, "g1", "u1", [{ field: "location", value: "Leeds", memoryIds: [m.id] }]);
+    const data = await store.exportSubject("g1", "u1");
+    assert.ok(Array.isArray(data.memories) && data.memories.length > 0);
+    assert.equal(data.attributes[0].field, "location");
+    assert.equal(data.attributes[0].value, "Leeds");
+  } finally { await sql.end(); }
+});
+
+test("LLM extraction is gated: fires on first build, quiet when unchanged", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store, eventStore } = await makeStore(sql);
+    const profileStore = new ProfileStore(sql as any);
+    for (let i = 0; i < 5; i++) await store.recordMessage(msg(`msg ${i}`, { authorId: "u1", authorName: "Alice" }));
+    await activeFact(store, "Lives in Leeds");
+
+    const calls = { profile: 0, section: 0, sections: {} as Record<string, number>, extract: 0 };
+    const brain = stubBrain(calls);
+    await profileStore.buildProfiles("g1", brain, store, eventStore);
+    assert.equal(calls.extract, 1); // neverExtracted gate fires once
+
+    await profileStore.buildProfiles("g1", brain, store, eventStore);
+    assert.equal(calls.extract, 1); // unchanged → no re-extraction
+
+    await activeFact(store, "Works as a nurse");
+    await profileStore.buildProfiles("g1", brain, store, eventStore);
+    assert.equal(calls.extract, 2); // changed fingerprint → extraction fires again
   } finally { await sql.end(); }
 });

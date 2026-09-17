@@ -30,3 +30,8 @@ test("decide: unmentioned chatter stays below the speak threshold", () => {
   const decision = brain.decide(msg("lol nice"), 0);
   assert.equal(decision.shouldSpeak, false);
 });
+
+test("decide: lowering the threshold enables unsolicited replies", () => {
+  const decision = brain.decide(msg("hello?"), 0, 0.1);
+  assert.equal(decision.shouldSpeak, true);
+});

@@ -1,13 +1,13 @@
 import OpenAI from "openai";
 import type { Memory } from "./database.js";
 import { executeTool, replyToolDefs } from "./tools.js";
-import type { ContinuityDecision, Decision, DossierSection, ExtractionResult, MemoryCandidate, MessageEvent, ProfileSynthesis, ProfileSynthesisInput, StoredEvent, VerificationVerdict } from "./types.js";
+import type { AttributeProposal, ContinuityDecision, Decision, DossierSection, ExtractionResult, MemoryCandidate, MessageEvent, ProfileSynthesis, ProfileSynthesisInput, StoredEvent, VerificationVerdict } from "./types.js";
 
 export class Brain {
   private client: OpenAI;
   constructor(apiKey: string, private model: string, baseURL?: string) { this.client = new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) }); }
 
-  decide(event: MessageEvent, recentBotMessages: number): Decision {
+  decide(event: MessageEvent, recentBotMessages: number, threshold = 0.7): Decision {
     const reasons: string[] = [];
     let score = 0.05;
     if (event.mentionsBot) { score += 0.85; reasons.push("direct mention"); }
@@ -15,7 +15,7 @@ export class Brain {
     // The recency penalty suppresses unsolicited chatter — it must never suppress
     // an explicit mention, which is a direct request for a reply.
     if (recentBotMessages > 0 && !event.mentionsBot) { score -= 0.25; reasons.push("bot spoke recently"); }
-    return { shouldSpeak: score >= 0.7, score: Math.max(0, Math.min(1, score)), reasons };
+    return { shouldSpeak: score >= threshold, score: Math.max(0, Math.min(1, score)), reasons };
   }
 
   async extractMemories(event: MessageEvent, replyToContent?: string, note?: string): Promise<ExtractionResult> {
@@ -222,22 +222,82 @@ export class Brain {
    * ProfileStore.buildProfiles(). Neutral third-person dossier; unconfirmed
    * information must be labelled as such.
    */
+  /**
+   * Structured-attribute extraction — the LLM proposes (field, value) facets
+   * with memory_ids citations; the upsert-diff in attributes.ts decides what
+   * actually lands. currentAttributes anchors vocabulary: reuse an existing
+   * label verbatim when it still fits, emit `replaces` when it no longer does.
+   */
+  async extractAttributes(input: {
+    displayName: string;
+    memories: Array<{ id: number; content: string; kind: string; confirmed: boolean }>;
+    currentAttributes: Array<{ field: string; value: string }>;
+  }, model?: string): Promise<AttributeProposal[]> {
+    const schema = {
+      type: "object" as const,
+      properties: {
+        attributes: {
+          type: "array" as const,
+          items: {
+            type: "object" as const,
+            properties: {
+              field: { type: "string" as const, enum: ["trait", "interest", "skill", "pronouns", "timezone", "location", "occupation", "birthday"] },
+              value: { type: "string" as const },
+              memory_ids: { type: "array" as const, items: { type: "number" as const } },
+              replaces: { type: ["string", "null"] as const },
+            },
+            required: ["field", "value", "memory_ids", "replaces"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["attributes"],
+      additionalProperties: false,
+    };
+
+    const memoriesText = input.memories.length
+      ? input.memories.map(m => `- [id ${m.id}] [${m.confirmed ? "confirmed" : "unconfirmed"}] ${m.content}`).join("\n")
+      : "None";
+    const currentText = input.currentAttributes.length
+      ? input.currentAttributes.map(a => `- ${a.field}: ${a.value}`).join("\n")
+      : "None";
+
+    const response = await this.client.chat.completions.create({
+      model: model ?? this.model,
+      messages: [{
+        role: "user",
+        content: `Extract stable personal attributes for a Discord server member from the memories below. Only trait, interest, skill, pronouns, timezone, location, occupation, and birthday facets belong here — never names, relationships, or events. Every attribute MUST cite the memory ids that justify it, and at least one cited id must be a confirmed memory. Never infer sensitive traits beyond what the cited memories state.\n\nThe member's current attributes are listed below. Reuse an existing label verbatim when it still fits — that keeps their profile stable. When an existing label no longer fits, emit the improved value with "replaces" set to the old label exactly as written.\n\nMember: ${input.displayName}\n\nCurrent attributes:\n${currentText}\n\nMemories:\n${memoriesText}`,
+      }],
+      response_format: { type: "json_schema", json_schema: { name: "attributes", strict: true, schema } },
+    });
+
+    const raw = JSON.parse(response.choices[0].message.content ?? "{}") as {
+      attributes?: Array<{ field?: string; value?: string; memory_ids?: number[]; replaces?: string | null }>;
+    };
+    return (raw.attributes ?? [])
+      .filter(a => a.field && a.value && Array.isArray(a.memory_ids))
+      .map(a => ({ field: a.field!, value: a.value!, memoryIds: a.memory_ids!, replaces: a.replaces ?? undefined }));
+  }
+
+  /**
+   * Render the prose card from the structured attribute set — called by
+   * ProfileStore.buildProfiles() only when the attribute/context fingerprint
+   * changed. Neutral third-person; facets are assembled deterministically
+   * elsewhere, this call only produces bio + role_in_server.
+   */
   async synthesizeProfile(input: ProfileSynthesisInput, model?: string): Promise<ProfileSynthesis> {
     const schema = {
       type: "object" as const,
       properties: {
         bio: { type: "string" as const },
-        traits: { type: "array" as const, items: { type: "string" as const } },
-        interests: { type: "array" as const, items: { type: "string" as const } },
-        notable_relationships: { type: "array" as const, items: { type: "string" as const } },
         role_in_server: { type: "string" as const },
       },
-      required: ["bio", "traits", "interests", "notable_relationships", "role_in_server"],
+      required: ["bio", "role_in_server"],
       additionalProperties: false,
     };
 
-    const memoriesText = input.memories.length
-      ? input.memories.map(m => `- [${m.confirmed ? "confirmed" : "unconfirmed"}] ${m.content}`).join("\n")
+    const attrsText = input.attributes.length
+      ? input.attributes.map(a => `- ${a.field}: ${a.value}${a.confidence < 0.55 ? " (tentative)" : ""}`).join("\n")
       : "None";
     const relsText = input.relationships.length
       ? input.relationships.map(r => `- ${r.withName}: ${r.summary} (valence ${r.valence?.toFixed(2) ?? "?"}, ${r.observations} observations)`).join("\n")
@@ -250,21 +310,15 @@ export class Brain {
       model: model ?? this.model,
       messages: [{
         role: "user",
-        content: `Write a neutral third-person profile card for a Discord server member based only on the evidence below. Label unconfirmed information as unconfirmed. Never infer sensitive traits beyond what the evidence states. Keep the bio under 80 words.\n\nMember: ${input.displayName}\nActivity: ${input.stats.messageCount} messages, first seen ${input.stats.firstSeenAt ?? "unknown"}, last seen ${input.stats.lastSeenAt ?? "unknown"}, most active in ${input.stats.topChannel ?? "unknown"}, active hours ${input.stats.activeHours}\n\nMemories:\n${memoriesText}\n\nBehavioral patterns:\n${input.patterns.map(p => `- ${p}`).join("\n") || "None"}\n\nRelationships:\n${relsText}\n\nEvents participated in:\n${eventsText}`,
+        content: `Write a neutral third-person profile card for a Discord server member based only on the evidence below. Treat tentative attributes as unconfirmed. Never infer sensitive traits beyond what the evidence states. Keep the bio under 80 words. role_in_server is a short phrase for their place in the group.\n\nMember: ${input.displayName}\nActivity: ${input.stats.messageCount} messages, first seen ${input.stats.firstSeenAt ?? "unknown"}, last seen ${input.stats.lastSeenAt ?? "unknown"}, most active in ${input.stats.topChannel ?? "unknown"}, active hours ${input.stats.activeHours}\n\nAttributes:\n${attrsText}\n\nBehavioral patterns:\n${input.patterns.map(p => `- ${p}`).join("\n") || "None"}\n\nRelationships:\n${relsText}\n\nEvents participated in:\n${eventsText}`,
       }],
       response_format: { type: "json_schema", json_schema: { name: "profile", strict: true, schema } },
     });
 
     const raw = JSON.parse(response.choices[0].message.content ?? "{}") as {
-      bio?: string; traits?: string[]; interests?: string[]; notable_relationships?: string[]; role_in_server?: string;
+      bio?: string; role_in_server?: string;
     };
-    return {
-      bio: raw.bio ?? "",
-      traits: raw.traits ?? [],
-      interests: raw.interests ?? [],
-      notableRelationships: raw.notable_relationships ?? [],
-      roleInServer: raw.role_in_server ?? "",
-    };
+    return { bio: raw.bio ?? "", roleInServer: raw.role_in_server ?? "" };
   }
 
   /**

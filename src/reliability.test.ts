@@ -89,6 +89,28 @@ test("age-weighted support can resolve a contested memory without rewriting conf
   } finally { await sql.end(); }
 });
 
+test("a non-promotable candidate cannot launder into active via contested resolution", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const rumor = { subjectId: "user", kind: "person_fact" as const, content: "User secretly supports Arsenal", importance: .5, reason: "Secondhand claim", evidenceType: "reported_by_other" as const, effect: "support" as const };
+    const now = Date.now();
+    const first = await store.saveMemory({ ...event("heard they support Arsenal 0"), messageId: "rumor-0", createdAt: new Date(now - 20 * 1000) }, rumor);
+    for (let index = 1; index < 20; index++) await store.saveMemory({ ...event(`heard they support Arsenal ${index}`), messageId: `rumor-${index}`, createdAt: new Date(now - (20 - index) * 1000) }, rumor);
+    // Weak evidence can grow confidence but can never promote — still a candidate.
+    const grown = (await store.getMemory("guild", first.id))!;
+    assert.equal(grown.status, "candidate");
+    assert.ok(grown.confidence >= .70, `confidence was ${grown.confidence}`);
+    // An old contradiction contests it; fresh supports still dominate net_score.
+    await store.saveMemory({ ...event("they denied it once"), messageId: "rumor-denial", createdAt: new Date(now - 100 * 86_400_000) }, { ...rumor, effect: "contradict" });
+    assert.equal((await store.getMemory("guild", first.id))?.status, "contested");
+    const result = await store.resolveContested("guild", first.id);
+    assert.equal(result.resolved, true);
+    // Support won, but reported_by_other primary evidence may never reach active.
+    assert.equal((await store.getMemory("guild", first.id))?.status, "candidate");
+  } finally { await sql.end(); }
+});
+
 test("a direct correction supersedes the old memory and links the replacement", async () => {
   const sql = makeTestSql();
   try {

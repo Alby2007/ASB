@@ -128,6 +128,14 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content: "Only server administrators can triage memories.", ephemeral: true });
     const recent = await store.recentMemories(guildId, 15);
     const lines = recent.map(m => `**#${m.id}** \`${m.status}/${m.kind}\` **${m.subjectLabel}** — ${m.content.slice(0, 120)}`);
+    // Contested attributes are the dispute surface — a stored facet whose
+    // evidence is currently under challenge.
+    const contested = await store.contestedAttributes(guildId, 5);
+    if (contested.length) {
+      const attrLines = await Promise.all(contested.map(async a =>
+        `⚔️ **${await store.displayNameFor(guildId, a.subjectId)}** — ${a.field}: ${a.value}`));
+      lines.push("", "**Contested attributes**", ...attrLines);
+    }
     return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setTitle("Recent memories (all members)").setDescription(lines.join("\n") || "Nothing stored yet.")] });
   }
   if (interaction.commandName === "memory-settings") {
@@ -194,8 +202,22 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
         inline: false,
       });
     if (profile.facets.roleInServer) embed.addFields({ name: "Role", value: profile.facets.roleInServer, inline: false });
-    if (profile.facets.traits?.length) embed.addFields({ name: "Traits", value: profile.facets.traits.join(", "), inline: false });
-    if (profile.facets.interests?.length) embed.addFields({ name: "Interests", value: profile.facets.interests.join(", "), inline: false });
+
+    // Attributes carry provenance — each facet shows the memories it was
+    // derived from, so "why does it think this" has an answer.
+    const attrs = (await store.attributesFor(guildId, subjectId)).filter(a => a.status === "active");
+    const cite = (a: { memoryIds: number[] }) => a.memoryIds.length ? ` *(${a.memoryIds.map(id => `#${id}`).join(", ")})*` : "";
+    const details = attrs.filter(a => !["trait", "interest", "skill"].includes(a.field)).map(a => `**${a.field}:** ${a.value}${cite(a)}`);
+    if (details.length) embed.addFields({ name: "Details", value: details.join("\n"), inline: false });
+    const traits = attrs.filter(a => a.field === "trait").map(a => `${a.value}${cite(a)}`);
+    if (traits.length) embed.addFields({ name: "Traits", value: traits.join(", "), inline: false });
+    const interests = attrs.filter(a => a.field === "interest").map(a => `${a.value}${cite(a)}`);
+    if (interests.length) embed.addFields({ name: "Interests", value: interests.join(", "), inline: false });
+    const skills = attrs.filter(a => a.field === "skill").map(a => `${a.value}${cite(a)}`);
+    if (skills.length) embed.addFields({ name: "Skills", value: skills.join(", "), inline: false });
+    // Legacy facets cover profiles built before attributes existed.
+    if (!attrs.length && profile.facets.traits?.length) embed.addFields({ name: "Traits", value: profile.facets.traits.join(", "), inline: false });
+    if (!attrs.length && profile.facets.interests?.length) embed.addFields({ name: "Interests", value: profile.facets.interests.join(", "), inline: false });
     if (relLines.length) embed.addFields({ name: "Relationships", value: relLines.join("\n"), inline: false });
     if (events.length) embed.addFields({
       name: "Significant events",

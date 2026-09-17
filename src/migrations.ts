@@ -333,7 +333,49 @@ const migrations: Migration[] = [
       // pg_trgm is left installed — other objects outside this schema may rely on it.
     },
   },
+  {
+    version: 12,
+    name: "v12_profile_attributes",
+    // Structured profile facets become the source of truth; profiles.summary /
+    // facets_json become renderings gated on attr_hash. memory_ids carries
+    // provenance so /forget / supersede / merge cascade immediately. Status is
+    // derived from cited memories except 'superseded', which is asserted via
+    // superseded_by (a row can be superseded while its evidence is still live).
+    // No backfill: derivation runs lazily inside buildProfiles.
+    up: async (sql) => {
+      await sql`
+        CREATE TABLE IF NOT EXISTS profile_attributes (
+          id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          guild_id       TEXT NOT NULL,
+          subject_id     TEXT NOT NULL,
+          field          TEXT NOT NULL,
+          value          TEXT NOT NULL,
+          value_norm     TEXT NOT NULL,
+          confidence     DOUBLE PRECISION NOT NULL,
+          memory_ids     BIGINT[] NOT NULL DEFAULT '{}',
+          status         TEXT NOT NULL,
+          superseded_by  BIGINT,
+          first_seen_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (guild_id, subject_id, field, value_norm)
+        )
+      `;
+      await sql`CREATE INDEX IF NOT EXISTS profile_attributes_lookup ON profile_attributes(guild_id, subject_id, status)`;
+      await sql`CREATE INDEX IF NOT EXISTS profile_attributes_value_trgm ON profile_attributes USING gin (value_norm gin_trgm_ops)`;
+      await addColumn(sql, "profiles", "attr_hash TEXT NOT NULL DEFAULT ''");
+    },
+    down: async (sql) => {
+      await sql`DROP INDEX IF EXISTS profile_attributes_lookup`;
+      await sql`DROP INDEX IF EXISTS profile_attributes_value_trgm`;
+      await sql`DROP TABLE IF EXISTS profile_attributes`;
+      await sql`ALTER TABLE profiles DROP COLUMN IF EXISTS attr_hash`;
+    },
+  },
 ];
+
+/** Highest known migration version — tests assert against this instead of a
+ * hardcoded number so adding a migration doesn't silently stale them. */
+export const LATEST_MIGRATION_VERSION = Math.max(...migrations.map(m => m.version));
 
 export async function runMigrations(sql: Sql, targetVersion?: number): Promise<void> {
   // Ensure the base tables exist on a fresh database.

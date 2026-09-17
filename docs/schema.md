@@ -19,7 +19,7 @@ Raw Discord message archive. Purged on a rolling retention window.
 | `author_name` | TEXT | Display name at time of message |
 | `content` | TEXT | Full message text |
 | `created_at` | TEXT | ISO-8601 timestamp |
-| `triage_result` | TEXT \| NULL | LLM/regex durability verdict (v6): `'regex'` passed the regex gate, `'durable'` flagged by LLM triage, `'noise'` rejected. NULL = not yet triaged |
+| `triage_result` | TEXT \| NULL | Durability/extraction state (v6): `'regex'` passed the regex gate, `'durable'` flagged by LLM triage, `'noise'` rejected, `'extracted'` extraction ran (terminal — never re-selected, even with zero evidence rows). NULL = not yet triaged |
 | `reply_to_id` | TEXT \| NULL | Discord ID of the message this one replies to (v7) |
 
 **Index:** `messages_context (guild_id, channel_id, created_at DESC)` — used by `recentContext()`.
@@ -298,10 +298,35 @@ Synthesized per-chatter profile cards, rebuilt only when their input fingerprint
 | `subject_id` | TEXT | Discord user ID (composite PK) |
 | `display_name` | TEXT | Best current display name |
 | `summary` | TEXT | LLM-written bio |
-| `facets_json` | TEXT | JSON: `traits`, `interests`, `notableRelationships`, `roleInServer`, plus `dossier.sections` — per-section results `{ hash, builtAt, data }` for `voice`, `life_situation`, `temperament`, `beliefs`, `relationship_map`, `reputation`, `timeline`; list items carry `source_ids` memory citations |
-| `source_hash` | TEXT | SHA-256 fingerprint of card build inputs; identical hash → card LLM call skipped (dossier sections hash independently) |
+| `facets_json` | TEXT | JSON rendered deterministically from `profile_attributes` + edges: `traits`, `interests`, `notableRelationships`, `roleInServer`, plus `dossier.sections` — per-section results `{ hash, builtAt, data }` for `voice`, `life_situation`, `temperament`, `beliefs`, `relationship_map`, `reputation`, `timeline`; list items carry `source_ids` memory citations |
+| `source_hash` | TEXT | SHA-256 fingerprint of semantic build inputs (memories, candidates, patterns, edges, events — raw activity churn excluded); gates LLM attribute extraction |
+| `attr_hash` | TEXT | SHA-256 fingerprint of the render inputs: active attribute rows + bio context (patterns, edges, events, stats); identical hash → prose render skipped |
 | `built_at` | TEXT | ISO-8601 of last LLM synthesis |
 | `updated_at` | TEXT | ISO-8601 |
+
+---
+
+### `profile_attributes`
+
+Structured person facets — the **source of truth** for profile cards; `summary`/`facets_json` are renderings of these rows. Provenance-backed: every facet cites the memories that justify it, so `/forget`/`supersede`/merge cascade immediately.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | BIGINT PK | Identity |
+| `guild_id` | TEXT | Server scope |
+| `subject_id` | TEXT | Discord user ID |
+| `field` | TEXT | One of eight: singular `pronouns`/`timezone`/`location`/`occupation`/`birthday`; multi-valued `trait`/`interest`/`skill` (`SINGULAR_FIELDS` in `src/attributes.ts` is the classifier) |
+| `value` | TEXT | Display form |
+| `value_norm` | TEXT | `trim().toLowerCase()` — uniqueness/fold key only |
+| `confidence` | DOUBLE | `max()` of surviving cited memories' confidence; corroboration is reported via `array_length(memory_ids)` |
+| `memory_ids` | BIGINT[] | Provenance — citing memory IDs (set union, no dupes) |
+| `status` | TEXT | Derived from cited-memory statuses + `superseded_by`: all-forgotten/empty → `forgotten`; any `contested` → `contested`; any `active` → `active`; all-`superseded` → `superseded` |
+| `superseded_by` | BIGINT | The only asserted input to status — set on singular-field replacement and LLM `replaces` |
+| `first_seen_at`/`last_seen_at` | TIMESTAMPTZ | |
+
+`UNIQUE (guild_id, subject_id, field, value_norm)` — case/whitespace variants can't produce sibling rows. Indexes: `(guild_id, subject_id, status)` lookup; GIN trigram on `value_norm` for the polarity-gated near-dup fold (≥0.6 folds, 0.4–0.6 logs `attr_near_miss`).
+
+Extraction: deterministic regexes on `person_fact`/`person_preference` content run inside `buildProfiles` (also the lazy backfill); an LLM pass proposes `trait`/`interest`/`skill` gated on `source_hash`. Only `active` rows render anywhere; `contested` surfaces in `/memory-triage`.
 
 ---
 
@@ -331,3 +356,4 @@ Version tracking for the migration system.
 | 9 | `v05_alias_learning` | `alias_candidates` table — provenance for learned display-name aliases |
 | 10 | `v06_unresolved_names` | `unresolved_names` table — names that failed entity resolution |
 | 11 | `v11_memory_trigram_dedup` | `pg_trgm` extension + `memories_content_trgm` GIN index for near-duplicate memory matching |
+| 12 | `v12_profile_attributes` | `profile_attributes` table + `profiles.attr_hash` — structured provenance-backed facets become the profile source of truth; create-only, no backfill |

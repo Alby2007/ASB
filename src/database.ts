@@ -1,8 +1,9 @@
-import type { EvidenceEffect, EvidenceType, Member, MemoryCandidate, MemoryStatus, MessageEvent, RelationshipEdge, VerificationVerdict } from "./types.js";
+import type { EvidenceEffect, EvidenceType, Member, MemoryCandidate, MemoryStatus, MessageEvent, ProfileAttribute, RelationshipEdge, VerificationVerdict } from "./types.js";
 import { sql as defaultSql, type Sql } from "./db.js";
 import { runMigrations } from "./migrations.js";
 import { findMentionedUsers } from "./entity-resolution.js";
 import { calculateInitialConfidence, updateConfidence, calculateDefaultImportance, calculateDefaultExplicitness } from "./confidence.js";
+import { contentPolarity, listAttributes, listContestedAttributes, recomputeForMemories, transferProvenance } from "./attributes.js";
 
 export type Memory = Omit<MemoryCandidate, "confidence" | "importance" | "explicitness"> & {
   // DB columns are NOT NULL, so these are always present on a persisted Memory.
@@ -123,38 +124,6 @@ const TRIGRAM_NEAR_MISS_THRESHOLD = 0.4;
 // regardless of confidence.
 const PROMOTABLE_EVIDENCE_TYPES: EvidenceType[] = ["explicit_fact", "clear_preference", "correction"];
 
-// Cheap polarity check for fuzzy-matched memories: a rephrased extraction whose
-// content lands on the opposite side of an antonym/negation pair is a
-// contradiction of the matched row, whatever effect the LLM labelled it.
-const POLARITY_WORDS: Record<string, 1 | -1> = {
-  love: 1, loves: 1, loved: 1, loving: 1,
-  hate: -1, hates: -1, hated: -1, hating: -1,
-  like: 1, likes: 1, liked: 1,
-  dislike: -1, dislikes: -1, disliked: -1,
-  enjoy: 1, enjoys: 1, enjoyed: 1,
-  prefer: 1, prefers: 1, preferred: 1,
-  want: 1, wants: 1, wanted: 1,
-  support: 1, supports: 1, supported: 1, supporting: 1,
-  oppose: -1, opposes: -1, opposed: -1,
-  against: -1,
-  can: 1, cant: -1, cannot: -1, "can't": -1,
-  do: 1, does: 1, dont: -1, "don't": -1, doesnt: -1, "doesn't": -1, didnt: -1, "didn't": -1,
-  will: 1, wont: -1, "won't": -1,
-  is: 1, am: 1, are: 1, was: 1, were: 1,
-  isnt: -1, "isn't": -1, arent: -1, "aren't": -1, wasnt: -1, "wasn't": -1, werent: -1, "weren't": -1,
-  never: -1, not: -1, no: -1,
-};
-
-/** Product of polarity-charged tokens; neutral content returns +1. */
-function contentPolarity(content: string): 1 | -1 {
-  let polarity: 1 | -1 = 1;
-  for (const token of content.toLowerCase().match(/[a-z']+/g) ?? []) {
-    const p = POLARITY_WORDS[token];
-    if (p) polarity = (polarity * p) as 1 | -1;
-  }
-  return polarity;
-}
-
 export class MemoryStore {
   private constructor(private sql: Sql) {}
 
@@ -197,12 +166,19 @@ export class MemoryStore {
   // ── Messages ───────────────────────────────────────────────────────────────
 
   async recordMessage(event: MessageEvent, replyToId?: string): Promise<void> {
-    await this.sql`
+    // Insert-only dedup: a conflict means the message was already archived
+    // (re-ingest), so member stats must not double-count. Name/seen-at merges
+    // still run — they're idempotent by construction.
+    const inserted = await this.sql`
       INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, content, created_at, reply_to_id)
       VALUES (${event.messageId}, ${event.guildId}, ${event.channelId}, ${event.authorId}, ${event.authorName}, ${event.content}, ${event.createdAt.toISOString()}, ${replyToId ?? null})
-      ON CONFLICT (id) DO UPDATE SET reply_to_id = COALESCE(messages.reply_to_id, EXCLUDED.reply_to_id)
+      ON CONFLICT (id) DO NOTHING
     `;
-    await this.upsertMember(event.guildId, event.authorId, event.authorName, event.createdAt);
+    if (inserted.count === 0 && replyToId) {
+      // Pre-existing rows can still gain a reply edge on re-ingest.
+      await this.sql`UPDATE messages SET reply_to_id = ${replyToId} WHERE id = ${event.messageId} AND reply_to_id IS NULL`;
+    }
+    await this.upsertMember(event.guildId, event.authorId, event.authorName, event.createdAt, inserted.count > 0);
   }
 
   // ── Members ────────────────────────────────────────────────────────────────
@@ -210,15 +186,16 @@ export class MemoryStore {
   // display name observed, message counts, and first/last activity. It backs the
   // entity-resolution alias map and per-chatter profiles.
 
-  async upsertMember(guildId: string, userId: string, displayName: string, at: Date): Promise<void> {
+  async upsertMember(guildId: string, userId: string, displayName: string, at: Date, countMessage = true): Promise<void> {
+    const inc = countMessage ? 1 : 0;
     await this.sql`
       INSERT INTO members (guild_id, user_id, known_names, first_seen_at, last_seen_at, message_count)
-      VALUES (${guildId}, ${userId}, ${[displayName]}, ${at.toISOString()}, ${at.toISOString()}, 1)
+      VALUES (${guildId}, ${userId}, ${[displayName]}, ${at.toISOString()}, ${at.toISOString()}, ${inc})
       ON CONFLICT (guild_id, user_id) DO UPDATE SET
         known_names   = CASE WHEN ${displayName} = ANY(members.known_names) THEN members.known_names ELSE array_append(members.known_names, ${displayName}) END,
         first_seen_at = LEAST(members.first_seen_at, EXCLUDED.first_seen_at),
         last_seen_at  = GREATEST(members.last_seen_at, EXCLUDED.last_seen_at),
-        message_count = members.message_count + 1
+        message_count = members.message_count + ${inc}
     `;
   }
 
@@ -414,6 +391,7 @@ export class MemoryStore {
 
       if (verdict === "misattributed") {
         await sql`UPDATE memories SET status = 'forgotten', updated_at = NOW() WHERE id = ${memoryId}`;
+        await recomputeForMemories(sql, mem.guildId, [memoryId]);
         await this._logHistory(sql, memoryId, "misattributed", mem.confidence, mem.confidence, "candidate", "forgotten", null, { reason });
         return "rejected";
       }
@@ -434,6 +412,7 @@ export class MemoryStore {
         const selfReport = ev[0]?.author_id === mem.subjectId;
         if (selfReport && promotableTypes.includes(mem.primaryEvidenceType as EvidenceType)) {
           await sql`UPDATE memories SET status = 'active', last_confirmed_at = NOW(), updated_at = NOW() WHERE id = ${memoryId}`;
+          await recomputeForMemories(sql, mem.guildId, [memoryId]);
           await this._logHistory(sql, memoryId, "verified_active", mem.confidence, mem.confidence, "candidate", "active", null, { reason });
           return "promoted";
         }
@@ -445,27 +424,15 @@ export class MemoryStore {
 
   // ── Dossier inputs ─────────────────────────────────────────────────────────
 
-  /** Up to 60 raw messages for voice analysis: 30 most recent + 30 random older ones. */
+  /** Up to 60 raw messages for voice analysis — most recent, deterministic so
+   * the section hash only changes when the member actually posts again. */
   async sampleMessages(guildId: string, authorId: string): Promise<Array<{ content: string; createdAt: string }>> {
-    const recent = await this.sql<Array<{ content: string; created_at: Date | string }>>`
+    const rows = await this.sql<Array<{ content: string; created_at: Date | string }>>`
       SELECT content, created_at FROM messages
       WHERE guild_id = ${guildId} AND author_id = ${authorId} AND length(content) > 0
-      ORDER BY created_at DESC LIMIT 30
+      ORDER BY created_at DESC LIMIT 60
     `;
-    const random = await this.sql<Array<{ content: string; created_at: Date | string }>>`
-      SELECT content, created_at FROM messages
-      WHERE guild_id = ${guildId} AND author_id = ${authorId} AND length(content) > 0
-      ORDER BY random() LIMIT 30
-    `;
-    const seen = new Set<string>();
-    const out: Array<{ content: string; createdAt: string }> = [];
-    for (const r of [...recent, ...random]) {
-      const key = r.content + ts(r.created_at);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push({ content: r.content, createdAt: ts(r.created_at) });
-    }
-    return out;
+    return rows.map(r => ({ content: r.content, createdAt: ts(r.created_at) }));
   }
 
   /** Literal-verdicted relationship observations (with reasons) involving a
@@ -696,7 +663,7 @@ export class MemoryStore {
       SELECT m.id, m.channel_id, m.author_id, m.author_name, m.content, m.created_at, m.reply_to_id, m.triage_result
       FROM messages m
       WHERE m.guild_id = ${guildId} AND m.created_at > ${since.toISOString()}
-        AND (m.triage_result IS NULL OR m.triage_result = 'durable')
+        AND (m.triage_result IS NULL OR m.triage_result IN ('durable', 'regex'))
         AND m.author_id <> ${excludeAuthorId}
         AND m.content <> ''
         AND NOT EXISTS (SELECT 1 FROM memory_evidence e WHERE e.message_id = m.id)
@@ -878,6 +845,7 @@ export class MemoryStore {
       WHERE id = ${saved.id}
     `;
 
+    if (status !== previousStatus) await recomputeForMemories(sql, event.guildId, [saved.id]);
     await this._logHistory(sql, saved.id, action, previousConfidence, confidence, previousStatus, status, evidenceId, { evidenceType, effect, sourceMessageId: event.messageId });
 
     const finalRows = await sql<MemoryRow[]>`SELECT * FROM memories WHERE guild_id = ${event.guildId} AND id = ${saved.id}`;
@@ -995,17 +963,24 @@ export class MemoryStore {
   // ── Mutations ──────────────────────────────────────────────────────────────
 
   async forget(guildId: string, id: number): Promise<number> {
-    const result = await this.sql`UPDATE memories SET status = 'forgotten' WHERE guild_id = ${guildId} AND id = ${id} AND status != 'forgotten'`;
-    return result.count;
+    return await this.sql.begin(async sql => {
+      const result = await sql`UPDATE memories SET status = 'forgotten' WHERE guild_id = ${guildId} AND id = ${id} AND status != 'forgotten'`;
+      if (result.count) await recomputeForMemories(sql, guildId, [id]);
+      return result.count;
+    });
   }
 
   /** Opt-out bulk forget: every live memory about a subject → forgotten. */
   async forgetAllFor(guildId: string, subjectId: string): Promise<number> {
-    const result = await this.sql`
-      UPDATE memories SET status = 'forgotten', updated_at = NOW()
-      WHERE guild_id = ${guildId} AND subject_id = ${subjectId} AND status != 'forgotten'
-    `;
-    return result.count;
+    return await this.sql.begin(async sql => {
+      const rows = await sql<Array<{ id: number }>>`
+        UPDATE memories SET status = 'forgotten', updated_at = NOW()
+        WHERE guild_id = ${guildId} AND subject_id = ${subjectId} AND status != 'forgotten'
+        RETURNING id
+      `;
+      await recomputeForMemories(sql, guildId, rows.map(r => r.id));
+      return rows.length;
+    });
   }
 
   /** Hard-delete every relationship observation and edge involving a subject —
@@ -1030,21 +1005,30 @@ export class MemoryStore {
   }
 
   async confirm(guildId: string, id: number): Promise<number> {
-    const result = await this.sql`
-      UPDATE memories SET status = 'active', confidence = GREATEST(confidence, 0.9), last_confirmed_at = NOW()
-      WHERE guild_id = ${guildId} AND id = ${id} AND status = 'candidate'
-    `;
-    return result.count;
+    return await this.sql.begin(async sql => {
+      const result = await sql`
+        UPDATE memories SET status = 'active', confidence = GREATEST(confidence, 0.9), last_confirmed_at = NOW()
+        WHERE guild_id = ${guildId} AND id = ${id} AND status = 'candidate'
+      `;
+      if (result.count) await recomputeForMemories(sql, guildId, [id]);
+      return result.count;
+    });
   }
 
   async supersede(guildId: string, oldId: number, replacementId: number): Promise<void> {
     const old = await this.getMemory(guildId, oldId);
     const replacement = await this.getMemory(guildId, replacementId);
     if (!old || !replacement) return;
-    await this.sql`UPDATE memories SET status = 'superseded', superseded_by = ${replacementId}, updated_at = NOW() WHERE guild_id = ${guildId} AND id = ${oldId}`;
-    await this.sql`UPDATE memories SET supersedes_memory_id = ${oldId}, status = 'active', updated_at = NOW() WHERE guild_id = ${guildId} AND id = ${replacementId}`;
-    await this.logHistory(oldId, "superseded", old.confidence, old.confidence, old.status, "superseded", null, { replacementId });
-    await this.logHistory(replacementId, "correction_activated", replacement.confidence, replacement.confidence, replacement.status, "active", null, { supersedesMemoryId: oldId });
+    await this.sql.begin(async sql => {
+      await sql`UPDATE memories SET status = 'superseded', superseded_by = ${replacementId}, updated_at = NOW() WHERE guild_id = ${guildId} AND id = ${oldId}`;
+      await sql`UPDATE memories SET supersedes_memory_id = ${oldId}, status = 'active', updated_at = NOW() WHERE guild_id = ${guildId} AND id = ${replacementId}`;
+      // Provenance transfers, not strips: attributes citing the superseded
+      // memory now cite the canonical replacement.
+      await transferProvenance(sql, guildId, oldId, replacementId);
+      await recomputeForMemories(sql, guildId, [replacementId]);
+      await this._logHistory(sql, oldId, "superseded", old.confidence, old.confidence, old.status, "superseded", null, { replacementId });
+      await this._logHistory(sql, replacementId, "correction_activated", replacement.confidence, replacement.confidence, replacement.status, "active", null, { supersedesMemoryId: oldId });
+    });
   }
 
   // ── Semantic dedup ─────────────────────────────────────────────────────────
@@ -1118,6 +1102,9 @@ export class MemoryStore {
         WHERE id = ${canonicalId}
       `;
       await sql`UPDATE memories SET status = 'superseded', superseded_by = ${canonicalId}, updated_at = NOW() WHERE id = ${dupId}`;
+      // A merge is a supersede for provenance purposes: attributes citing the
+      // dup transfer their citation to the canonical row.
+      await transferProvenance(sql, guildId, dupId, canonicalId);
       await this._logHistory(sql, canonicalId, "dedup_merged", null, null, null, null, null, { mergedMemoryId: dupId, reason });
       await this._logHistory(sql, dupId, "dedup_merged", null, null, dup.status, "superseded", null, { mergedInto: canonicalId, reason });
       return true;
@@ -1171,9 +1158,16 @@ export class MemoryStore {
     // Always persist the current net_score so the DB reflects the latest resolution signal.
     await this.sql`UPDATE memories SET net_score = ${netScore} WHERE guild_id = ${guildId} AND id = ${memoryId}`;
     if (memory.confidence >= 0.70 && netScore >= 0.50 && newest?.effect !== "contradict") {
-      // Resolution: restore to active and clear the conflict tracking columns.
-      await this.sql`UPDATE memories SET status = 'active', frozen_confidence = NULL, net_score = NULL, updated_at = NOW() WHERE guild_id = ${guildId} AND id = ${memoryId}`;
-      await this.logHistory(memoryId, "conflict_resolved", memory.confidence, memory.confidence, "contested", "active", null, { supportScore, contradictionScore, netScore });
+      // Resolution: support won, but the promotion gate still applies — a
+      // memory whose primary evidence could never promote (rumour, sarcasm,
+      // uncertain inference) resolves to candidate, not active. Otherwise a
+      // weak-evidence candidate could launder itself into an active fact via
+      // contradict → contested → resolve. Candidates reap via stale-quarantine.
+      const promotable = PROMOTABLE_EVIDENCE_TYPES.includes(memory.primaryEvidenceType as EvidenceType);
+      const target: MemoryStatus = promotable ? "active" : "candidate";
+      await this.sql`UPDATE memories SET status = ${target}, frozen_confidence = NULL, net_score = NULL, updated_at = NOW() WHERE guild_id = ${guildId} AND id = ${memoryId}`;
+      await recomputeForMemories(this.sql, guildId, [memoryId]);
+      await this.logHistory(memoryId, "conflict_resolved", memory.confidence, memory.confidence, "contested", target, null, { supportScore, contradictionScore, netScore, promotable });
       return { resolved: true, netScore };
     }
     await this.logHistory(memoryId, "conflict_unresolved", memory.confidence, memory.confidence, "contested", "contested", null, { supportScore, contradictionScore, netScore });
@@ -1187,6 +1181,7 @@ export class MemoryStore {
     const memory = await this.getMemory(guildId, memoryId);
     if (!memory || memory.status !== "contested") return;
     await this.sql`UPDATE memories SET status = 'active', frozen_confidence = NULL, net_score = NULL, updated_at = NOW() WHERE guild_id = ${guildId} AND id = ${memoryId}`;
+    await recomputeForMemories(this.sql, guildId, [memoryId]);
     await this.logHistory(memoryId, "subject_confirmed", memory.confidence, memory.confidence, "contested", "active", null, {});
   }
 
@@ -1329,17 +1324,24 @@ export class MemoryStore {
     // The primary_evidence_type gate mirrors the per-insert promotableTypes allowlist so that
     // sarcasm, rumour, and uncertain-inference memories cannot be promoted by bulk maintenance
     // even if their confidence and mention counts happen to satisfy the numeric thresholds.
-    const promotedResult = await this.sql`
+    const promotedRows = await this.sql<Array<{ id: number }>>`
       UPDATE memories SET status = 'active' WHERE guild_id = ${guildId} AND status = 'candidate'
       AND mentions >= 2 AND confidence >= ${candidateThreshold}
       AND primary_evidence_type IN ('explicit_fact', 'clear_preference', 'correction')
+      RETURNING id
     `;
-    const quarantinedCandidatesResult = await this.sql`
+    const quarantinedCandidatesRows = await this.sql<Array<{ id: number }>>`
       UPDATE memories SET status = 'quarantined' WHERE guild_id = ${guildId} AND status = 'candidate' AND last_confirmed_at < ${candidateCutoff}
+      RETURNING id
     `;
-    const quarantinedActiveResult = await this.sql`
+    const quarantinedActiveRows = await this.sql<Array<{ id: number }>>`
       UPDATE memories SET status = 'quarantined' WHERE guild_id = ${guildId} AND status = 'active' AND confidence < 0.75 AND last_confirmed_at < ${staleCutoff}
+      RETURNING id
     `;
+    // Status changes cascade to citing attributes — quarantined provenance no
+    // longer supports a live facet; promoted provenance can revive one.
+    const changedIds = [...promotedRows, ...quarantinedCandidatesRows, ...quarantinedActiveRows].map(r => r.id);
+    if (changedIds.length) await recomputeForMemories(this.sql, guildId, changedIds);
 
     // Attempt to resolve all contested memories in this guild via age-weighted net score.
     const contestedRows = await this.sql<Array<{ id: number }>>`SELECT id FROM memories WHERE guild_id = ${guildId} AND status = 'contested'`;
@@ -1359,9 +1361,9 @@ export class MemoryStore {
     }
 
     return {
-      promoted: promotedResult.count,
-      quarantinedCandidates: quarantinedCandidatesResult.count,
-      quarantinedActive: quarantinedActiveResult.count,
+      promoted: promotedRows.length,
+      quarantinedCandidates: quarantinedCandidatesRows.length,
+      quarantinedActive: quarantinedActiveRows.length,
       resolved,
       patternsFound,
     };
@@ -1378,11 +1380,23 @@ export class MemoryStore {
     return { messages: messages[0].count, memories: memories[0].count, lore: lore[0].count };
   }
 
-  async exportSubject(guildId: string, subjectId: string): Promise<Array<Memory & { evidence: MemoryEvidence[] }>> {
+  async exportSubject(guildId: string, subjectId: string): Promise<{ memories: Array<Memory & { evidence: MemoryEvidence[] }>; attributes: ProfileAttribute[] }> {
     const rows = await this.sql<MemoryRow[]>`SELECT * FROM memories WHERE guild_id = ${guildId} AND subject_id = ${subjectId} ORDER BY id`;
-    return Promise.all(rows.map(async r => {
+    const memories = await Promise.all(rows.map(async r => {
       const mem = rowToMemory(r);
       return { ...mem, evidence: await this.evidence(guildId, mem.id) };
     }));
+    const attributes = await listAttributes(this.sql, guildId, subjectId);
+    return { memories, attributes };
+  }
+
+  /** Structured profile attributes for a subject — the provenance-backed facet set. */
+  async attributesFor(guildId: string, subjectId: string): Promise<ProfileAttribute[]> {
+    return listAttributes(this.sql, guildId, subjectId);
+  }
+
+  /** Guild-wide contested attributes — the admin triage surface. */
+  async contestedAttributes(guildId: string, limit = 10): Promise<ProfileAttribute[]> {
+    return listContestedAttributes(this.sql, guildId, limit);
   }
 }

@@ -6,12 +6,13 @@ import type { EventStore } from "./events.js";
 import type { Dossier, DossierSection, Profile, ProfileSynthesis, ProfileSynthesisInput } from "./types.js";
 import { gatherDossierInputs, type DossierInput } from "./dossier.js";
 import { buildAliasMap } from "./entity-resolution.js";
+import { applyProposals, attributeHash, extractDeterministic, listAttributes } from "./attributes.js";
 
 // ── Row types returned by Postgres ────────────────────────────────────────────
 
 type ProfileRow = {
   guild_id: string; subject_id: string; display_name: string;
-  summary: string; facets_json: string; source_hash: string;
+  summary: string; facets_json: string; source_hash: string; attr_hash: string;
   built_at: Date | string | null; updated_at: Date | string;
 };
 
@@ -88,9 +89,11 @@ export class ProfileStore {
     return rows.map(rowToProfile);
   }
 
-  /** Public for /opt-out — removes card + dossier sections. */
+  /** Public for /opt-out — removes card, dossier sections, and attribute rows.
+   * Attributes are pure derived data: deleted, not forgotten. */
   async deleteProfile(guildId: string, subjectId: string): Promise<void> {
     await this.sql`DELETE FROM profiles WHERE guild_id = ${guildId} AND subject_id = ${subjectId}`;
+    await this.sql`DELETE FROM profile_attributes WHERE guild_id = ${guildId} AND subject_id = ${subjectId}`;
   }
 
   /** Top channel and active-hour histogram for a member, from the raw message archive. */
@@ -150,9 +153,12 @@ export class ProfileStore {
       const stats = await this.activityStats(guildId, member.userId);
       const displayName = await memoryStore.displayNameFor(guildId, member.userId);
 
-      // The LLM call is bounded by this fingerprint: identical inputs → skip.
+      // The extraction call is bounded by this fingerprint over semantic
+      // inputs only — raw activity churn (messageCount, lastSeenAt) is
+      // deliberately excluded so a member who just chats costs zero LLM.
+      // Stats reach the bio through the render hash instead.
       const fingerprint = [
-        member.userId, member.messageCount, member.lastSeenAt,
+        member.userId,
         ...active.map(m => `m${m.id}:${m.updatedAt}`),
         ...candidates.map(m => `c${m.id}:${m.updatedAt}`),
         ...patterns.map(p => `p${p.id}:${p.updatedAt}`),
@@ -161,8 +167,8 @@ export class ProfileStore {
       ].join("|");
       const sourceHash = createHash("sha256").update(fingerprint).digest("hex");
 
-      const existing = await this.sql<[{ source_hash: string; facets_json: string }]>`
-        SELECT source_hash, facets_json FROM profiles WHERE guild_id = ${guildId} AND subject_id = ${member.userId}
+      const existing = await this.sql<[{ source_hash: string; attr_hash: string; facets_json: string }]>`
+        SELECT source_hash, attr_hash, facets_json FROM profiles WHERE guild_id = ${guildId} AND subject_id = ${member.userId}
       `;
       let existingFacets: Profile["facets"] = {};
       try { existingFacets = JSON.parse(existing[0]?.facets_json ?? "{}"); } catch { /* malformed JSON → rebuild */ }
@@ -185,16 +191,66 @@ export class ProfileStore {
       const toBuild = [...dossierInputs.values()].filter(i => sections[i.section]?.hash !== i.hash);
 
       const cardChanged = existing[0]?.source_hash !== sourceHash;
-      if (!cardChanged && toBuild.length === 0) { unchanged++; continue; }
 
-      // ── Tier 1: card ──────────────────────────────────────────────────────
+      // ── Tier 0: structured attributes — the source of truth ──────────────
+      // Deterministic extraction runs every pass: pure code, free, idempotent
+      // via the upsert-diff, and the catch-all for every activation path plus
+      // the lazy backfill for memories that predate this feature.
+      const detProposals = active.flatMap(m => extractDeterministic({ id: m.id, kind: m.kind, content: m.content }));
+      if (detProposals.length) await applyProposals(this.sql, guildId, member.userId, detProposals);
+
+      // LLM extraction is gated: memory-fingerprint change, or the member has
+      // never been through extraction (attr_hash unset = first pass / lazy
+      // backfill). Citations are validated ⊆ input; zero-citation and
+      // candidate-only proposals are dropped — an uncitable facet is exactly
+      // the failure this table exists to kill.
+      const extractionInput = [
+        ...active.slice(0, 15).map(m => ({ id: m.id, content: m.content, kind: m.kind, confirmed: true })),
+        ...candidates.map(m => ({ id: m.id, content: m.content, kind: m.kind, confirmed: false })),
+      ];
+      const neverExtracted = (existing[0]?.attr_hash ?? "") === "";
+      if ((cardChanged || neverExtracted) && extractionInput.length) {
+        try {
+          const attrsNow = await listAttributes(this.sql, guildId, member.userId);
+          const raw = await brain.extractAttributes({
+            displayName,
+            memories: extractionInput,
+            currentAttributes: attrsNow.filter(a => a.status === "active").map(a => ({ field: a.field, value: a.value })),
+          }, model);
+          const validIds = new Set(extractionInput.map(m => m.id));
+          const activeIds = new Set(active.map(m => m.id));
+          const proposals = raw
+            .map(p => ({ ...p, memoryIds: p.memoryIds.filter(id => validIds.has(id)) }))
+            .filter(p => p.memoryIds.length > 0)
+            .filter(p => p.memoryIds.some(id => activeIds.has(id)));
+          if (proposals.length) await applyProposals(this.sql, guildId, member.userId, proposals);
+        } catch { /* model flakiness — attributes just stay as they are */ }
+      }
+
+      // ── Render gate: the bio re-renders when the attribute set or the
+      // context feeding it changes — not on raw activity churn. ────────────
+      const attrs = await listAttributes(this.sql, guildId, member.userId);
+      // Only active attributes render — contested stays visible in admin
+      // triage but never presents as fact in a profile.
+      const liveAttrs = attrs.filter(a => a.status === "active");
+      const renderHash = attributeHash(attrs, [
+        ...patterns.map(p => `p${p.id}:${p.updatedAt}`),
+        ...edges.map(e => `r${e.otherId}:${e.observationCount}:${e.lastObservedAt}`),
+        ...events.map(e => `e${e.id}`),
+        `ch:${stats.topChannel ?? ""}`, `hr:${stats.activeHours}`,
+      ]);
+      const renderChanged = existing[0]?.attr_hash !== renderHash;
+
+      if (!cardChanged && !renderChanged && toBuild.length === 0) { unchanged++; continue; }
+
+      // ── Tier 1: card — prose rendered from the structured set ────────────
+      const edgeNames = new Map<string, string>();
+      for (const e of edges) {
+        edgeNames.set(e.otherId, await memoryStore.displayNameFor(guildId, e.otherId));
+      }
+
       let cardResult: ProfileSynthesis | undefined;
-      if (cardChanged) {
-        const edgeNames = new Map<string, string>();
-        for (const e of edges) {
-          edgeNames.set(e.otherId, await memoryStore.displayNameFor(guildId, e.otherId));
-        }
-
+      if (renderChanged || !existing[0]) {
         const input: ProfileSynthesisInput = {
           displayName,
           stats: {
@@ -202,10 +258,7 @@ export class ProfileStore {
             firstSeenAt: member.firstSeenAt, lastSeenAt: member.lastSeenAt,
             topChannel: stats.topChannel, activeHours: stats.activeHours,
           },
-          memories: [
-            ...active.slice(0, 15).map(m => ({ content: m.content, kind: m.kind, confidence: m.confidence, confirmed: true })),
-            ...candidates.map(m => ({ content: m.content, kind: m.kind, confidence: m.confidence, confirmed: false })),
-          ],
+          attributes: liveAttrs.map(a => ({ field: a.field, value: a.value, confidence: a.confidence })),
           patterns: patterns.map(p => p.description),
           relationships: edges.map(e => ({
             withName: edgeNames.get(e.otherId) ?? "unknown",
@@ -226,7 +279,7 @@ export class ProfileStore {
         if (!cardResult && !existing[0]) {
           cardResult = {
             bio: `${displayName} has posted ${input.stats.messageCount} messages between ${input.stats.firstSeenAt ?? "unknown"} and ${input.stats.lastSeenAt ?? "unknown"}.`,
-            traits: [], interests: [], notableRelationships: [], roleInServer: "",
+            roleInServer: "",
           };
         }
       }
@@ -252,30 +305,33 @@ export class ProfileStore {
         await new Promise(r => setTimeout(r, 800)); // pace section calls for Groq TPM
       }
 
+      // Facets assemble deterministically: traits/interests from live
+      // attributes, notable relationships from verified edges.
       const facets: Profile["facets"] = {
-        traits: cardResult?.traits ?? existingFacets.traits ?? [],
-        interests: cardResult?.interests ?? existingFacets.interests ?? [],
-        notableRelationships: cardResult?.notableRelationships ?? existingFacets.notableRelationships ?? [],
+        traits: liveAttrs.filter(a => a.field === "trait").map(a => a.value),
+        interests: liveAttrs.filter(a => a.field === "interest").map(a => a.value),
+        notableRelationships: edges.slice(0, 5).map(e => `${edgeNames.get(e.otherId) ?? "unknown"} — ${e.summary || "observed dynamic"}`),
         roleInServer: cardResult?.roleInServer ?? existingFacets.roleInServer ?? "",
         dossier: { sections },
       };
       const summary = cardResult?.bio ?? (existing[0] ? undefined : "");
       if (cardResult || !existing[0]) {
         await this.sql`
-          INSERT INTO profiles (guild_id, subject_id, display_name, summary, facets_json, source_hash, built_at, updated_at)
-          VALUES (${guildId}, ${member.userId}, ${displayName}, ${summary ?? ""}, ${JSON.stringify(facets)}, ${sourceHash}, NOW(), NOW())
+          INSERT INTO profiles (guild_id, subject_id, display_name, summary, facets_json, source_hash, attr_hash, built_at, updated_at)
+          VALUES (${guildId}, ${member.userId}, ${displayName}, ${summary ?? ""}, ${JSON.stringify(facets)}, ${sourceHash}, ${renderHash}, NOW(), NOW())
           ON CONFLICT (guild_id, subject_id) DO UPDATE SET
             display_name = EXCLUDED.display_name,
             summary      = EXCLUDED.summary,
             facets_json  = EXCLUDED.facets_json,
             source_hash  = EXCLUDED.source_hash,
+            attr_hash    = EXCLUDED.attr_hash,
             built_at     = EXCLUDED.built_at,
             updated_at   = NOW()
         `;
       } else {
-        // Card unchanged — only refresh facets/dossier, preserve summary + built_at.
+        // Card unchanged — refresh facets/dossier + hashes, preserve summary + built_at.
         await this.sql`
-          UPDATE profiles SET display_name = ${displayName}, facets_json = ${JSON.stringify(facets)}, updated_at = NOW()
+          UPDATE profiles SET display_name = ${displayName}, facets_json = ${JSON.stringify(facets)}, source_hash = ${sourceHash}, attr_hash = ${renderHash}, updated_at = NOW()
           WHERE guild_id = ${guildId} AND subject_id = ${member.userId}
         `;
       }
