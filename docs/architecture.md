@@ -1,6 +1,6 @@
 # Architecture
 
-ASB (Artificial Server Member) is a single TypeScript/Node process that connects to Discord, observes messages, extracts durable memories using an LLM, detects notable server events, and replies conservatively when directly addressed. All state is stored locally in a SQLite database.
+ASB (Artificial Server Member) is a single TypeScript/Node process that connects to Discord, observes messages, extracts durable memories using an LLM, detects notable server events, and replies conservatively when directly addressed. All state is stored in Postgres (Supabase in production; any Postgres via `DATABASE_URL`).
 
 ---
 
@@ -13,13 +13,16 @@ ASB (Artificial Server Member) is a single TypeScript/Node process that connects
 | `src/brain.ts` | `Brain` | All LLM calls: extract memories, correct, assess continuity, classify events, reply |
 | `src/config.ts` | `config` | Env-variable validation (zod); single exported config object |
 | `src/types.ts` | `MessageEvent`, `MemoryCandidate`, `StoredEvent`, `Decision`, … | Shared TypeScript types shared across modules |
-| `src/database.ts` | `MemoryStore` | SQLite persistence: memory CRUD, lifecycle, conflict resolution, episode consolidation |
-| `src/events.ts` | `EventStore` | SQLite persistence: event CRUD, participants, message/memory attachments |
+| `src/database.ts` | `MemoryStore` | Postgres persistence: memory CRUD, lifecycle, conflict resolution, episode consolidation |
+| `src/events.ts` | `EventStore` | Postgres persistence: event CRUD, participants, message/memory attachments |
 | `src/migrations.ts` | `runMigrations`, `getMigrationVersion` | Versioned schema migrations (v1–v5) with rollback support |
 | `src/confidence.ts` | `calculateInitialConfidence`, `updateConfidence`, `calculateDefaultImportance`, `calculateDefaultExplicitness` | Deterministic numeric formulas; no LLM involvement |
 | `src/perception.ts` | `shouldInspectForMemory` | Cheap regex pre-filter: prevents LLM calls for ordinary chat |
 | `src/event-detection.ts` | `EventPipeline` | Heuristic + LLM continuity decisions; nightly maintenance |
 | `src/event-significance.ts` | `calculateSignificance` | Deterministic significance score and tier assignment |
+| `src/entity-resolution.ts` | `buildAliasMap`, `resolveSubject`, `findMentionedUsers` | Maps display names to real user IDs; ambiguous names resolve to `unknown` |
+| `src/profiles.ts` | `ProfileStore` | Per-chatter profile cards + dossiers: input fingerprinting + LLM synthesis, rebuilt only when inputs change |
+| `src/dossier.ts` | `gatherDossierInputs` | Per-section dossier input gathering and hashing — voice, life_situation, temperament, beliefs, relationship_map, reputation, timeline |
 | `src/commands.ts` | `commandDefinitions`, `handleMemoryCommand`, `handleMemoryButton` | Discord slash command schemas and interaction handlers |
 
 ---
@@ -37,14 +40,23 @@ Discord MessageCreate
         │ yes                     no ──────────────────────────────┐
         ▼                                                           │
   brain.ts: extractMemories()                                       │
-  (LLM — returns subjectId, kind, content,                         │
-   reason, evidenceType, effect only;                              │
+  (LLM — returns subjectId, subjectName, kind, content,            │
+   reason, evidenceType, effect + relationship assertions;         │
    no numeric values)                                              │
+        │                                                           │
+        ▼                                                           │
+  entity-resolution.ts: resolveSubject()                           │
+  • subjectName → real user ID via the members alias map           │
+  • ambiguous names → "unknown" (correctness over recall)          │
+  • relationship assertions → relationship_observations            │
+    → rolled up into relationships edges; verdict column (v8)      │
+    excludes joke assertions from roll-up via recomputeEdges()      │
         │                                                           │
         ▼                                                           │
   database.ts: saveMemory()                                         │
   • confidence.ts formulas set initial confidence                   │
-  • UNIQUE(guild_id, subject_id, kind, content) dedup              │
+  • UNIQUE(guild_id, subject_id, kind, content) dedup, with a pg_trgm
+    similarity fallback so rephrased extractions reinforce one row              │
   • evidence inserted idempotently by (memory_id, message_id)      │
   • lifecycle: candidate → active (if promotable evidence type     │
     and confidence ≥ threshold)                                    │
@@ -67,6 +79,12 @@ Discord MessageCreate
   brain.ts: reply()
   • recent channel context + relevant active memories
   • max 1800 chars
+  • REPLY_MODEL=groq/compound* switches to Groq's agentic system: server-side
+    web_search + visit_website tools, executed_tools logged, falls back to
+    GROQ_MODEL on failure
+  • REPLY_TOOLS=1 attaches local web_search/visit_url tools (tools.ts — free,
+    in-process, no per-call billing) when the message matches toolCues();
+    model-driven tool_calls loop, ≤3 rounds, falls back to the plain path
         │
         ▼
   Discord: message.reply()
@@ -76,7 +94,29 @@ Discord MessageCreate
 
 ## Data flow — bulk ingest (`npm run ingest`)
 
-`ingest.ts` connects to Discord, fetches the full channel history, sorts messages chronologically (Discord API returns newest-first), and feeds each message through the same `saveMemory` → `EventPipeline.process` path as the live bot. It rate-limits LLM calls to stay under Groq's token limit and skips messages that already have evidence rows (safe to re-run). After processing it calls `EventPipeline.maintainEvents()` to close open windows and score candidates.
+`ingest.ts` connects to Discord, fetches the full channel history, sorts messages chronologically (Discord API returns newest-first), and feeds each message through the same `saveMemory` → `EventPipeline.process` path as the live bot. It rate-limits LLM calls to stay under Groq's token limit and skips messages that already have evidence rows (safe to re-run). After processing it calls `EventPipeline.maintainEvents()` to close open windows and score candidates, then `ProfileStore.buildProfiles()` to rebuild per-chatter profile cards.
+
+---
+
+## Profiles
+
+`ProfileStore.buildProfiles()` runs during daily maintenance and at the end of ingest. For each member with ≥1 active memory or ≥5 messages it gathers deterministic inputs — top memories, behavioral patterns, relationship edges (≥2 observations), events, and activity stats — hashes them into `source_hash`, and only calls `Brain.synthesizeProfile()` when the fingerprint changed. Opted-out members are skipped and their profiles deleted. Profiles surface via `/profile` (self or admin) and are injected into `brain.reply()` for the author, @-mentioned users, and members referenced by name.
+
+Members with ≥3 active memories or ≥50 messages additionally get a **dossier** — a set of independently-built sections stored under `facets_json.dossier.sections`, each rebuilt only when its own input hash changes:
+
+- `voice` — writing style analyzed from a 60-message raw sample plus deterministic stats (avg length, caps/emoji/question rates)
+- `life_situation`, `beliefs` — sourced item lists citing memory IDs (`source_ids`)
+- `temperament`, `reputation` — prose + sourced items; reputation uses only third-party claims (evidence author ≠ subject)
+- `relationship_map` — per-person dynamics from merged edges (A→B + B→A collapsed at read time), bidirectional observation reasons, and the deterministic interaction graph (mention + name-ref frequency from `interactionPairs`)
+- `timeline` — deterministic event list, no LLM
+
+Degenerate LLM output (repeated glyphs, JSON blobs) is detected per section and never overwrites existing data. Dossiers surface via `/dossier` (self or admin); `reply()` only ever injects the card.
+
+Candidate memories pass a **sincerity verification** gate before they can activate: `Brain.verifyMemoriesBatch` re-judges each promotable candidate against its stored source message, the author's known names, and the preceding chat lines (literal / joke / unclear / misattributed). Verified literal self-reports promote to `active`; jokes are re-classified `sarcasm_or_joke` (confidence → 0.10, never promotable); `misattributed` verdicts — pasted/quoted text describing someone other than the poster — are forgotten outright; third-party literals stay candidate pending corroboration. Verification runs in `applyRetention()` and at the end of ingest before profile builds.
+
+**Paste/quote attribution.** Extraction instructs the model not to attribute quoted, pasted, or persona text to the poster ("I am \<other person\>", reposted bios, copied bot output) — it should attribute to the named person via `subjectName` or skip it. A deterministic guard (`detectSelfNaming`) flags "I am \<Capitalized Name\>" patterns where the name isn't one of the author's `known_names` and annotates the extraction input.
+
+**Contest detection.** Messages that address the bot and carry denial/correction cues (`contestCue`) are checked by `Brain.detectContest` against the author's stored memories. `contests` relations attach `contradict` evidence (status → `contested`, confidence frozen, `resolveContested` arbitrates via `net_score`); `confirms` attach `support` evidence that can resolve a contested memory back to `active`. Runs live in `MessageCreate` and as a sweep at the end of ingest.
 
 ---
 
@@ -145,7 +185,7 @@ Back-references to a closed candidate can retroactively promote it to `event` ti
 
 2. **Evidence is deduplicated by `(memory_id, message_id)`.** Replaying the same message cannot inflate confidence. Cross-author repetition creates separate evidence rows and legitimately builds confidence.
 
-3. **Transactions everywhere.** `saveMemory()` and `createEvent()` both use SQLite transactions so partial state is impossible.
+3. **Transactions everywhere.** `saveMemory()` and `createEvent()` both use Postgres transactions so partial state is impossible.
 
 4. **Conservative speaking.** The bot observes silently and replies only to direct mentions by default (`SPEAK_THRESHOLD=0.70`). The recency penalty never suppresses a direct mention.
 

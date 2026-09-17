@@ -1,0 +1,12 @@
+import 'dotenv/config';
+import { EventPipeline } from './src/event-detection.ts';
+import { MemoryStore } from './src/database.ts';
+import { EventStore } from './src/events.ts';
+import { Brain } from './src/brain.ts';
+const store = await MemoryStore.create();
+const eventStore = new EventStore();
+const brain = new Brain(process.env.GROQ_API_KEY, 'openai/gpt-oss-20b', 'https://api.groq.com/openai/v1');
+const pipeline = new EventPipeline();
+const result = await pipeline.maintainEvents(process.env.GUILD_ID, eventStore, store, brain);
+console.log('closed=' + result.closed + ' promoted=' + result.promoted + ' discarded=' + result.discarded);
+process.exit(0);

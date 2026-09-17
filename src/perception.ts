@@ -7,3 +7,65 @@ export function shouldInspectForMemory(event: MessageEvent) {
   const text = event.content.trim();
   return text.length >= 12 && text.length <= 2_000 && durableSignals.test(text);
 }
+
+// ── Provenance guards ─────────────────────────────────────────────────────────
+
+// "I am <Capitalized Name>" where the name is not one of the author's own names is
+// the signature of pasted/echoed text ("I am Sage, a dragon lover…") or persona
+// play — the claim belongs to the named person, not the poster. Requiring a
+// capitalized token keeps "i am depressed/tired/cooked" from firing; the
+// stopword list covers common capitalized openers ("I am Not", "I am The").
+const selfNaming = /(?:^|\W)[iI](?:'|’)m\s+(?:actually\s+|literally\s+)?([A-Z][\w'.-]*)|(?:^|\W)[iI]\s+am\s+(?:actually\s+|literally\s+)?([A-Z][\w'.-]*)/;
+const selfNamingStopwords = new Set([
+  "the", "a", "an", "not", "so", "just", "actually", "literally", "currently", "really",
+  "very", "too", "also", "still", "only", "always", "never", "now", "here", "there",
+  "done", "cooked", "dead", "dying", "fine", "ok", "okay", "good", "bad", "sorry",
+  "sure", "right", "wrong", "back", "home", "online", "offline", "new", "old", "this",
+  "that", "your", "my", "his", "her", "their", "our", "being", "gonna", "going",
+]);
+
+/**
+ * Returns the capitalized name a message self-names with when it doesn't match
+ * any of the author's known names — a pasted/quoted-bio signal. undefined when
+ * the message isn't a self-naming or names the author themselves.
+ */
+export function detectSelfNaming(content: string, authorNames: string[]): string | undefined {
+  const m = content.match(selfNaming);
+  const name = (m?.[1] ?? m?.[2])?.replace(/[.]+$/, "");
+  if (!name || selfNamingStopwords.has(name.toLowerCase())) return undefined;
+  // All-caps words are emphasis ("i am RETIRED/DEAD/COOKED"), not names.
+  if (name.length >= 4 && name === name.toUpperCase()) return undefined;
+  if (authorNames.some(n => n.toLowerCase() === name.toLowerCase())) return undefined;
+  return name;
+}
+
+// Negation/correction cues on a bot-addressed message — cheap gate before the
+// LLM contest check. Matches "I didn't mention", "you have me confused",
+// "Correction: I did say…", etc.
+const contestSignals = /\b(?:i (?:never|didn'?t|did not|do not) (?:say|said|mention|tell|write)|have me confused|you'?re (?:wrong|confused|making)|wrong person|that'?s not (?:true|me|right|what i)|never said|where did i say|you made (?:that|this|it) up|not true|correction:?|actually,? i did|i did say|i never said)\b/i;
+
+/** Cheap gate: does this message look like the author contesting or correcting something? */
+export function contestCue(content: string): boolean {
+  return contestSignals.test(content);
+}
+
+// Corrections addressed at the bot's memory without an @-mention:
+// "add that to the memory", "your memory doesn't go back that far", "what do you
+// know about me". Tight enough that human-to-human chatter rarely fires it.
+const botMemorySignals = /\b(?:add (?:that|this|it) to (?:the|your) memory|your (?:memory|memories|notes?) (?:doesn'?t|does not|do not|only|spans?|is)|what (?:do )?you (?:know|remember) about me|correct your (?:memory|notes?))\b/i;
+
+/** Cheap gate: does this message address the bot's memory state without mentioning it? */
+export function botMemoryCue(content: string): boolean {
+  return botMemorySignals.test(content);
+}
+
+// Cheap gate for attaching local web tools (web_search / visit_url) to a reply
+// call: a URL, a trailing question mark, or search-y vocabulary. Keeps tool
+// definitions (and their prompt-token cost) off ordinary banter; the model
+// self-gates actual tool use once they're attached.
+const toolSignals = /https?:\/\/|\?\s*$|\b(?:google|search|look ?up|check (?:this|that|the|if)|latest|news|wiki(?:pedia)?|who won|what is|what'?s the|price of|release[ds]?|when (?:does|did|is|was)|how (?:much|many))\b/i;
+
+/** Cheap gate: might this message need live web info or a fetched page? */
+export function toolCues(content: string): boolean {
+  return toolSignals.test(content);
+}

@@ -5,7 +5,7 @@ const env = z.object({
   // Required at runtime by the bot; tests don't need these — use empty string default.
   DISCORD_TOKEN: z.string().default(""),
   GROQ_API_KEY: z.string().default(""),
-  GROQ_MODEL: z.string().default("openai/gpt-oss-20b"),
+  GROQ_MODEL: z.string().default("openai/gpt-oss-120b"),
   GROQ_BASE_URL: z.string().default("https://api.groq.com/openai/v1"),
   // Optional when running tests via TEST_DATABASE_URL — db.ts prefers TEST_DATABASE_URL.
   DATABASE_URL: z.string().default(""),

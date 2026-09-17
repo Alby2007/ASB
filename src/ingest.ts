@@ -5,7 +5,10 @@ import { config } from "./config.js";
 import { MemoryStore } from "./database.js";
 import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
-import { shouldInspectForMemory } from "./perception.js";
+import { detectSelfNaming, shouldInspectForMemory } from "./perception.js";
+import { runContestCheck } from "./contest.js";
+import { ProfileStore } from "./profiles.js";
+import { buildAliasMap, resolveSubject } from "./entity-resolution.js";
 import type { MessageEvent } from "./types.js";
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -17,6 +20,9 @@ const LLM_BATCH_SIZE = 5;           // Messages per LLM call (batched extraction
 const BATCH_MODEL = process.env.INGEST_MODEL ?? "qwen/qwen3.8-27b";
 const BATCH_DELAY_MS = 3000;        // Delay between batch LLM calls
 const EVENT_DELAY_MS = 3000;        // Pipeline LLM calls get the same pacing
+const TRIAGE_MODEL = process.env.INGEST_TRIAGE_MODEL ?? "qwen/qwen3.8-27b";
+const TRIAGE_BATCH_SIZE = 10;       // Messages per triage call
+const TRIAGE_DELAY_MS = 1500;       // Triage prompts are small — 40 RPM is safe
 
 async function withRetry<T>(fn: () => Promise<T>, retries = 6): Promise<T> {
   for (let i = 0; i < retries; i++) {
@@ -44,7 +50,7 @@ const pipeline = new EventPipeline();
 let store: MemoryStore;
 let eventStore: EventStore;
 
-let total = 0, archived = 0, batchCalls = 0, memoriesSaved = 0, eventsCreated = 0, llmErrors = 0;
+let total = 0, archived = 0, batchCalls = 0, memoriesSaved = 0, eventsCreated = 0, llmErrors = 0, relationshipsRecorded = 0;
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -59,18 +65,39 @@ function toEvent(msg: RawMsg): MessageEvent {
   };
 }
 
-/** Archive all messages and return those that need memory extraction (passed pre-filter, not already processed). */
-async function archiveAndFilter(msgs: RawMsg[]): Promise<Array<{ event: MessageEvent; replyToId?: string; replyToContent?: string }>> {
-  const toExtract: Array<{ event: MessageEvent; replyToId?: string; replyToContent?: string }> = [];
+type ExtractItem = { event: MessageEvent; replyToId?: string; replyToContent?: string; note?: string };
+
+/** Archive all messages. Returns the extraction queue (regex pass, no evidence)
+ * and the triage queue (regex fail, no evidence, not yet triaged). */
+async function archiveAndFilter(msgs: RawMsg[]): Promise<{ toExtract: ExtractItem[]; toTriage: ExtractItem[] }> {
+  const toExtract: ExtractItem[] = [];
+  const toTriage: ExtractItem[] = [];
+  // One query for all existing triage marks instead of per-message lookups
+  const triaged = await store.getTriageResults(msgs.map(m => m.id));
+  const regexMarked: Array<{ id: string; result: string }> = [];
+
   for (const msg of msgs) {
     if (msg.author.bot || !msg.content.trim()) continue;
     total++;
     const event = toEvent(msg);
-    await store.recordMessage(event);
-    archived++;
-
     const replyToId = msg.reference?.messageId ?? undefined;
-    if (shouldInspectForMemory(event) && !(await store.hasEvidence(msg.id))) {
+    await store.recordMessage(event, replyToId);
+    archived++;
+    if (shouldInspectForMemory(event)) {
+      // Regex-passed messages count as triaged too — record the path they took
+      if (!triaged.has(msg.id)) regexMarked.push({ id: msg.id, result: "regex" });
+      if (!(await store.hasEvidence(msg.id))) {
+        let replyToContent: string | undefined;
+        if (replyToId) {
+          const ref = await store.getMessage(replyToId);
+          if (ref) replyToContent = `${ref.authorName}: ${ref.content}`;
+        }
+        toExtract.push({ event, replyToId, replyToContent });
+      }
+    } else if (msg.content.trim().length >= 4 && !triaged.has(msg.id) && !(await store.hasEvidence(msg.id))) {
+      toTriage.push({ event, replyToId });
+    } else if (triaged.get(msg.id) === "durable" && !(await store.hasEvidence(msg.id))) {
+      // Marked durable in a previous run but never extracted (e.g. crash mid-run)
       let replyToContent: string | undefined;
       if (replyToId) {
         const ref = await store.getMessage(replyToId);
@@ -79,7 +106,8 @@ async function archiveAndFilter(msgs: RawMsg[]): Promise<Array<{ event: MessageE
       toExtract.push({ event, replyToId, replyToContent });
     }
   }
-  return toExtract;
+  await store.setTriageResults(regexMarked);
+  return { toExtract, toTriage };
 }
 
 /** Run event pipeline (no memory IDs yet — memories are saved in batch step). */
@@ -136,26 +164,90 @@ client.once("ready", async () => {
   backlog.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
   console.log(`Ingesting ${backlog.length} messages oldest→newest (batch model: ${BATCH_MODEL})...`);
 
-  // ── Step 1: archive all messages + collect those that need extraction ────────
-  const toExtract = await archiveAndFilter(backlog as Parameters<typeof archiveAndFilter>[0]);
-  console.log(`  archived ${archived} | ${toExtract.length} messages need memory extraction`);
+  // ── Step 1: archive all messages + split into extraction / triage queues ────
+  const { toExtract, toTriage } = await archiveAndFilter(backlog as Parameters<typeof archiveAndFilter>[0]);
+  console.log(`  archived ${archived} | ${toExtract.length} regex-passed | ${toTriage.length} need LLM triage`);
+
+  // ── Step 1.5: LLM triage — catch durable signals the regex missed ────────────
+  let durableFound = 0;
+  for (let i = 0; i < toTriage.length; i += TRIAGE_BATCH_SIZE) {
+    const batch = toTriage.slice(i, i + TRIAGE_BATCH_SIZE);
+    try {
+      const verdicts = await withRetry(() => brain.triageBatch(
+        batch.map(b => ({ messageId: b.event.messageId, authorName: b.event.authorName, content: b.event.content })),
+        TRIAGE_MODEL
+      ));
+      const marks: Array<{ id: string; result: string }> = [];
+      for (const item of batch) {
+        const v = verdicts.get(item.event.messageId);
+        const durable = v?.durable ?? false;
+        marks.push({ id: item.event.messageId, result: durable ? "durable" : "noise" });
+        if (durable) {
+          durableFound++;
+          // Resolve reply context the same way archiveAndFilter does
+          if (item.replyToId) {
+            const ref = await store.getMessage(item.replyToId);
+            if (ref) item.replyToContent = `${ref.authorName}: ${ref.content}`;
+          }
+          toExtract.push(item);
+        }
+      }
+      await store.setTriageResults(marks);
+    } catch (err) {
+      llmErrors++;
+      console.error(`  [triage error] batch ${i / TRIAGE_BATCH_SIZE + 1}:`, (err as Error).message.slice(0, 120));
+    }
+    const done = Math.min(i + TRIAGE_BATCH_SIZE, toTriage.length);
+    if (done % 100 === 0 || done === toTriage.length) {
+      console.log(`  triage ${done}/${toTriage.length} | durable found: ${durableFound}`);
+    }
+    await sleep(TRIAGE_DELAY_MS);
+  }
+  // Keep extraction in chronological order — durable messages were appended out of order
+  toExtract.sort((a, b) => a.event.createdAt.getTime() - b.event.createdAt.getTime());
+  console.log(`  extraction queue: ${toExtract.length} messages`);
 
   // ── Step 2: batch extraction — LLM_BATCH_SIZE messages per call ─────────────
   // Map messageId → saved memory IDs so the event pipeline can link them
   const savedIdsByMessage = new Map<string, number[]>();
+  // The member registry is fully populated by the archive step, so the alias map
+  // can resolve names like "Starz" to real user IDs throughout extraction.
+  const aliasMap = await buildAliasMap(guild.id, store);
+  // userId → known display names, for the pasted/echoed self-naming guard
+  const memberNames = new Map((await store.listMembers(guild.id)).map(m => [m.userId, m.knownNames]));
 
   for (let i = 0; i < toExtract.length; i += LLM_BATCH_SIZE) {
     const batch = toExtract.slice(i, i + LLM_BATCH_SIZE);
     batchCalls++;
+    for (const item of batch) {
+      const named = detectSelfNaming(item.event.content, memberNames.get(item.event.authorId) ?? [item.event.authorName]);
+      if (named) {
+        await store.learnAlias(item.event.guildId, item.event.authorId, named, "self_naming", item.event.messageId);
+        item.note = `the author may be naming themselves "${named}" (a previously unknown alias) or quoting/describing "${named}" — attribute accordingly`;
+      }
+    }
     try {
       const results = await withRetry(() => brain.extractMemoriesBatch(batch, BATCH_MODEL));
       for (const item of batch) {
-        const candidates = results.get(item.event.messageId) ?? [];
+        const result = results.get(item.event.messageId) ?? { memories: [], relationships: [] };
         const ids: number[] = [];
-        for (const memory of candidates) {
+        for (const memory of result.memories) {
+          memory.subjectId = resolveSubject(memory, aliasMap, item.event);
+          if (memory.subjectId === "unknown" && memory.subjectName) {
+            await store.logUnresolvedName(item.event.guildId, memory.subjectName, item.event.messageId);
+          }
           const saved = await store.saveMemory(item.event, memory, config.candidateConfidenceThreshold);
           ids.push(saved.id);
           memoriesSaved++;
+        }
+        for (const rel of result.relationships) {
+          const subjectId = rel.subjectName ? resolveSubject({ subjectName: rel.subjectName }, aliasMap, item.event) : item.event.authorId;
+          const otherId = resolveSubject({ subjectName: rel.otherName }, aliasMap, item.event);
+          if (subjectId === "unknown" && rel.subjectName) await store.logUnresolvedName(item.event.guildId, rel.subjectName, item.event.messageId);
+          if (otherId === "unknown" && rel.otherName) await store.logUnresolvedName(item.event.guildId, rel.otherName, item.event.messageId);
+          if (await store.recordRelationship(item.event.guildId, subjectId, otherId, item.event.messageId, rel.nature, rel.valence, rel.reason ?? "")) {
+            relationshipsRecorded++;
+          }
         }
         savedIdsByMessage.set(item.event.messageId, ids);
       }
@@ -184,12 +276,74 @@ client.once("ready", async () => {
     }
   }
 
-  console.log(`\nDone. ${total} total | ${archived} archived | ${batchCalls} batch calls | ${memoriesSaved} memories | ${eventsCreated} candidate events | ${llmErrors} LLM errors`);
+  console.log(`\nDone. ${total} total | ${archived} archived | ${durableFound} durable via triage | ${batchCalls} batch calls | ${memoriesSaved} memories | ${relationshipsRecorded} relationship observations | ${eventsCreated} candidate events | ${llmErrors} LLM errors`);
 
   // Run event maintenance to close open windows and score candidates
   console.log("Running event maintenance...");
   const result = await pipeline.maintainEvents(guild.id, eventStore, store, brain);
   console.log(`Maintenance: closed=${result.closed} promoted=${result.promoted} discarded=${result.discarded}`);
+
+  // Sincerity verification — re-judge promotable candidates against their source
+  // messages so edgy jokes don't promote. Verified literal self-reports go active.
+  console.log("Verifying candidate memories...");
+  try {
+    const verifiable = await store.listVerifiableCandidates(guild.id);
+    let vPromoted = 0, vFlagged = 0;
+    for (let i = 0; i < verifiable.length; i += TRIAGE_BATCH_SIZE) {
+      const batch = verifiable.slice(i, i + TRIAGE_BATCH_SIZE);
+      try {
+        const verdicts = await withRetry(() => brain.verifyMemoriesBatch(
+          batch.map(b => ({ memoryId: b.memoryId, authorName: b.authorName, authorNames: b.authorNames, claim: b.content, sourceMessage: b.sourceMessage, contextBefore: b.contextBefore })),
+          process.env.VERIFY_MODEL ?? BATCH_MODEL
+        ));
+        for (const b of batch) {
+          const v = verdicts.get(b.memoryId) ?? { verdict: "unclear" as const, reason: "omitted" };
+          const r = await store.applyVerification(b.memoryId, v.verdict, v.reason);
+          if (r === "promoted") vPromoted++;
+          else if (r === "flagged") vFlagged++;
+          else if (r === "rejected") vFlagged++;
+        }
+      } catch (err) {
+        llmErrors++;
+        console.error(`  [verify error] batch ${i / TRIAGE_BATCH_SIZE + 1}:`, (err as Error).message.slice(0, 120));
+      }
+      await sleep(TRIAGE_DELAY_MS);
+    }
+    console.log(`  verification: ${vPromoted} promoted | ${vFlagged} flagged | ${verifiable.length - vPromoted - vFlagged} unchanged`);
+  } catch (err) {
+    console.error("Verification failed:", (err as Error).message.slice(0, 120));
+  }
+
+  // Contest sweep — bot-addressed denials/corrections update the memories they target
+  try {
+    const botId = client.user!.id;
+    let contests = 0, confirms = 0;
+    for (const msg of backlog as Parameters<typeof archiveAndFilter>[0]) {
+      if (msg.author.bot || !msg.content.trim()) continue;
+      if (!msg.content.includes(`<@${botId}>`) && !msg.content.includes(`<@!${botId}>`)) continue;
+      try {
+        const r = await withRetry(() => runContestCheck(toEvent(msg), brain, store, botId, process.env.CONTEST_MODEL ?? BATCH_MODEL));
+        contests += r.contests; confirms += r.confirms;
+        if (r.contests || r.confirms) await sleep(EVENT_DELAY_MS);
+      } catch (err) {
+        llmErrors++;
+        console.error(`  [contest error] msg ${msg.id}:`, (err as Error).message.slice(0, 120));
+      }
+    }
+    if (contests || confirms) console.log(`  contest sweep: ${contests} contested | ${confirms} confirmed`);
+  } catch (err) {
+    console.error("Contest sweep failed:", (err as Error).message.slice(0, 120));
+  }
+
+  // Build per-chatter profile cards (bounded: one LLM call per changed member)
+  console.log("Building member profiles...");
+  try {
+    const profileStore = new ProfileStore();
+    const profiles = await withRetry(() => profileStore.buildProfiles(guild.id, brain, store, eventStore, process.env.PROFILE_MODEL ?? BATCH_MODEL));
+    console.log(`Profiles: ${profiles.built} built | ${profiles.unchanged} unchanged | ${profiles.considered} considered`);
+  } catch (err) {
+    console.error("Profile build failed:", (err as Error).message.slice(0, 120));
+  }
 
   process.exit(0);
 });

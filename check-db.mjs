@@ -1,0 +1,12 @@
+import 'dotenv/config';
+import postgres from 'postgres';
+const sql = postgres(process.env.DATABASE_URL, {max: 1, onnotice: () => {}});
+const ev = await sql`SELECT tier, COUNT(*) as c FROM events GROUP BY tier`;
+ev.forEach(r => console.log('event tier:', r.tier, '|', r.c));
+const sig = await sql`SELECT significance FROM events WHERE significance > 0 ORDER BY significance DESC LIMIT 5`;
+sig.forEach(r => console.log('  sig:', r.significance));
+const mem = await sql`SELECT status, COUNT(*) as c FROM memories GROUP BY status`;
+mem.forEach(r => console.log('memory status:', r.status, '|', r.c));
+const msg = await sql`SELECT COUNT(*) as c FROM messages`;
+console.log('messages:', msg[0].c);
+await sql.end();

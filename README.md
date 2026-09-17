@@ -8,7 +8,7 @@ An intentionally quiet Discord bot that observes conversations, forms a small pe
 2. Extract a small number of confidence-scored, durable memories.
 3. Recall relevant person and server memories in later conversations.
 4. Reply reliably to direct mentions and otherwise remain silent by default.
-5. Store messages and memories locally in SQLite so a restart does not erase its context.
+5. Store messages and memories in Postgres so a restart does not erase its context.
 6. Make every curated memory inspectable, correctable, and forgettable by the person it concerns.
 
 ### Memory commands
@@ -33,7 +33,7 @@ Out of scope for v1: autonomous proactive posts, relationship inference, rich se
 
 ## Build order
 
-1. **This foundation:** Discord ingestion, SQLite memory, OpenAI extraction and mention replies.
+1. **This foundation:** Discord ingestion, Postgres memory, LLM extraction and mention replies.
 2. Add Discord slash commands: `/memory`, `/forget`, `/status` and consent controls.
 3. Add a reviewable memory queue and tests with synthetic conversation fixtures.
 4. Enable carefully rate-limited contextual interventions in one test channel.
@@ -41,12 +41,12 @@ Out of scope for v1: autonomous proactive posts, relationship inference, rich se
 
 ## Architecture at a glance
 
-ASB is a single TypeScript process. Every Discord message goes through a pre-filter, optional LLM memory extraction, SQLite persistence, and an event-detection pipeline before a reply is considered. See [`docs/architecture.md`](docs/architecture.md) for the full module map and data-flow diagram.
+ASB is a single TypeScript process. Every Discord message goes through a pre-filter, optional LLM memory extraction, Postgres persistence, and an event-detection pipeline before a reply is considered. See [`docs/architecture.md`](docs/architecture.md) for the full module map and data-flow diagram.
 
 ## Run locally
 
 1. Create a Discord application and bot at the [Discord Developer Portal](https://discord.com/developers/applications). Enable the **Message Content Intent** under Bot → Privileged Gateway Intents, then invite it with `bot` permissions to a test server.
-2. Copy `.env.example` to `.env`, then supply the Discord bot token and Groq API key. Set `GUILD_ID` to the test server while developing. See [`docs/configuration.md`](docs/configuration.md) for all options.
+2. Copy `.env.example` to `.env`, then supply the Discord bot token, Groq API key, and a `DATABASE_URL` pointing at Postgres (a free [Supabase](https://supabase.com) project works; use the Session pooler URL). Set `GUILD_ID` to the test server while developing. See [`docs/configuration.md`](docs/configuration.md) for all options.
 3. Install dependencies and start it:
 
    ```bash
@@ -54,7 +54,7 @@ ASB is a single TypeScript process. Every Discord message goes through a pre-fil
    npm run dev
    ```
 
-Memory is stored at `data/asm.sqlite`, which is deliberately gitignored. Treat it as community data: use a private test server first and tell members what is retained. Raw messages are automatically removed after `RAW_MESSAGE_RETENTION_DAYS` (30 by default), and administrators can manually purge them earlier. Curated memories and their short evidence quotes remain until forgotten, corrected, or later decayed by a retention policy.
+Memory is stored in the Postgres database configured via `DATABASE_URL`; the schema is created automatically by migrations on startup. Treat it as community data: use a private test server first and tell members what is retained. Raw messages are automatically removed after `RAW_MESSAGE_RETENTION_DAYS` (30 by default), and administrators can manually purge them earlier. Curated memories and their short evidence quotes remain until forgotten, corrected, or later decayed by a retention policy.
 
 ### Bulk-ingest historical messages
 

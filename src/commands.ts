@@ -2,6 +2,7 @@ import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonInteraction, 
 import type { Brain } from "./brain.js";
 import type { Memory, MemoryStore } from "./database.js";
 import type { EventStore } from "./events.js";
+import { ProfileStore } from "./profiles.js";
 import type { MessageEvent } from "./types.js";
 
 export const commandDefinitions = [
@@ -21,6 +22,12 @@ export const commandDefinitions = [
   { name: "memory-settings", description: "Admin: view memory and retention settings", default_member_permissions: PermissionFlagsBits.ManageGuild.toString() },
   { name: "event", description: "Inspect the event linked to one of your memories", options: [
     { name: "memory_id", description: "A memory number returned by /memory", type: 4, required: true }
+  ] },
+  { name: "profile", description: "View a member's synthesized profile card", options: [
+    { name: "user", description: "Member to inspect (admins can view anyone)", type: 6, required: false }
+  ] },
+  { name: "dossier", description: "View a member's detailed profile dossier", options: [
+    { name: "user", description: "Member to inspect (admins can view anyone)", type: 6, required: false }
   ] }
 ];
 
@@ -131,6 +138,102 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
         { name: "Memories", value: String(ev.memoryIds.length), inline: true },
       );
     return interaction.reply({ ephemeral: true, embeds: [embed] });
+  }
+  if (interaction.commandName === "profile") {
+    const member = interaction.options.getUser("user");
+    if (member && member.id !== interaction.user.id && !interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      return interaction.reply({ content: "You can only view your own profile.", ephemeral: true });
+    }
+    const subjectId = member?.id ?? interaction.user.id;
+    const memberRow = await store.getMember(guildId, subjectId);
+    if (memberRow?.optedOut) return interaction.reply({ content: "This member has opted out of profiles.", ephemeral: true });
+    const profile = await new ProfileStore().getProfile(guildId, subjectId);
+    if (!profile) return interaction.reply({ content: "No profile has been built for that member yet. Profiles are generated during daily maintenance once enough has been observed.", ephemeral: true });
+
+    const [edges, memories] = await Promise.all([
+      store.relationshipsFor(guildId, subjectId),
+      store.listMemories(guildId, subjectId),
+    ]);
+    const topEdges = edges.filter(e => e.observationCount >= 2).slice(0, 5);
+    const relLines: string[] = [];
+    for (const e of topEdges) {
+      const otherId = e.subjectId === subjectId ? e.otherId : e.subjectId;
+      const name = await store.displayNameFor(guildId, otherId);
+      const tone = e.valence == null ? "" : e.valence >= 0.3 ? " · close" : e.valence <= -0.3 ? " · hostile" : " · neutral";
+      relLines.push(`**${name}** — ${e.summary || "observed dynamic"}${tone} (${e.observationCount} observations)`);
+    }
+    const events = evStore ? (await evStore.listEvents(guildId, { subjectUserId: subjectId, tier: "event" })).events.slice(0, 5) : [];
+
+    const embed = new EmbedBuilder()
+      .setTitle(`Profile — ${profile.displayName || member?.username || interaction.user.username}`)
+      .setDescription(profile.summary || "*No bio yet.*")
+      .addFields({
+        name: "Activity",
+        value: memberRow
+          ? `${memberRow.messageCount.toLocaleString()} messages · first seen ${new Date(memberRow.firstSeenAt).toLocaleDateString()} · last seen ${new Date(memberRow.lastSeenAt).toLocaleDateString()}`
+          : "No activity recorded",
+        inline: false,
+      });
+    if (profile.facets.roleInServer) embed.addFields({ name: "Role", value: profile.facets.roleInServer, inline: false });
+    if (profile.facets.traits?.length) embed.addFields({ name: "Traits", value: profile.facets.traits.join(", "), inline: false });
+    if (profile.facets.interests?.length) embed.addFields({ name: "Interests", value: profile.facets.interests.join(", "), inline: false });
+    if (relLines.length) embed.addFields({ name: "Relationships", value: relLines.join("\n"), inline: false });
+    if (events.length) embed.addFields({
+      name: "Significant events",
+      value: events.map(e => `${e.title || `Event #${e.id}`} *(${e.participants.find(p => p.userId === subjectId)?.role ?? "participant"})*`).join("\n"),
+      inline: false,
+    });
+    if (memories.memories.length) embed.addFields({
+      name: "Top memories",
+      value: memories.memories.slice(0, 5).map(m => `• ${m.content}`).join("\n"),
+      inline: false,
+    });
+    return interaction.reply({ ephemeral: true, embeds: [embed] });
+  }
+  if (interaction.commandName === "dossier") {
+    const member = interaction.options.getUser("user");
+    if (member && member.id !== interaction.user.id && !interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      return interaction.reply({ content: "You can only view your own dossier.", ephemeral: true });
+    }
+    const subjectId = member?.id ?? interaction.user.id;
+    const memberRow = await store.getMember(guildId, subjectId);
+    if (memberRow?.optedOut) return interaction.reply({ content: "This member has opted out of profiles.", ephemeral: true });
+    const profile = await new ProfileStore().getProfile(guildId, subjectId);
+    const dossier = profile?.facets.dossier?.sections;
+    if (!profile || !dossier || Object.keys(dossier).length === 0) {
+      return interaction.reply({ content: "No detailed profile has been built for that member yet.", ephemeral: true });
+    }
+
+    const cite = (ids?: number[]) => ids?.length ? ` *(${ids.map(id => `#${id}`).join(", ")})*` : "";
+    const itemsText = (items?: Array<{ text?: string; source_ids?: number[]; confirmed?: boolean }>) =>
+      (items ?? []).map(i => `• ${i.text ?? ""}${cite(i.source_ids)}`).join("\n") || "*None.*";
+
+    const embeds: EmbedBuilder[] = [];
+    const head = new EmbedBuilder()
+      .setTitle(`Dossier — ${profile.displayName || member?.username || interaction.user.username}`)
+      .setDescription(profile.summary || "*No bio yet.*")
+      .setFooter({ text: "Unconfirmed items are marked as such. #n references resolve via /memory memory_id." });
+    embeds.push(head);
+
+    const v = dossier.voice?.data as { prose?: string; quirks?: string[]; stats?: { avgLength: number; capsRatio: number; emojiRatio: number; questionRatio: number; sampleSize: number } } | undefined;
+    if (v) {
+      const stats = v.stats ? `\n\n*avg ${v.stats.avgLength} chars · ${(v.stats.capsRatio * 100).toFixed(0)}% all-caps · ${(v.stats.emojiRatio * 100).toFixed(0)}% emoji · ${(v.stats.questionRatio * 100).toFixed(0)}% questions · ${v.stats.sampleSize} msgs sampled*` : "";
+      embeds.push(new EmbedBuilder().setTitle("Voice").setDescription(`${v.prose ?? ""}${v.quirks?.length ? `\n\n**Quirks:** ${v.quirks.join("; ")}` : ""}${stats}`));
+    }
+    const life = dossier.life_situation?.data as { items?: Array<{ text?: string; source_ids?: number[] }> } | undefined;
+    if (life) embeds.push(new EmbedBuilder().setTitle("Life situation").setDescription(itemsText(life.items)));
+    const temp = dossier.temperament?.data as { prose?: string; items?: Array<{ text?: string; source_ids?: number[] }> } | undefined;
+    if (temp) embeds.push(new EmbedBuilder().setTitle("Temperament").setDescription(`${temp.prose ?? ""}${temp.items?.length ? `\n\n${itemsText(temp.items)}` : ""}`));
+    const beliefs = dossier.beliefs?.data as { items?: Array<{ text?: string; source_ids?: number[] }> } | undefined;
+    if (beliefs) embeds.push(new EmbedBuilder().setTitle("Beliefs & tastes").setDescription(itemsText(beliefs.items)));
+    const rels = dossier.relationship_map?.data as { entries?: Array<{ name?: string; dynamic?: string }> } | undefined;
+    if (rels?.entries?.length) embeds.push(new EmbedBuilder().setTitle("Relationship map").setDescription(rels.entries.map(e => `• **${e.name ?? "?"}** — ${e.dynamic ?? ""}`).join("\n")));
+    const rep = dossier.reputation?.data as { prose?: string; items?: Array<{ text?: string; source_ids?: number[] }> } | undefined;
+    if (rep) embeds.push(new EmbedBuilder().setTitle("Reputation").setDescription(`${rep.prose ?? ""}${rep.items?.length ? `\n\n${itemsText(rep.items)}` : ""}`));
+    const tl = dossier.timeline?.data as { entries?: Array<{ title?: string; date?: string; role?: string }> } | undefined;
+    if (tl?.entries?.length) embeds.push(new EmbedBuilder().setTitle("Timeline").setDescription(tl.entries.map(e => `• ${e.date ?? "?"} — ${e.title ?? "Untitled"} *(${e.role ?? "participant"})*`).join("\n")));
+
+    return interaction.reply({ ephemeral: true, embeds: embeds.slice(0, 10) });
   }
 }
 

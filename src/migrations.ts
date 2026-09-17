@@ -179,6 +179,160 @@ const migrations: Migration[] = [
       await sql`UPDATE memories SET subject_name = ''`;
     },
   },
+  {
+    version: 6,
+    name: "v02_message_triage_result",
+    up: async (sql) => {
+      await addColumn(sql, "messages", "triage_result TEXT");
+    },
+    down: async (sql) => {
+      await sql`UPDATE messages SET triage_result = NULL`;
+    },
+  },
+  {
+    version: 7,
+    name: "v03_profiles_and_relationships",
+    up: async (sql) => {
+      await addColumn(sql, "messages", "reply_to_id TEXT");
+      await sql`
+        CREATE TABLE IF NOT EXISTS members (
+          guild_id      TEXT NOT NULL,
+          user_id       TEXT NOT NULL,
+          known_names   TEXT[] NOT NULL DEFAULT '{}',
+          first_seen_at TIMESTAMPTZ NOT NULL,
+          last_seen_at  TIMESTAMPTZ NOT NULL,
+          message_count INTEGER NOT NULL DEFAULT 0,
+          opted_out     SMALLINT NOT NULL DEFAULT 0,
+          PRIMARY KEY (guild_id, user_id)
+        )
+      `;
+      await sql`
+        CREATE TABLE IF NOT EXISTS relationship_observations (
+          id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          guild_id   TEXT NOT NULL,
+          subject_id TEXT NOT NULL,
+          other_id   TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          nature     TEXT NOT NULL,
+          valence    DOUBLE PRECISION,
+          reason     TEXT NOT NULL DEFAULT '',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE(subject_id, other_id, message_id)
+        )
+      `;
+      await sql`CREATE INDEX IF NOT EXISTS relationship_obs_lookup ON relationship_observations(guild_id, subject_id, other_id)`;
+      await sql`
+        CREATE TABLE IF NOT EXISTS relationships (
+          id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          guild_id          TEXT NOT NULL,
+          subject_id        TEXT NOT NULL,
+          other_id          TEXT NOT NULL,
+          summary           TEXT NOT NULL DEFAULT '',
+          valence           DOUBLE PRECISION,
+          observation_count INTEGER NOT NULL DEFAULT 0,
+          last_observed_at  TIMESTAMPTZ,
+          updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE(guild_id, subject_id, other_id)
+        )
+      `;
+      await sql`CREATE INDEX IF NOT EXISTS relationships_lookup ON relationships(guild_id, subject_id)`;
+      await sql`
+        CREATE TABLE IF NOT EXISTS profiles (
+          guild_id     TEXT NOT NULL,
+          subject_id   TEXT NOT NULL,
+          display_name TEXT NOT NULL DEFAULT '',
+          summary      TEXT NOT NULL DEFAULT '',
+          facets_json  TEXT NOT NULL DEFAULT '{}',
+          source_hash  TEXT NOT NULL DEFAULT '',
+          built_at     TIMESTAMPTZ,
+          updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (guild_id, subject_id)
+        )
+      `;
+    },
+    down: async (sql) => {
+      await sql`DROP INDEX IF EXISTS relationships_lookup`;
+      await sql`DROP TABLE IF EXISTS relationships`;
+      await sql`DROP INDEX IF EXISTS relationship_obs_lookup`;
+      await sql`DROP TABLE IF EXISTS relationship_observations`;
+      await sql`DROP TABLE IF EXISTS profiles`;
+      await sql`DROP TABLE IF EXISTS members`;
+      await sql`UPDATE messages SET reply_to_id = NULL`;
+    },
+  },
+  {
+    version: 8,
+    name: "v04_relationship_verdicts",
+    // Sincerity verdict per observation ('literal'|'joke'|'unclear'; NULL = not
+    // yet judged). Edge roll-up excludes 'joke' rows so edgy banter doesn't
+    // create durable edges.
+    up: async (sql) => {
+      await addColumn(sql, "relationship_observations", "verdict TEXT");
+    },
+    down: async (sql) => {
+      await sql`ALTER TABLE relationship_observations DROP COLUMN IF EXISTS verdict`;
+    },
+  },
+  {
+    version: 9,
+    name: "v05_alias_learning",
+    // Provenance for learned aliases: a self-naming hit ("I am Sage" posted by
+    // tinyriot) both records the candidate and applies it to known_names.
+    up: async (sql) => {
+      await sql`
+        CREATE TABLE IF NOT EXISTS alias_candidates (
+          id                  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          guild_id            TEXT NOT NULL,
+          user_id             TEXT NOT NULL,
+          name                TEXT NOT NULL,
+          source              TEXT NOT NULL,
+          evidence_message_id TEXT NOT NULL DEFAULT '',
+          created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE(guild_id, user_id, name, evidence_message_id)
+        )
+      `;
+    },
+    down: async (sql) => {
+      await sql`DROP TABLE IF EXISTS alias_candidates`;
+    },
+  },
+  {
+    version: 10,
+    name: "v06_unresolved_names",
+    // Names that failed entity resolution, logged with their message — the
+    // discovery surface for aliases the self-naming path can't catch and for
+    // recurring non-member entities worth modeling.
+    up: async (sql) => {
+      await sql`
+        CREATE TABLE IF NOT EXISTS unresolved_names (
+          id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          guild_id   TEXT NOT NULL,
+          name       TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE(guild_id, name, message_id)
+        )
+      `;
+    },
+    down: async (sql) => {
+      await sql`DROP TABLE IF EXISTS unresolved_names`;
+    },
+  },
+  {
+    version: 11,
+    name: "v11_memory_trigram_dedup",
+    // pg_trgm powers the near-duplicate fast-path in saveMemory(): when the exact
+    // (guild, subject, kind, content) key misses, a similarity() lookup scoped to
+    // the same subject+kind decides whether to reinforce an existing row instead.
+    up: async (sql) => {
+      await sql`CREATE EXTENSION IF NOT EXISTS pg_trgm`;
+      await sql`CREATE INDEX IF NOT EXISTS memories_content_trgm ON memories USING gin (content gin_trgm_ops)`;
+    },
+    down: async (sql) => {
+      await sql`DROP INDEX IF EXISTS memories_content_trgm`;
+      // pg_trgm is left installed — other objects outside this schema may rely on it.
+    },
+  },
 ];
 
 export async function runMigrations(sql: Sql, targetVersion?: number): Promise<void> {

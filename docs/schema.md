@@ -1,6 +1,6 @@
 # Database Schema
 
-ASB stores all state in a single SQLite file at `data/asm.sqlite` (WAL mode). Tables are created on first run and evolved by the versioned migration system in `src/migrations.ts`.
+ASB stores all state in Postgres — Supabase in production, or any Postgres via `DATABASE_URL`. Tables are created on first run and evolved by the versioned migration system in `src/migrations.ts`.
 
 ---
 
@@ -19,6 +19,8 @@ Raw Discord message archive. Purged on a rolling retention window.
 | `author_name` | TEXT | Display name at time of message |
 | `content` | TEXT | Full message text |
 | `created_at` | TEXT | ISO-8601 timestamp |
+| `triage_result` | TEXT \| NULL | LLM/regex durability verdict (v6): `'regex'` passed the regex gate, `'durable'` flagged by LLM triage, `'noise'` rejected. NULL = not yet triaged |
+| `reply_to_id` | TEXT \| NULL | Discord ID of the message this one replies to (v7) |
 
 **Index:** `messages_context (guild_id, channel_id, created_at DESC)` — used by `recentContext()`.
 
@@ -60,7 +62,7 @@ One row per curated fact, preference, episode, or piece of server lore. The core
 
 **Unique constraint:** `(guild_id, subject_id, kind, content)` — exact deduplication prevents duplicate rows for the same fact.
 
-**Index:** `memories_lookup (guild_id, subject_id, status, importance DESC)`.
+**Indexes:** `memories_lookup (guild_id, subject_id, status, importance DESC)`; `memories_content_trgm` — GIN trigram index (v11) powering the near-duplicate fallback in `saveMemory()`: when the exact key misses, the best `similarity(content)` row in the same `(guild_id, subject_id, kind)` scope is reinforced instead. Matches and near-misses are audited in `memory_history` as `dedup_matched` / `dedup_near_miss`.
 
 #### Memory lifecycle statuses
 
@@ -227,6 +229,79 @@ Which memories are linked to an event.
 
 ---
 
+### `members`
+
+Member registry — one row per (guild, user). Built by `recordMessage()` so both the live bot and ingest populate it.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `guild_id` | TEXT | Server scope (composite PK) |
+| `user_id` | TEXT | Discord user ID (composite PK) |
+| `known_names` | TEXT[] | Every display name observed for this user; backs the entity-resolution alias map |
+| `first_seen_at` | TEXT | ISO-8601 |
+| `last_seen_at` | TEXT | ISO-8601 |
+| `message_count` | INTEGER | Total recorded messages |
+| `opted_out` | INTEGER | 1 = excluded from profile building; any existing profile is deleted |
+
+---
+
+### `relationship_observations`
+
+Raw LLM relationship assertions. One row per (subject, other, message) — idempotent evidence for the rolled-up edges in `relationships`.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | INTEGER PK | Auto-increment |
+| `guild_id` | TEXT | Server scope |
+| `subject_id` | TEXT | Discord user ID the assertion is about |
+| `other_id` | TEXT | Discord user ID of the other party |
+| `message_id` | TEXT | Source message snowflake |
+| `nature` | TEXT | Free-text dynamic: "close friends", "antagonizes", "dating", … |
+| `valence` | REAL \| NULL | −1 hostile … 0 neutral … +1 close |
+| `reason` | TEXT | LLM-supplied explanation |
+| `created_at` | TEXT | ISO-8601 |
+
+**Unique constraint:** `(subject_id, other_id, message_id)`. **Index:** `relationship_obs_lookup (guild_id, subject_id, other_id)`.
+
+---
+
+### `relationships`
+
+Durable relationship edges rolled up from observations. `observation_count` increments and `valence` is a running average on each new observation.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | INTEGER PK | Auto-increment |
+| `guild_id` | TEXT | Server scope |
+| `subject_id` | TEXT | Discord user ID |
+| `other_id` | TEXT | Discord user ID |
+| `summary` | TEXT | Latest observed nature of the relationship |
+| `valence` | REAL \| NULL | Running-average valence |
+| `observation_count` | INTEGER | Number of supporting observations; edges surface in profiles at ≥2 |
+| `last_observed_at` | TEXT | ISO-8601 |
+| `updated_at` | TEXT | ISO-8601 |
+
+**Unique constraint:** `(guild_id, subject_id, other_id)`. **Index:** `relationships_lookup (guild_id, subject_id)`.
+
+---
+
+### `profiles`
+
+Synthesized per-chatter profile cards, rebuilt only when their input fingerprint changes.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `guild_id` | TEXT | Server scope (composite PK) |
+| `subject_id` | TEXT | Discord user ID (composite PK) |
+| `display_name` | TEXT | Best current display name |
+| `summary` | TEXT | LLM-written bio |
+| `facets_json` | TEXT | JSON: `traits`, `interests`, `notableRelationships`, `roleInServer`, plus `dossier.sections` — per-section results `{ hash, builtAt, data }` for `voice`, `life_situation`, `temperament`, `beliefs`, `relationship_map`, `reputation`, `timeline`; list items carry `source_ids` memory citations |
+| `source_hash` | TEXT | SHA-256 fingerprint of card build inputs; identical hash → card LLM call skipped (dossier sections hash independently) |
+| `built_at` | TEXT | ISO-8601 of last LLM synthesis |
+| `updated_at` | TEXT | ISO-8601 |
+
+---
+
 ### `schema_migrations`
 
 Version tracking for the migration system.
@@ -247,3 +322,9 @@ Version tracking for the migration system.
 | 3 | `phase_1c_primary_evidence_type` | `primary_evidence_type` on `memories` |
 | 4 | `v02_events` | `event_id` on `memories`; `events`, `event_participants`, `event_messages`, `event_memories` tables |
 | 5 | `v02_memory_subject_name` | `subject_name` on `memories` |
+| 6 | `v02_message_triage_result` | `triage_result` on `messages` — persists LLM triage verdicts so re-ingests never re-triage |
+| 7 | `v03_profiles_and_relationships` | `reply_to_id` on `messages`; `members`, `relationship_observations`, `relationships`, `profiles` tables |
+| 8 | `v04_relationship_verdicts` | `verdict` on `relationship_observations` — joke assertions excluded from edge roll-up |
+| 9 | `v05_alias_learning` | `alias_candidates` table — provenance for learned display-name aliases |
+| 10 | `v06_unresolved_names` | `unresolved_names` table — names that failed entity resolution |
+| 11 | `v11_memory_trigram_dedup` | `pg_trgm` extension + `memories_content_trgm` GIN index for near-duplicate memory matching |

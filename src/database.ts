@@ -1,6 +1,7 @@
-import type { EvidenceType, MemoryCandidate, MemoryStatus, MessageEvent } from "./types.js";
+import type { EvidenceEffect, EvidenceType, Member, MemoryCandidate, MemoryStatus, MessageEvent, RelationshipEdge, VerificationVerdict } from "./types.js";
 import { sql as defaultSql, type Sql } from "./db.js";
 import { runMigrations } from "./migrations.js";
+import { findMentionedUsers } from "./entity-resolution.js";
 import { calculateInitialConfidence, updateConfidence, calculateDefaultImportance, calculateDefaultExplicitness } from "./confidence.js";
 
 export type Memory = Omit<MemoryCandidate, "confidence" | "importance" | "explicitness"> & {
@@ -60,10 +61,30 @@ type MessageRow = {
 
 type SettingsRow = { guild_id: string; memory_enabled: number; reply_enabled: number; raw_retention_days: number };
 
+type MemberRow = {
+  guild_id: string; user_id: string; known_names: string[];
+  first_seen_at: Date | string; last_seen_at: Date | string;
+  message_count: number; opted_out: number;
+};
+
+type RelationshipRow = {
+  id: number; guild_id: string; subject_id: string; other_id: string;
+  summary: string; valence: number | null; observation_count: number;
+  last_observed_at: Date | string | null; updated_at: Date | string;
+};
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function ts(d: Date | string): string {
   return d instanceof Date ? d.toISOString() : d;
+}
+
+function rowToMember(r: MemberRow): Member {
+  return {
+    guildId: r.guild_id, userId: r.user_id, knownNames: r.known_names ?? [],
+    firstSeenAt: ts(r.first_seen_at), lastSeenAt: ts(r.last_seen_at),
+    messageCount: Number(r.message_count), optedOut: Number(r.opted_out) === 1,
+  };
 }
 
 function rowToMemory(r: MemoryRow): Memory {
@@ -89,6 +110,50 @@ function rowToMemory(r: MemoryRow): Memory {
 }
 
 // ── MemoryStore ───────────────────────────────────────────────────────────────
+
+// pg_trgm similarity thresholds for near-duplicate dedup in saveMemory().
+// ≥ MATCH: evidence attaches to the existing row. ≥ NEAR_MISS (but < MATCH): the
+// new row is still created and a dedup_near_miss history entry records the score
+// for threshold tuning.
+const TRIGRAM_MATCH_THRESHOLD = 0.6;
+const TRIGRAM_NEAR_MISS_THRESHOLD = 0.4;
+
+// Only high-quality evidence types may promote a candidate to active — or ride the
+// fuzzy-dedup fast-path. Sarcasm, rumour, and uncertain inferences are excluded
+// regardless of confidence.
+const PROMOTABLE_EVIDENCE_TYPES: EvidenceType[] = ["explicit_fact", "clear_preference", "correction"];
+
+// Cheap polarity check for fuzzy-matched memories: a rephrased extraction whose
+// content lands on the opposite side of an antonym/negation pair is a
+// contradiction of the matched row, whatever effect the LLM labelled it.
+const POLARITY_WORDS: Record<string, 1 | -1> = {
+  love: 1, loves: 1, loved: 1, loving: 1,
+  hate: -1, hates: -1, hated: -1, hating: -1,
+  like: 1, likes: 1, liked: 1,
+  dislike: -1, dislikes: -1, disliked: -1,
+  enjoy: 1, enjoys: 1, enjoyed: 1,
+  prefer: 1, prefers: 1, preferred: 1,
+  want: 1, wants: 1, wanted: 1,
+  support: 1, supports: 1, supported: 1, supporting: 1,
+  oppose: -1, opposes: -1, opposed: -1,
+  against: -1,
+  can: 1, cant: -1, cannot: -1, "can't": -1,
+  do: 1, does: 1, dont: -1, "don't": -1, doesnt: -1, "doesn't": -1, didnt: -1, "didn't": -1,
+  will: 1, wont: -1, "won't": -1,
+  is: 1, am: 1, are: 1, was: 1, were: 1,
+  isnt: -1, "isn't": -1, arent: -1, "aren't": -1, wasnt: -1, "wasn't": -1, werent: -1, "weren't": -1,
+  never: -1, not: -1, no: -1,
+};
+
+/** Product of polarity-charged tokens; neutral content returns +1. */
+function contentPolarity(content: string): 1 | -1 {
+  let polarity: 1 | -1 = 1;
+  for (const token of content.toLowerCase().match(/[a-z']+/g) ?? []) {
+    const p = POLARITY_WORDS[token];
+    if (p) polarity = (polarity * p) as 1 | -1;
+  }
+  return polarity;
+}
 
 export class MemoryStore {
   private constructor(private sql: Sql) {}
@@ -122,12 +187,467 @@ export class MemoryStore {
 
   // ── Messages ───────────────────────────────────────────────────────────────
 
-  async recordMessage(event: MessageEvent): Promise<void> {
+  async recordMessage(event: MessageEvent, replyToId?: string): Promise<void> {
     await this.sql`
-      INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, content, created_at)
-      VALUES (${event.messageId}, ${event.guildId}, ${event.channelId}, ${event.authorId}, ${event.authorName}, ${event.content}, ${event.createdAt.toISOString()})
-      ON CONFLICT (id) DO NOTHING
+      INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, content, created_at, reply_to_id)
+      VALUES (${event.messageId}, ${event.guildId}, ${event.channelId}, ${event.authorId}, ${event.authorName}, ${event.content}, ${event.createdAt.toISOString()}, ${replyToId ?? null})
+      ON CONFLICT (id) DO UPDATE SET reply_to_id = COALESCE(messages.reply_to_id, EXCLUDED.reply_to_id)
     `;
+    await this.upsertMember(event.guildId, event.authorId, event.authorName, event.createdAt);
+  }
+
+  // ── Members ────────────────────────────────────────────────────────────────
+  // The members table is the member registry: one row per (guild, user) tracking every
+  // display name observed, message counts, and first/last activity. It backs the
+  // entity-resolution alias map and per-chatter profiles.
+
+  async upsertMember(guildId: string, userId: string, displayName: string, at: Date): Promise<void> {
+    await this.sql`
+      INSERT INTO members (guild_id, user_id, known_names, first_seen_at, last_seen_at, message_count)
+      VALUES (${guildId}, ${userId}, ${[displayName]}, ${at.toISOString()}, ${at.toISOString()}, 1)
+      ON CONFLICT (guild_id, user_id) DO UPDATE SET
+        known_names   = CASE WHEN ${displayName} = ANY(members.known_names) THEN members.known_names ELSE array_append(members.known_names, ${displayName}) END,
+        first_seen_at = LEAST(members.first_seen_at, EXCLUDED.first_seen_at),
+        last_seen_at  = GREATEST(members.last_seen_at, EXCLUDED.last_seen_at),
+        message_count = members.message_count + 1
+    `;
+  }
+
+  async getMember(guildId: string, userId: string): Promise<Member | undefined> {
+    const rows = await this.sql<MemberRow[]>`SELECT * FROM members WHERE guild_id = ${guildId} AND user_id = ${userId}`;
+    return rows[0] ? rowToMember(rows[0]) : undefined;
+  }
+
+  async listMembers(guildId: string): Promise<Member[]> {
+    const rows = await this.sql<MemberRow[]>`SELECT * FROM members WHERE guild_id = ${guildId} ORDER BY message_count DESC`;
+    return rows.map(rowToMember);
+  }
+
+  /** Fallback for rows archived before the members table existed (pre-v7). */
+  async listAuthorNames(guildId: string): Promise<Array<{ authorId: string; authorName: string }>> {
+    const rows = await this.sql<Array<{ author_id: string; author_name: string }>>`
+      SELECT DISTINCT author_id, author_name FROM messages WHERE guild_id = ${guildId}
+    `;
+    return rows.map(r => ({ authorId: r.author_id, authorName: r.author_name }));
+  }
+
+  async setMemberOptOut(guildId: string, userId: string, optedOut: boolean): Promise<void> {
+    await this.sql`UPDATE members SET opted_out = ${optedOut ? 1 : 0} WHERE guild_id = ${guildId} AND user_id = ${userId}`;
+  }
+
+  /** Learn a new name for a member from evidence (self-naming, manual /alias).
+   * Records provenance in alias_candidates and applies it to known_names so the
+   * alias map resolves it from then on. Idempotent per evidence message. */
+  async learnAlias(guildId: string, userId: string, name: string, source: string, messageId: string): Promise<boolean> {
+    const clean = name.trim();
+    if (!clean) return false;
+    return await this.sql.begin(async sql => {
+      const inserted = await sql`
+        INSERT INTO alias_candidates (guild_id, user_id, name, source, evidence_message_id)
+        VALUES (${guildId}, ${userId}, ${clean}, ${source}, ${messageId})
+        ON CONFLICT (guild_id, user_id, name, evidence_message_id) DO NOTHING
+        RETURNING id
+      `;
+      if (inserted.length === 0) return false;
+      await sql`
+        UPDATE members SET known_names = array_append(known_names, ${clean})
+        WHERE guild_id = ${guildId} AND user_id = ${userId}
+          AND NOT (LOWER(${clean}) = ANY(SELECT LOWER(x) FROM unnest(known_names) x))
+      `;
+      return true;
+    });
+  }
+
+  /** Log a name that failed entity resolution — the discovery surface for
+   * aliases self-naming can't catch and recurring non-member entities. */
+  async logUnresolvedName(guildId: string, name: string, messageId: string): Promise<void> {
+    const clean = name.trim();
+    if (!clean) return;
+    await this.sql`
+      INSERT INTO unresolved_names (guild_id, name, message_id)
+      VALUES (${guildId}, ${clean}, ${messageId})
+      ON CONFLICT (guild_id, name, message_id) DO NOTHING
+    `;
+  }
+
+  /** Unresolved names by frequency — candidates for alias learning or
+   * external-entity modeling. */
+  async unresolvedNames(guildId: string, limit = 30): Promise<Array<{ name: string; count: number }>> {
+    const rows = await this.sql<Array<{ name: string; c: number }>>`
+      SELECT name, COUNT(*)::int AS c FROM unresolved_names
+      WHERE guild_id = ${guildId}
+      GROUP BY name ORDER BY c DESC, name LIMIT ${limit}
+    `;
+    return rows.map(r => ({ name: r.name, count: r.c }));
+  }
+
+  /** Best current display name for a user: latest known name, else most recent message author_name. */
+  async displayNameFor(guildId: string, userId: string): Promise<string> {
+    const member = await this.getMember(guildId, userId);
+    if (member && member.knownNames.length > 0) return member.knownNames[member.knownNames.length - 1];
+    const rows = await this.sql<Array<{ author_name: string }>>`
+      SELECT author_name FROM messages WHERE guild_id = ${guildId} AND author_id = ${userId} ORDER BY created_at DESC LIMIT 1
+    `;
+    return rows[0]?.author_name ?? userId;
+  }
+
+  // ── Relationships ──────────────────────────────────────────────────────────
+  // Relationship assertions are stored as idempotent observations keyed by
+  // (subject_id, other_id, message_id); each new observation rolls up into a
+  // durable edge in `relationships` with a running-average valence.
+
+  async recordRelationship(guildId: string, subjectId: string, otherId: string, messageId: string, nature: string, valence: number | null, reason = ""): Promise<boolean> {
+    if (subjectId === otherId || subjectId === "unknown" || otherId === "unknown" || subjectId === "server" || otherId === "server") return false;
+    return await this.sql.begin(async sql => {
+      const inserted = await sql`
+        INSERT INTO relationship_observations (guild_id, subject_id, other_id, message_id, nature, valence, reason)
+        VALUES (${guildId}, ${subjectId}, ${otherId}, ${messageId}, ${nature}, ${valence}, ${reason})
+        ON CONFLICT (subject_id, other_id, message_id) DO NOTHING
+        RETURNING id
+      `;
+      if (inserted.length === 0) return false;
+      await sql`
+        INSERT INTO relationships (guild_id, subject_id, other_id, summary, valence, observation_count, last_observed_at, updated_at)
+        VALUES (${guildId}, ${subjectId}, ${otherId}, ${nature}, ${valence}, 1, NOW(), NOW())
+        ON CONFLICT (guild_id, subject_id, other_id) DO UPDATE SET
+          summary           = EXCLUDED.summary,
+          observation_count = relationships.observation_count + 1,
+          valence           = CASE
+            WHEN relationships.valence IS NULL THEN EXCLUDED.valence
+            WHEN EXCLUDED.valence IS NULL THEN relationships.valence
+            ELSE relationships.valence + (EXCLUDED.valence - relationships.valence) / (relationships.observation_count + 1)
+          END,
+          last_observed_at  = NOW(),
+          updated_at        = NOW()
+      `;
+      return true;
+    });
+  }
+
+  /** All edges where the subject is either side of the relationship, strongest first. */
+  async relationshipsFor(guildId: string, subjectId: string): Promise<RelationshipEdge[]> {
+    const rows = await this.sql<RelationshipRow[]>`
+      SELECT id, guild_id, subject_id, other_id, summary, valence, observation_count, last_observed_at, updated_at
+      FROM relationships
+      WHERE guild_id = ${guildId} AND (subject_id = ${subjectId} OR other_id = ${subjectId})
+      ORDER BY observation_count DESC
+    `;
+    return rows.map(r => ({
+      id: Number(r.id), guildId: r.guild_id, subjectId: r.subject_id, otherId: r.other_id,
+      summary: r.summary, valence: r.valence != null ? Number(r.valence) : null,
+      observationCount: Number(r.observation_count),
+      lastObservedAt: r.last_observed_at ? ts(r.last_observed_at) : null,
+      updatedAt: ts(r.updated_at),
+    }));
+  }
+
+  // ── Sincerity verification ─────────────────────────────────────────────────
+  // Extraction can mislabel edgy humor as explicit_fact/clear_preference. A
+  // second-pass LLM judgment against the stored source message gates promotion:
+  // jokes are re-classified sarcasm_or_joke, verified literal self-reports go
+  // active, and third-party literals stay candidate pending corroboration.
+
+  /** Candidate memories with promotable evidence types, joined to their first source message.
+   * Carries the author's known names and the messages preceding the source so the
+   * verifier can spot pasted/quoted text and jokes that only read literal in isolation. */
+  async listVerifiableCandidates(guildId: string): Promise<Array<{
+    memoryId: number; subjectId: string; kind: Memory["kind"]; content: string;
+    evidenceType: string; selfReport: boolean; authorName: string; authorNames: string[];
+    sourceMessage: string; contextBefore: Array<{ authorName: string; content: string }>;
+  }>> {
+    const rows = await this.sql<Array<{
+      memory_id: number; subject_id: string; kind: string; content: string;
+      primary_evidence_type: string; self_report: boolean;
+      author_name: string | null; author_names: string[] | null; source_message: string;
+      channel_id: string | null; msg_created_at: Date | string | null;
+    }>>`
+      SELECT m.id AS memory_id, m.subject_id, m.kind, m.content, m.primary_evidence_type,
+             (m.subject_id = e.author_id) AS self_report,
+             msg.author_name, mem.known_names AS author_names,
+             e.message_content_snapshot AS source_message,
+             msg.channel_id, msg.created_at AS msg_created_at
+      FROM memories m
+      JOIN LATERAL (
+        SELECT ev.author_id, ev.message_id, ev.message_content_snapshot
+        FROM memory_evidence ev WHERE ev.memory_id = m.id ORDER BY ev.id LIMIT 1
+      ) e ON true
+      LEFT JOIN messages msg ON msg.id = e.message_id
+      LEFT JOIN members mem ON mem.guild_id = m.guild_id AND mem.user_id = e.author_id
+      WHERE m.guild_id = ${guildId} AND m.status = 'candidate'
+        AND m.primary_evidence_type IN ('explicit_fact', 'clear_preference', 'correction')
+      ORDER BY m.id
+    `;
+    return await Promise.all(rows.map(async r => {
+      let contextBefore: Array<{ authorName: string; content: string }> = [];
+      if (r.channel_id && r.msg_created_at) {
+        const ctx = await this.sql<Array<{ author_name: string; content: string }>>`
+          SELECT author_name, content FROM messages
+          WHERE guild_id = ${guildId} AND channel_id = ${r.channel_id} AND created_at < ${r.msg_created_at}
+          ORDER BY created_at DESC LIMIT 5
+        `;
+        contextBefore = ctx.reverse().map(c => ({ authorName: c.author_name, content: c.content }));
+      }
+      return {
+        memoryId: Number(r.memory_id), subjectId: r.subject_id, kind: r.kind as Memory["kind"],
+        content: r.content, evidenceType: r.primary_evidence_type, selfReport: r.self_report,
+        authorName: r.author_name ?? r.subject_id, authorNames: r.author_names ?? [],
+        sourceMessage: r.source_message, contextBefore,
+      };
+    }));
+  }
+
+  /**
+   * Apply one verification verdict to a candidate memory.
+   * - joke → evidence re-classified sarcasm_or_joke, confidence reset to 0.10
+   * - misattributed → forgotten (the source text was quoting/describing someone else)
+   * - literal + self-report + promotable type → promoted to active
+   * - literal + third-party, or unclear → unchanged
+   * Returns "promoted" | "flagged" | "rejected" | "unchanged".
+   */
+  async applyVerification(memoryId: number, verdict: VerificationVerdict, reason: string): Promise<"promoted" | "flagged" | "rejected" | "unchanged"> {
+    return await this.sql.begin(async sql => {
+      const rows = await sql<MemoryRow[]>`SELECT * FROM memories WHERE id = ${memoryId}`;
+      const mem = rows[0] ? rowToMemory(rows[0]) : undefined;
+      if (!mem || mem.status !== "candidate") return "unchanged";
+
+      if (verdict === "misattributed") {
+        await sql`UPDATE memories SET status = 'forgotten', updated_at = NOW() WHERE id = ${memoryId}`;
+        await this._logHistory(sql, memoryId, "misattributed", mem.confidence, mem.confidence, "candidate", "forgotten", null, { reason });
+        return "rejected";
+      }
+
+      if (verdict === "joke") {
+        const jokeConfidence = calculateInitialConfidence("sarcasm_or_joke");
+        await sql`UPDATE memories SET primary_evidence_type = 'sarcasm_or_joke', confidence = ${jokeConfidence}, updated_at = NOW() WHERE id = ${memoryId}`;
+        await sql`UPDATE memory_evidence SET evidence_type = 'sarcasm_or_joke' WHERE memory_id = ${memoryId}`;
+        await this._logHistory(sql, memoryId, "flagged_joke", mem.confidence, jokeConfidence, "candidate", "candidate", null, { reason });
+        return "flagged";
+      }
+
+      if (verdict === "literal") {
+        const promotableTypes: EvidenceType[] = ["explicit_fact", "clear_preference", "correction"];
+        const ev = await sql<[{ author_id: string }]>`
+          SELECT author_id FROM memory_evidence WHERE memory_id = ${memoryId} ORDER BY id LIMIT 1
+        `;
+        const selfReport = ev[0]?.author_id === mem.subjectId;
+        if (selfReport && promotableTypes.includes(mem.primaryEvidenceType as EvidenceType)) {
+          await sql`UPDATE memories SET status = 'active', last_confirmed_at = NOW(), updated_at = NOW() WHERE id = ${memoryId}`;
+          await this._logHistory(sql, memoryId, "verified_active", mem.confidence, mem.confidence, "candidate", "active", null, { reason });
+          return "promoted";
+        }
+        await this._logHistory(sql, memoryId, "verified_literal", mem.confidence, mem.confidence, "candidate", "candidate", null, { reason });
+      }
+      return "unchanged";
+    });
+  }
+
+  // ── Dossier inputs ─────────────────────────────────────────────────────────
+
+  /** Up to 60 raw messages for voice analysis: 30 most recent + 30 random older ones. */
+  async sampleMessages(guildId: string, authorId: string): Promise<Array<{ content: string; createdAt: string }>> {
+    const recent = await this.sql<Array<{ content: string; created_at: Date | string }>>`
+      SELECT content, created_at FROM messages
+      WHERE guild_id = ${guildId} AND author_id = ${authorId} AND length(content) > 0
+      ORDER BY created_at DESC LIMIT 30
+    `;
+    const random = await this.sql<Array<{ content: string; created_at: Date | string }>>`
+      SELECT content, created_at FROM messages
+      WHERE guild_id = ${guildId} AND author_id = ${authorId} AND length(content) > 0
+      ORDER BY random() LIMIT 30
+    `;
+    const seen = new Set<string>();
+    const out: Array<{ content: string; createdAt: string }> = [];
+    for (const r of [...recent, ...random]) {
+      const key = r.content + ts(r.created_at);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ content: r.content, createdAt: ts(r.created_at) });
+    }
+    return out;
+  }
+
+  /** Raw relationship observations (with reasons) involving a member — either as
+   * the asserting side ("member_subject") or the observed side ("member_other").
+   * otherId is always the counterparty. Dossier relationship_map input. */
+  async relationshipObservationsFor(guildId: string, subjectId: string): Promise<Array<{
+    otherId: string; nature: string; valence: number | null; reason: string;
+    direction: "member_subject" | "member_other"; createdAt: string;
+  }>> {
+    const rows = await this.sql<Array<{
+      subject_id: string; other_id: string; nature: string; valence: number | null; reason: string; created_at: Date | string;
+    }>>`
+      SELECT subject_id, other_id, nature, valence, reason, created_at FROM relationship_observations
+      WHERE guild_id = ${guildId} AND (subject_id = ${subjectId} OR other_id = ${subjectId})
+        AND verdict IS DISTINCT FROM 'joke'
+      ORDER BY created_at DESC
+    `;
+    return rows.map(r => ({
+      otherId: r.subject_id === subjectId ? r.other_id : r.subject_id,
+      nature: r.nature,
+      valence: r.valence != null ? Number(r.valence) : null,
+      reason: r.reason,
+      direction: r.subject_id === subjectId ? "member_subject" as const : "member_other" as const,
+      createdAt: ts(r.created_at),
+    }));
+  }
+
+  /** Memories about a subject asserted by someone else — the community-attributed
+   * claims that feed the dossier reputation section. */
+  async thirdPartyClaims(guildId: string, subjectId: string): Promise<Array<{
+    memoryId: number; content: string; kind: Memory["kind"]; confidence: number; status: MemoryStatus; evidenceType: string;
+  }>> {
+    const rows = await this.sql<Array<{
+      id: number; content: string; kind: string; confidence: number; status: string; primary_evidence_type: string;
+    }>>`
+      SELECT DISTINCT m.id, m.content, m.kind, m.confidence, m.status, m.primary_evidence_type
+      FROM memories m
+      JOIN memory_evidence e ON e.memory_id = m.id
+      WHERE m.guild_id = ${guildId} AND m.subject_id = ${subjectId}
+        AND e.author_id <> m.subject_id
+        AND m.status IN ('active', 'candidate')
+      ORDER BY m.confidence DESC
+    `;
+    return rows.map(r => ({
+      memoryId: Number(r.id), content: r.content, kind: r.kind as Memory["kind"],
+      confidence: Number(r.confidence), status: r.status as MemoryStatus,
+      evidenceType: r.primary_evidence_type,
+    }));
+  }
+
+  // ── Interaction graph ──────────────────────────────────────────────────────
+  // Deterministic "who addresses whom" topology from the raw archive — <@ID>
+  // mentions plus written name-references. Distinct from LLM-asserted edges:
+  // this measures frequency of contact, not claimed dynamics. reply_to_id is
+  // unpopulated in the archive, so mentions are the signal we have.
+
+  /** Undirected pairs keyed (min,max) — mention and name-ref both count once per message per pair. */
+  async interactionPairs(
+    guildId: string,
+    aliasMap: Map<string, string>,
+    excludeIds: string[] = []
+  ): Promise<Array<{ aId: string; bId: string; count: number; firstAt: string; lastAt: string }>> {
+    const rows = await this.sql<Array<{ author_id: string; content: string; created_at: Date | string }>>`
+      SELECT author_id, content, created_at FROM messages
+      WHERE guild_id = ${guildId} AND length(content) > 0
+      ORDER BY created_at
+    `;
+    const skip = new Set(excludeIds);
+    const pairs = new Map<string, { aId: string; bId: string; count: number; firstAt: string; lastAt: string }>();
+    for (const r of rows) {
+      if (skip.has(r.author_id)) continue;
+      const targets = new Set<string>();
+      for (const m of r.content.matchAll(/<@!?(\d{5,25})>/g)) targets.add(m[1]);
+      for (const id of findMentionedUsers(r.content, aliasMap)) targets.add(id);
+      targets.delete(r.author_id);
+      for (const t of targets) {
+        if (skip.has(t)) continue;
+        const [a, b] = r.author_id < t ? [r.author_id, t] : [t, r.author_id];
+        const key = `${a}|${b}`;
+        const at = ts(r.created_at);
+        const cur = pairs.get(key);
+        if (cur) { cur.count++; cur.lastAt = at; }
+        else pairs.set(key, { aId: a, bId: b, count: 1, firstAt: at, lastAt: at });
+      }
+    }
+    return [...pairs.values()].sort((x, y) => y.count - x.count);
+  }
+
+  // ── Edge merging + observation verification ────────────────────────────────
+  // Edges are stored directed (subject_id → other_id), so the same pair observed
+  // from both sides fragments the observation count. mergedEdges groups by
+  // counterparty for surfacing; the directed rows stay authoritative.
+
+  /** Edges involving subjectId, merged by counterparty: counts summed, valence
+   * observation-weighted, natures unioned (latest first). */
+  async mergedEdges(guildId: string, subjectId: string): Promise<Array<{
+    otherId: string; summary: string; natures: string[];
+    valence: number | null; observationCount: number; lastObservedAt: string | null;
+  }>> {
+    const edges = await this.relationshipsFor(guildId, subjectId);
+    const byOther = new Map<string, RelationshipEdge[]>();
+    for (const e of edges) {
+      const other = e.subjectId === subjectId ? e.otherId : e.subjectId;
+      const list = byOther.get(other);
+      if (list) list.push(e); else byOther.set(other, [e]);
+    }
+    return [...byOther.entries()].map(([otherId, list]) => {
+      const total = list.reduce((s, e) => s + e.observationCount, 0);
+      const scored = list.filter(e => e.valence != null && e.observationCount > 0);
+      const valence = scored.length
+        ? scored.reduce((s, e) => s + e.valence! * e.observationCount, 0) / scored.reduce((s, e) => s + e.observationCount, 0)
+        : null;
+      const byRecency = [...list].sort((a, b) => (b.lastObservedAt ?? "").localeCompare(a.lastObservedAt ?? ""));
+      return {
+        otherId,
+        summary: byRecency[0].summary,
+        natures: [...new Set(byRecency.map(e => e.summary).filter(Boolean))],
+        valence, observationCount: total, lastObservedAt: byRecency[0].lastObservedAt,
+      };
+    }).sort((a, b) => b.observationCount - a.observationCount);
+  }
+
+  /** Unverified observations joined to their source message + author names +
+   * preceding context — input for verifyRelationshipsBatch. */
+  async listUnverifiedObservations(guildId: string, limit = 50): Promise<Array<{
+    observationId: number; subjectId: string; otherId: string; nature: string;
+    authorName: string; authorNames: string[]; sourceMessage: string;
+    contextBefore: Array<{ authorName: string; content: string }>;
+  }>> {
+    const rows = await this.sql<Array<{
+      id: number; subject_id: string; other_id: string; nature: string;
+      author_name: string | null; author_names: string[] | null; source_message: string;
+      channel_id: string | null; msg_created_at: Date | string | null;
+    }>>`
+      SELECT o.id, o.subject_id, o.other_id, o.nature,
+             msg.author_name, mem.known_names AS author_names,
+             msg.content AS source_message, msg.channel_id, msg.created_at AS msg_created_at
+      FROM relationship_observations o
+      JOIN messages msg ON msg.id = o.message_id
+      LEFT JOIN members mem ON mem.guild_id = o.guild_id AND mem.user_id = msg.author_id
+      WHERE o.guild_id = ${guildId} AND o.verdict IS NULL
+      ORDER BY o.id LIMIT ${limit}
+    `;
+    return await Promise.all(rows.map(async r => {
+      let contextBefore: Array<{ authorName: string; content: string }> = [];
+      if (r.channel_id && r.msg_created_at) {
+        const ctx = await this.sql<Array<{ author_name: string; content: string }>>`
+          SELECT author_name, content FROM messages
+          WHERE guild_id = ${guildId} AND channel_id = ${r.channel_id} AND created_at < ${r.msg_created_at}
+          ORDER BY created_at DESC LIMIT 5
+        `;
+        contextBefore = ctx.reverse().map(c => ({ authorName: c.author_name, content: c.content }));
+      }
+      return {
+        observationId: Number(r.id), subjectId: r.subject_id, otherId: r.other_id,
+        nature: r.nature, authorName: r.author_name ?? r.subject_id,
+        authorNames: r.author_names ?? [], sourceMessage: r.source_message, contextBefore,
+      };
+    }));
+  }
+
+  async setObservationVerdict(observationId: number, verdict: string): Promise<void> {
+    await this.sql`UPDATE relationship_observations SET verdict = ${verdict} WHERE id = ${observationId}`;
+  }
+
+  /** Rebuild the durable edges from non-joke observations. Delete + re-aggregate
+   * in one transaction; returns the edge count. */
+  async recomputeEdges(guildId: string): Promise<number> {
+    return await this.sql.begin(async sql => {
+      await sql`DELETE FROM relationships WHERE guild_id = ${guildId}`;
+      const inserted = await sql`
+        INSERT INTO relationships (guild_id, subject_id, other_id, summary, valence, observation_count, last_observed_at, updated_at)
+        SELECT guild_id, subject_id, other_id,
+               (array_agg(nature ORDER BY created_at DESC))[1],
+               AVG(valence),
+               COUNT(*)::int,
+               MAX(created_at), NOW()
+        FROM relationship_observations
+        WHERE guild_id = ${guildId} AND verdict IS DISTINCT FROM 'joke'
+        GROUP BY guild_id, subject_id, other_id
+        RETURNING id
+      `;
+      return inserted.length;
+    });
   }
 
   async getMessage(messageId: string): Promise<{ id: string; guildId: string; channelId: string; authorId: string; authorName: string; content: string; createdAt: string } | undefined> {
@@ -140,6 +660,26 @@ export class MemoryStore {
   async hasEvidence(messageId: string): Promise<boolean> {
     const rows = await this.sql<[{ c: number }]>`SELECT COUNT(*)::int as c FROM memory_evidence WHERE message_id = ${messageId}`;
     return rows[0].c > 0;
+  }
+
+  /** Returns triage_result for each given message id. Missing rows and NULLs are absent from the map. */
+  async getTriageResults(messageIds: string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    if (messageIds.length === 0) return out;
+    const rows = await this.sql<Array<{ id: string; triage_result: string | null }>>`
+      SELECT id, triage_result FROM messages WHERE id = ANY(${messageIds}) AND triage_result IS NOT NULL
+    `;
+    for (const r of rows) if (r.triage_result) out.set(r.id, r.triage_result);
+    return out;
+  }
+
+  async setTriageResults(results: Array<{ id: string; result: string }>): Promise<void> {
+    if (results.length === 0) return;
+    await this.sql.begin(async sql => {
+      for (const r of results) {
+        await sql`UPDATE messages SET triage_result = ${r.result} WHERE id = ${r.id}`;
+      }
+    });
   }
 
   // ── Core memory persistence ────────────────────────────────────────────────
@@ -155,11 +695,55 @@ export class MemoryStore {
       const existing = await sql<MemoryRow[]>`
         SELECT id FROM memories WHERE guild_id = ${event.guildId} AND subject_id = ${memory.subjectId} AND kind = ${memory.kind} AND content = ${memory.content}
       `;
-      if (!existing[0]) {
+
+      // Near-duplicate fast-path: when the exact key misses, fall back to a pg_trgm
+      // similarity lookup in the same (guild, subject, kind) scope so rephrased
+      // extractions reinforce one row instead of splitting confirmations.
+      // Excluded:
+      //  - effect 'correct': a replacement must create its own row for supersede() to link.
+      //  - kind 'episode': recurring events must accumulate as separate rows for
+      //    pattern consolidation.
+      //  - subject 'unknown': similarity across different unresolved people would
+      //    merge distinct memories.
+      //  - non-promotable evidence types: the fast-path is gated the same way
+      //    promotion is, so a joke/rumour extraction can't nudge a look-alike row.
+      //  - contested/superseded/forgotten targets: a forgotten memory must not be
+      //    resurrected by a near-duplicate.
+      let trigramMatch: { id: number; score: number; content: string } | null = null;
+      let nearMiss: { id: number; score: number } | null = null;
+      if (!existing[0] && effect !== "correct" && memory.kind !== "episode" && memory.subjectId !== "unknown" && PROMOTABLE_EVIDENCE_TYPES.includes(evidenceType)) {
+        const simRows = await sql<Array<{ id: number; sim: number; content: string }>>`
+          SELECT id, similarity(content, ${memory.content}) AS sim, content
+          FROM memories
+          WHERE guild_id = ${event.guildId}
+            AND subject_id = ${memory.subjectId}
+            AND kind = ${memory.kind}
+            AND status IN ('candidate', 'active', 'quarantined')
+            AND content % ${memory.content}
+          ORDER BY sim DESC, id ASC
+          LIMIT 1
+        `;
+        const top = simRows[0] ? { id: Number(simRows[0].id), score: Number(simRows[0].sim), content: simRows[0].content } : null;
+        if (top && top.score >= TRIGRAM_MATCH_THRESHOLD) trigramMatch = top;
+        else if (top && top.score >= TRIGRAM_NEAR_MISS_THRESHOLD) nearMiss = top;
+      }
+
+      // Fuzzy matches don't get to trust the LLM's effect blindly: opposite
+      // polarity between the two contents means this is a contradiction of the
+      // matched row. Exact matches skip this — same string can't flip polarity.
+      let effectiveEffect = effect;
+      if (trigramMatch && contentPolarity(trigramMatch.content) !== contentPolarity(memory.content)) {
+        effectiveEffect = "contradict";
+      }
+
+      const matchedId = existing[0] ? Number(existing[0].id) : trigramMatch?.id ?? null;
+      if (!matchedId) {
         const initialConfidence = calculateInitialConfidence(evidenceType);
         const importance = memory.importance ?? calculateDefaultImportance(memory.kind);
         const explicitness = memory.explicitness ?? calculateDefaultExplicitness(evidenceType);
-        const subjectName = memory.subjectId === event.authorId ? event.authorName : "";
+        // Persist the extracted name even when the subject couldn't be resolved to an ID —
+        // it enables later re-attribution of `unknown` memories.
+        const subjectName = memory.subjectName || (memory.subjectId === event.authorId ? event.authorName : "");
         await sql`
           INSERT INTO memories (guild_id, subject_id, subject_name, kind, content, confidence, importance, mentions, confirmation_count, created_at, updated_at, last_confirmed_at, status, explicitness, reason, primary_evidence_type)
           VALUES (${event.guildId}, ${memory.subjectId}, ${subjectName}, ${memory.kind}, ${memory.content}, ${initialConfidence}, ${importance}, 0, 0, NOW(), NOW(), NOW(), 'candidate', ${explicitness}, ${memory.reason}, ${evidenceType})
@@ -167,78 +751,114 @@ export class MemoryStore {
         `;
       }
 
-      const savedRows = await sql<MemoryRow[]>`
-        SELECT * FROM memories WHERE guild_id = ${event.guildId} AND subject_id = ${memory.subjectId} AND kind = ${memory.kind} AND content = ${memory.content}
-      `;
+      const savedRows = matchedId
+        ? await sql<MemoryRow[]>`SELECT * FROM memories WHERE id = ${matchedId}`
+        : await sql<MemoryRow[]>`
+            SELECT * FROM memories WHERE guild_id = ${event.guildId} AND subject_id = ${memory.subjectId} AND kind = ${memory.kind} AND content = ${memory.content}
+          `;
       const saved = rowToMemory(savedRows[0]);
+      const applied = await this._applyEvidence(sql, saved, event, evidenceType, effectiveEffect, memory.reason, memory.explicitness, candidateThreshold);
 
-      const evidenceExplicitness = memory.explicitness ?? calculateDefaultExplicitness(evidenceType);
-      // Idempotent evidence insert — same (memory_id, message_id) is ignored.
-      const insertedEvidence = await sql`
-        INSERT INTO memory_evidence (memory_id, message_id, author_id, quote, reason, explicitness, observed_at, evidence_type, effect, message_content_snapshot, message_timestamp, created_at)
-        VALUES (${saved.id}, ${event.messageId}, ${event.authorId}, ${event.content.slice(0, 1000)}, ${memory.reason}, ${evidenceExplicitness}, ${event.createdAt.toISOString()}, ${evidenceType}, ${effect}, ${event.content.slice(0, 1000)}, ${event.createdAt.toISOString()}, NOW())
-        ON CONFLICT (memory_id, message_id) DO NOTHING
-        RETURNING id
-      `;
-
-      // No new evidence row — idempotent, return as-is.
-      if (insertedEvidence.length === 0) return saved;
-
-      const evidenceId = Number(insertedEvidence[0].id);
-      const previousConfidence = saved.confidence;
-      const previousStatus = saved.status;
-      // Confidence is frozen the moment a memory enters contested state and remains frozen while contested.
-      // net_score is the sole arbiter of conflict resolution; confidence must not be changed by either
-      // supporting or contradicting evidence during this period so the two signals stay independent.
-      const isContested = saved.status === "contested";
-      let confidence = saved.confidence;
-      let status = saved.status;
-      let confirmations = saved.confirmationCount;
-      let contradictions = saved.contradictionCount;
-      let action = "context";
-
-      if (effect === "support") {
-        if (!isContested) confidence = updateConfidence(confidence, "support");
-        confirmations++;
-        action = "support";
+      // Audit trail for the fuzzy path — real scores are what lets the threshold
+      // be tuned with data instead of guesswork.
+      if (trigramMatch && applied) {
+        await this._logHistory(sql, saved.id, "dedup_matched", saved.confidence, applied.confidence, saved.status, applied.status, null, { similarity: trigramMatch.score, incomingContent: memory.content, effect, appliedEffect: effectiveEffect });
       }
-      if (effect === "contradict") {
-        contradictions++;
-        status = "contested";
-        action = "contradict";
-        // Write frozen_confidence the first time a memory enters contested state.
-        if (saved.status !== "contested") {
-          await sql`UPDATE memories SET frozen_confidence = ${saved.confidence} WHERE id = ${saved.id}`;
-        }
+      if (nearMiss) {
+        await this._logHistory(sql, saved.id, "dedup_near_miss", null, null, null, null, null, { similarity: nearMiss.score, existingMemoryId: nearMiss.id });
       }
-      if (effect === "correct") { action = "correction_evidence"; }
-
-      // Only high-quality evidence types may promote a candidate to active. Sarcasm, rumour, and
-      // uncertain inferences are explicitly excluded regardless of how high confidence grows.
-      const promotableTypes: EvidenceType[] = ["explicit_fact", "clear_preference", "correction"];
-      if (status === "candidate" && effect === "support" && confidence >= candidateThreshold && promotableTypes.includes(evidenceType)) {
-        status = "active";
-        action = "promote";
-      }
-
-      await sql`
-        UPDATE memories SET
-          confidence = ${confidence},
-          confirmation_count = ${confirmations},
-          mentions = ${confirmations},
-          contradiction_count = ${contradictions},
-          status = ${status},
-          updated_at = NOW(),
-          last_confirmed_at = CASE WHEN ${effect} = 'support' THEN NOW() ELSE last_confirmed_at END,
-          last_contradicted_at = CASE WHEN ${effect} = 'contradict' THEN NOW() ELSE last_contradicted_at END
-        WHERE id = ${saved.id}
-      `;
-
-      await this._logHistory(sql, saved.id, action, previousConfidence, confidence, previousStatus, status, evidenceId, { evidenceType, effect, sourceMessageId: event.messageId });
-
-      const finalRows = await sql<MemoryRow[]>`SELECT * FROM memories WHERE guild_id = ${event.guildId} AND id = ${saved.id}`;
-      return rowToMemory(finalRows[0]);
+      return applied ?? saved;
     }) as Memory;
+  }
+
+  /**
+   * Attach a new evidence event to an existing memory — used when a message
+   * contests or confirms an already-stored claim (e.g. the subject telling the
+   * bot "I never said that"). Idempotent on (memory_id, message_id); returns
+   * undefined when the message was already evidence for this memory.
+   */
+  async attachEvidence(memoryId: number, event: MessageEvent, evidenceType: EvidenceType, effect: EvidenceEffect, reason: string, candidateThreshold = 0.7): Promise<Memory | undefined> {
+    return await this.sql.begin(async sql => {
+      const rows = await sql<MemoryRow[]>`SELECT * FROM memories WHERE id = ${memoryId}`;
+      const saved = rows[0] ? rowToMemory(rows[0]) : undefined;
+      if (!saved) return undefined;
+      return await this._applyEvidence(sql, saved, event, evidenceType, effect, reason, undefined, candidateThreshold);
+    }) as Memory | undefined;
+  }
+
+  /**
+   * Insert an evidence row for `saved` and apply the deterministic lifecycle
+   * transitions (support bumps confidence, contradict contests, correct logs).
+   * Returns the updated memory, or undefined when the evidence was a duplicate.
+   */
+  private async _applyEvidence(
+    sql: Sql, saved: Memory, event: MessageEvent,
+    evidenceType: EvidenceType, effect: EvidenceEffect, reason: string,
+    explicitness: number | undefined, candidateThreshold: number
+  ): Promise<Memory | undefined> {
+    const evidenceExplicitness = explicitness ?? calculateDefaultExplicitness(evidenceType);
+    // Idempotent evidence insert — same (memory_id, message_id) is ignored.
+    const insertedEvidence = await sql`
+      INSERT INTO memory_evidence (memory_id, message_id, author_id, quote, reason, explicitness, observed_at, evidence_type, effect, message_content_snapshot, message_timestamp, created_at)
+      VALUES (${saved.id}, ${event.messageId}, ${event.authorId}, ${event.content.slice(0, 1000)}, ${reason}, ${evidenceExplicitness}, ${event.createdAt.toISOString()}, ${evidenceType}, ${effect}, ${event.content.slice(0, 1000)}, ${event.createdAt.toISOString()}, NOW())
+      ON CONFLICT (memory_id, message_id) DO NOTHING
+      RETURNING id
+    `;
+    if (insertedEvidence.length === 0) return undefined;
+
+    const evidenceId = Number(insertedEvidence[0].id);
+    const previousConfidence = saved.confidence;
+    const previousStatus = saved.status;
+    // Confidence is frozen the moment a memory enters contested state and remains frozen while contested.
+    // net_score is the sole arbiter of conflict resolution; confidence must not be changed by either
+    // supporting or contradicting evidence during this period so the two signals stay independent.
+    const isContested = saved.status === "contested";
+    let confidence = saved.confidence;
+    let status = saved.status;
+    let confirmations = saved.confirmationCount;
+    let contradictions = saved.contradictionCount;
+    let action = "context";
+
+    if (effect === "support") {
+      if (!isContested) confidence = updateConfidence(confidence, "support");
+      confirmations++;
+      action = "support";
+    }
+    if (effect === "contradict") {
+      contradictions++;
+      status = "contested";
+      action = "contradict";
+      // Write frozen_confidence the first time a memory enters contested state.
+      if (saved.status !== "contested") {
+        await sql`UPDATE memories SET frozen_confidence = ${saved.confidence} WHERE id = ${saved.id}`;
+      }
+    }
+    if (effect === "correct") { action = "correction_evidence"; }
+
+    // Only high-quality evidence types may promote a candidate to active. Sarcasm, rumour, and
+    // uncertain inferences are explicitly excluded regardless of how high confidence grows.
+    if (status === "candidate" && effect === "support" && confidence >= candidateThreshold && PROMOTABLE_EVIDENCE_TYPES.includes(evidenceType)) {
+      status = "active";
+      action = "promote";
+    }
+
+    await sql`
+      UPDATE memories SET
+        confidence = ${confidence},
+        confirmation_count = ${confirmations},
+        mentions = ${confirmations},
+        contradiction_count = ${contradictions},
+        status = ${status},
+        updated_at = NOW(),
+        last_confirmed_at = CASE WHEN ${effect} = 'support' THEN NOW() ELSE last_confirmed_at END,
+        last_contradicted_at = CASE WHEN ${effect} = 'contradict' THEN NOW() ELSE last_contradicted_at END
+      WHERE id = ${saved.id}
+    `;
+
+    await this._logHistory(sql, saved.id, action, previousConfidence, confidence, previousStatus, status, evidenceId, { evidenceType, effect, sourceMessageId: event.messageId });
+
+    const finalRows = await sql<MemoryRow[]>`SELECT * FROM memories WHERE guild_id = ${event.guildId} AND id = ${saved.id}`;
+    return rowToMemory(finalRows[0]);
   }
 
   // ── Reads ──────────────────────────────────────────────────────────────────
@@ -280,6 +900,19 @@ export class MemoryStore {
     const rows = await this.sql<MemoryRow[]>`
       SELECT * FROM memories WHERE guild_id = ${guildId} AND subject_id = ${subjectId} AND status = 'active'
       ORDER BY importance * confidence DESC, last_confirmed_at DESC
+    `;
+    return rows.map(rowToMemory);
+  }
+
+  /** Memories about a subject that a denial/correction message could target —
+   * active + contested first, then candidates the subject might have seen surfaced. */
+  async contestableMemories(guildId: string, subjectId: string, limit = 15): Promise<Memory[]> {
+    const rows = await this.sql<MemoryRow[]>`
+      SELECT * FROM memories WHERE guild_id = ${guildId} AND subject_id = ${subjectId}
+        AND status IN ('active', 'contested', 'candidate')
+      ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'contested' THEN 1 ELSE 2 END,
+               importance * confidence DESC, last_confirmed_at DESC
+      LIMIT ${limit}
     `;
     return rows.map(rowToMemory);
   }
@@ -375,6 +1008,16 @@ export class MemoryStore {
     }
     await this.logHistory(memoryId, "conflict_unresolved", memory.confidence, memory.confidence, "contested", "contested", null, { supportScore, contradictionScore, netScore });
     return { resolved: false, netScore };
+  }
+
+  /** The subject of a contested memory affirms it themselves — decisive: resolves
+   * to active regardless of net_score, since the person described is the authority
+   * on their own facts. Only called when ordinary resolution can't settle it. */
+  async subjectConfirm(guildId: string, memoryId: number): Promise<void> {
+    const memory = await this.getMemory(guildId, memoryId);
+    if (!memory || memory.status !== "contested") return;
+    await this.sql`UPDATE memories SET status = 'active', frozen_confidence = NULL, net_score = NULL, updated_at = NOW() WHERE guild_id = ${guildId} AND id = ${memoryId}`;
+    await this.logHistory(memoryId, "subject_confirmed", memory.confidence, memory.confidence, "contested", "active", null, {});
   }
 
   // ── Context helpers ────────────────────────────────────────────────────────

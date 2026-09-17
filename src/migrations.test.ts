@@ -16,7 +16,7 @@ function makeTestSql() {
 
 /** Drop all project tables so each test starts fresh. */
 async function resetSchema(sql: ReturnType<typeof postgres>) {
-  await sql`DROP TABLE IF EXISTS schema_migrations, event_memories, event_messages, event_participants, events, behavioral_patterns, memory_history, memory_evidence, server_settings, memories, messages CASCADE`;
+  await sql`DROP TABLE IF EXISTS schema_migrations, profiles, relationships, relationship_observations, members, event_memories, event_messages, event_participants, events, behavioral_patterns, memory_history, memory_evidence, server_settings, memories, messages CASCADE`;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -37,7 +37,7 @@ test("migrations are applied in order", async () => {
     await resetSchema(sql);
     await runMigrations(sql as any);
     const version = await getMigrationVersion(sql as any);
-    assert.equal(version, 5);
+    assert.equal(version, 7);
   } finally { await sql.end(); }
 });
 
@@ -168,7 +168,7 @@ test("rolling back to v1 removes behavioral_patterns table and index", async () 
   try {
     await resetSchema(sql);
     await runMigrations(sql as any);
-    assert.equal(await getMigrationVersion(sql as any), 5);
+    assert.equal(await getMigrationVersion(sql as any), 7);
     await runMigrations(sql as any, 1);
     assert.equal(await getMigrationVersion(sql as any), 1);
     const tables = await sql`SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name='behavioral_patterns'`;
@@ -210,6 +210,26 @@ test("migration v4 creates expected indexes", async () => {
     const names = rows.map(r => r.indexname);
     for (const name of ["events_guild_channel", "events_guild_open", "event_participants_event", "event_messages_event", "event_memories_memory", "event_memories_event"]) {
       assert.ok(names.includes(name), `Missing index: ${name}`);
+    }
+  } finally { await sql.end(); }
+});
+
+test("migration v7 creates members, relationship_observations, relationships, profiles tables and reply_to_id column", async () => {
+  const sql = makeTestSql();
+  try {
+    await resetSchema(sql);
+    await runMigrations(sql as any);
+    const rows = await sql<Array<{ table_name: string }>>`SELECT table_name FROM information_schema.tables WHERE table_schema='public'`;
+    const names = rows.map(r => r.table_name);
+    for (const name of ["members", "relationship_observations", "relationships", "profiles"]) {
+      assert.ok(names.includes(name), `Missing table: ${name}`);
+    }
+    const cols = await sql<Array<{ column_name: string }>>`SELECT column_name FROM information_schema.columns WHERE table_name='messages'`;
+    assert.ok(cols.some(c => c.column_name === "reply_to_id"), "messages.reply_to_id column missing");
+    const memberCols = await sql<Array<{ column_name: string }>>`SELECT column_name FROM information_schema.columns WHERE table_name='members'`;
+    const mcols = memberCols.map(r => r.column_name);
+    for (const col of ["guild_id", "user_id", "known_names", "first_seen_at", "last_seen_at", "message_count", "opted_out"]) {
+      assert.ok(mcols.includes(col), `Missing members column: ${col}`);
     }
   } finally { await sql.end(); }
 });
