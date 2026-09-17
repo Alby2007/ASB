@@ -1019,6 +1019,27 @@ export class MemoryStore {
     return result.count;
   }
 
+  /** Hard-delete every relationship observation and edge involving a subject —
+   * either side. Unlike memories (soft-forgotten for inspectability), these
+   * tables have no status column or inspection surface, so opt-out deletes.
+   * Edges are removed eagerly rather than waiting on recomputeEdges — a
+   * guild-wide rebuild for one opt-out would be wasteful and would leave a
+   * stale edge visible until the next maintenance run. Returns the
+   * observation count (edges aggregate many observations). */
+  async forgetRelationshipsFor(guildId: string, subjectId: string): Promise<number> {
+    return await this.sql.begin(async sql => {
+      const obs = await sql`
+        DELETE FROM relationship_observations
+        WHERE guild_id = ${guildId} AND (subject_id = ${subjectId} OR other_id = ${subjectId})
+      `;
+      await sql`
+        DELETE FROM relationships
+        WHERE guild_id = ${guildId} AND (subject_id = ${subjectId} OR other_id = ${subjectId})
+      `;
+      return obs.count;
+    });
+  }
+
   async confirm(guildId: string, id: number): Promise<number> {
     const result = await this.sql`
       UPDATE memories SET status = 'active', confidence = GREATEST(confidence, 0.9), last_confirmed_at = NOW()

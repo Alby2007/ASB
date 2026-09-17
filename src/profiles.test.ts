@@ -184,6 +184,26 @@ test("setMemberOptOut upserts a row for never-posted members, forgetAllFor clear
   } finally { await sql.end(); }
 });
 
+test("forgetRelationshipsFor deletes observations and edges on both sides of the subject", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    // Both directions need coverage: u1 as subject in one edge, as other in another.
+    await store.recordRelationship("g1", "u1", "u2", "m1", "close friends", 0.8, "t");
+    await store.recordRelationship("g1", "u3", "u1", "m2", "rivals", -0.5, "t");
+    await store.recordRelationship("g1", "u2", "u3", "m3", "siblings", 0.9, "t"); // control — u1 not involved
+
+    assert.equal(await store.forgetRelationshipsFor("g1", "u1"), 2);
+    assert.deepEqual(await store.relationshipsFor("g1", "u1"), []);
+    // Control edge untouched; recomputeEdges has nothing to rebuild u1's data from.
+    const remaining = await store.relationshipsFor("g1", "u2");
+    assert.equal(remaining.length, 1);
+    assert.equal(remaining[0].otherId, "u3");
+    await store.recomputeEdges("g1");
+    assert.deepEqual(await store.relationshipsFor("g1", "u1"), []);
+  } finally { await sql.end(); }
+});
+
 test("relevantMemories surfaces promotable-type candidates but keeps weak evidence gated", async () => {
   const sql = makeTestSql();
   try {

@@ -258,8 +258,9 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     const userId = interaction.user.id;
     await store.setMemberOptOut(guildId, userId, true);
     const forgotten = await store.forgetAllFor(guildId, userId);
+    const relForgotten = await store.forgetRelationshipsFor(guildId, userId);
     await new ProfileStore().deleteProfile(guildId, userId);
-    return interaction.reply({ content: `Opted out. ${forgotten} memor${forgotten === 1 ? "y" : "ies"} about you ${forgotten === 1 ? "was" : "were"} forgotten and your profile was deleted — no new memories, relationships, or profile data will be formed about you while you're opted out. Your messages still appear in the raw archive until the server's retention window removes them. Use /opt-in to re-enable.`, ephemeral: true });
+    return interaction.reply({ content: `Opted out. ${forgotten} memor${forgotten === 1 ? "y" : "ies"} and ${relForgotten} relationship record${relForgotten === 1 ? "" : "s"} about you were forgotten and your profile was deleted — no new memories, relationships, or profile data will be formed about you while you're opted out. Your messages still appear in the raw archive until the server's retention window removes them. Use /opt-in to re-enable.`, ephemeral: true });
   }
   if (interaction.commandName === "opt-in") {
     await store.setMemberOptOut(guildId, interaction.user.id, false);
