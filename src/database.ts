@@ -1070,6 +1070,47 @@ export class MemoryStore {
     return result.count;
   }
 
+  // Derived-data retention. Only `messages` aged out via raw retention, leaving
+  // the append-only tables unbounded; this caps them at 90 days:
+  // - memory_history: audit trail — old entries lose tuning value anyway.
+  // - unresolved_names / alias_candidates: discovery surfaces — a name that still
+  //   matters recurs and writes a fresh row, so aged rows carry no unique signal.
+  // - candidate-tier events that have closed (discarded or timed out): never
+  //   surfaced anywhere. Promoted 'event' rows are the feature and are kept.
+  // Child tables have no cascade, so they're deleted first. memory_evidence is
+  // deliberately not pruned — evidence is retained for inspectability even on
+  // forgotten memories, and its size tracks live memory count.
+  async pruneDerivedData(guildId: string, olderThanDays = 90): Promise<{ history: number; names: number; aliases: number; events: number }> {
+    const cutoff = new Date(Date.now() - olderThanDays * 86_400_000).toISOString();
+    const staleEvents = this.sql`SELECT id FROM events WHERE guild_id = ${guildId} AND tier = 'candidate' AND closed_at IS NOT NULL AND occurred_at < ${cutoff}`;
+    const history = await this.sql`
+      DELETE FROM memory_history WHERE created_at < ${cutoff}
+      AND memory_id IN (SELECT id FROM memories WHERE guild_id = ${guildId})
+    `;
+    const names = await this.sql`DELETE FROM unresolved_names WHERE guild_id = ${guildId} AND created_at < ${cutoff}`;
+    const aliases = await this.sql`DELETE FROM alias_candidates WHERE guild_id = ${guildId} AND created_at < ${cutoff}`;
+    await this.sql`DELETE FROM event_participants WHERE event_id IN (${staleEvents})`;
+    await this.sql`DELETE FROM event_messages WHERE event_id IN (${staleEvents})`;
+    await this.sql`DELETE FROM event_memories WHERE event_id IN (${staleEvents})`;
+    const events = await this.sql`DELETE FROM events WHERE id IN (${staleEvents})`;
+    return { history: history.count, names: names.count, aliases: aliases.count, events: events.count };
+  }
+
+  // Admin triage view: the last N memories written for the guild across all
+  // subjects, with the best display label we have (member name > extracted
+  // subject name > raw id).
+  async recentMemories(guildId: string, limit = 15): Promise<Array<Memory & { subjectLabel: string }>> {
+    const rows = await this.sql<Array<MemoryRow & { subject_label: string }>>`
+      SELECT m.*, COALESCE(NULLIF(mb.known_names[1], ''), NULLIF(m.subject_name, ''), m.subject_id) AS subject_label
+      FROM memories m
+      LEFT JOIN members mb ON mb.guild_id = m.guild_id AND mb.user_id = m.subject_id
+      WHERE m.guild_id = ${guildId}
+      ORDER BY m.created_at DESC, m.id DESC
+      LIMIT ${limit}
+    `;
+    return rows.map(r => ({ ...rowToMemory(r), subjectLabel: r.subject_label }));
+  }
+
   // ── Episode consolidation ──────────────────────────────────────────────────
   // Consolidate active episodes for a subject into behavioral_patterns rows.
   // Only active-status episodes count toward pattern formation — candidates and quarantined

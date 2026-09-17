@@ -49,6 +49,8 @@ Administrators can adjust per-server behaviour at runtime without restarting the
 | `/memory-resume` | Sets both back to 1. |
 | `/memory-settings` | Shows current values of `memory_enabled`, `reply_enabled`, and `raw_retention_days`. |
 | `/memory-purge older_than_days:N` | Manually deletes raw messages older than N days for this server (regardless of the global retention setting). |
+| `/status` | Shows bot uptime and in-process operational counters (LLM errors, contest misses, memories saved). |
+| `/memory-triage` | Shows the 15 most recently stored memories across all members, with status, kind, and subject. |
 
 ### How runtime settings interact with env variables
 

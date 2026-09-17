@@ -43,6 +43,12 @@ async function applyRetention() {
     const deleted = await store.deleteRawMessagesOlderThan(guild.id, settings.rawRetentionDays);
     await store.maintain(guild.id, config.candidateConfidenceThreshold);
     if (deleted) console.log(`Retention deleted ${deleted} raw messages in ${guild.name}`);
+    try {
+      const pruned = await store.pruneDerivedData(guild.id);
+      if (pruned.history + pruned.names + pruned.aliases + pruned.events) {
+        console.log(`Pruned derived data in ${guild.name}: ${pruned.history} history, ${pruned.names} unresolved names, ${pruned.aliases} alias candidates, ${pruned.events} events`);
+      }
+    } catch (error) { inc("maintenance.prune_error"); console.error("Derived-data pruning failed", error); }
     // v0.2: close stale open event windows and score candidate events
     try {
       const result = await pipeline.maintainEvents(guild.id, eventStore, store, brain);

@@ -22,6 +22,7 @@ export const commandDefinitions = [
   { name: "memory-resume", description: "Admin: resume observing and replying", default_member_permissions: PermissionFlagsBits.ManageGuild.toString() },
   { name: "memory-settings", description: "Admin: view memory and retention settings", default_member_permissions: PermissionFlagsBits.ManageGuild.toString() },
   { name: "status", description: "Admin: bot uptime and operational counters", default_member_permissions: PermissionFlagsBits.ManageGuild.toString() },
+  { name: "memory-triage", description: "Admin: the most recent memories stored for any member", default_member_permissions: PermissionFlagsBits.ManageGuild.toString() },
   { name: "event", description: "Inspect the event linked to one of your memories", options: [
     { name: "memory_id", description: "A memory number returned by /memory", type: 4, required: true }
   ] },
@@ -122,6 +123,12 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     const uptime = `${Math.floor(uptimeSec / 3600)}h ${Math.floor((uptimeSec % 3600) / 60)}m ${uptimeSec % 60}s`;
     const counterLines = Object.entries(counts).map(([k, v]) => `**${k}:** ${v.toLocaleString()}`).join("\n") || "No events recorded yet.";
     return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setTitle("Bot status").setDescription(`**Uptime:** ${uptime}\n\n${counterLines}\n\n*${value.messages.toLocaleString()} raw messages · ${value.memories.toLocaleString()} active memories · ${value.lore.toLocaleString()} lore*`)] });
+  }
+  if (interaction.commandName === "memory-triage") {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content: "Only server administrators can triage memories.", ephemeral: true });
+    const recent = await store.recentMemories(guildId, 15);
+    const lines = recent.map(m => `**#${m.id}** \`${m.status}/${m.kind}\` **${m.subjectLabel}** — ${m.content.slice(0, 120)}`);
+    return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setTitle("Recent memories (all members)").setDescription(lines.join("\n") || "Nothing stored yet.")] });
   }
   if (interaction.commandName === "memory-settings") {
     if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content: "Only server administrators can view settings.", ephemeral: true });
