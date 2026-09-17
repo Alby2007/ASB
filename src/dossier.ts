@@ -82,9 +82,11 @@ export async function gatherDossierInputs(
   // mergedEdges collapses A→B and B→A into one counterparty view so
   // bidirectionally-observed pairs aren't fragmented across two directed edges.
   const edges = await memoryStore.mergedEdges(guildId, member.userId);
+  const interactionIds = (ctx.interactions ?? []).slice(0, 5).map(i => i.otherId);
+  const names = await memoryStore.displayNamesFor(guildId, [...edges.slice(0, 8).map(e => e.otherId), ...interactionIds]);
   const edgeViews = [] as Array<{ name: string; summary: string; natures: string[]; valence: number | null; observations: number }>;
   for (const e of edges.slice(0, 8)) {
-    edgeViews.push({ name: await memoryStore.displayNameFor(guildId, e.otherId), summary: e.summary, natures: e.natures, valence: e.valence, observations: e.observationCount });
+    edgeViews.push({ name: names.get(e.otherId)!, summary: e.summary, natures: e.natures, valence: e.valence, observations: e.observationCount });
   }
   if (sourced.length || patterns.length || edgeViews.length) {
     const payload = {
@@ -106,13 +108,14 @@ export async function gatherDossierInputs(
   // deterministic interaction graph (how often they actually address each other)
   const interactionViews = [] as Array<{ name: string; addressedCount: number }>;
   for (const i of (ctx.interactions ?? []).slice(0, 5)) {
-    interactionViews.push({ name: await memoryStore.displayNameFor(guildId, i.otherId), addressedCount: i.count });
+    interactionViews.push({ name: names.get(i.otherId)!, addressedCount: i.count });
   }
   if (edgeViews.length || interactionViews.length) {
     const observations = await memoryStore.relationshipObservationsFor(guildId, member.userId);
+    const obsNames = await memoryStore.displayNamesFor(guildId, observations.slice(0, 25).map(o => o.otherId));
     const obsViews = [] as Array<{ name: string; nature: string; valence: number | null; reason: string; direction: string }>;
     for (const o of observations.slice(0, 25)) {
-      obsViews.push({ name: await memoryStore.displayNameFor(guildId, o.otherId), nature: o.nature, valence: o.valence, reason: o.reason, direction: o.direction });
+      obsViews.push({ name: obsNames.get(o.otherId)!, nature: o.nature, valence: o.valence, reason: o.reason, direction: o.direction });
     }
     const payload = { edges: edgeViews, observations: obsViews, interactions: interactionViews };
     out.set("relationship_map", { section: "relationship_map", hash: hashInput(payload), payload });

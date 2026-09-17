@@ -1,6 +1,7 @@
 import { Client, Events, GatewayIntentBits, type Message, type OmitPartialGroupDMChannel } from "discord.js";
 import { Brain } from "./brain.js";
 import { config } from "./config.js";
+import { sql } from "./db.js";
 import { MemoryStore } from "./database.js";
 import { commandDefinitions, handleMemoryButton, handleMemoryCommand } from "./commands.js";
 import { detectNamingRequest, detectSelfNaming, shouldInspectForMemory, toolCues } from "./perception.js";
@@ -302,6 +303,25 @@ client.on(Events.MessageCreate, message => {
   handleMessage(message).catch(error => { inc("handler.message_error"); console.error("Message handling failed", error); });
 });
 
+// Edits update the archive row; the extraction-time snapshot in memory_evidence
+// is deliberately left alone — it's the record of what was observed, not a
+// mirror of current content.
+client.on(Events.MessageUpdate, (_old, message) => {
+  if (!message.guild || message.author?.bot || !message.content?.trim()) return;
+  if (config.guildId && message.guild.id !== config.guildId) return;
+  store.updateMessageContent(message.guild.id, message.id, message.content)
+    .catch(error => { inc("handler.message_error"); console.error("Message update handling failed", error); });
+});
+
+// Deletes remove the raw row (so the sweep never extracts deleted content)
+// and scrub the verbatim text on any evidence it already produced.
+client.on(Events.MessageDelete, message => {
+  if (!message.guild) return;
+  if (config.guildId && message.guild.id !== config.guildId) return;
+  store.deleteMessage(message.guild.id, message.id)
+    .catch(error => { inc("handler.message_error"); console.error("Message delete handling failed", error); });
+});
+
 // Alias maps are shared per guild rather than built per message — the same map
 // object also feeds the compiled-regex cache in entity-resolution, so caching it
 // means the alternation pattern compiles once per rebuild, not per message.
@@ -457,6 +477,17 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
       }, event.messageId);
     }
   } catch (error) { inc("llm.reply_error"); console.error("Reply generation failed", error); }
+}
+
+// Graceful shutdown — close the Discord socket and the pg pool cleanly so
+// container/systemd restarts don't sever in-flight work.
+for (const sig of ["SIGINT", "SIGTERM"] as const) {
+  process.on(sig, async () => {
+    console.log(`Received ${sig}, shutting down`);
+    client.destroy();
+    await sql.end();
+    process.exit(0);
+  });
 }
 
 client.login(config.discordToken);

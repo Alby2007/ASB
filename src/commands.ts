@@ -68,7 +68,7 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     const result = await store.listMemories(guildId, subjectId, { search: interaction.options.getString("search") ?? undefined, page: interaction.options.getInteger("page") ?? 1, status: candidates ? "candidate" : undefined });
     const title = candidates ? "Candidate memories awaiting confirmation" : (server ? "What I remember about this server" : `What I remember about ${member?.username ?? interaction.user.username}`);
     const description = result.memories.length ? result.memories.map(display).join("\n\n") : "Nothing active yet.";
-    return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setTitle(`🧠 ${title}`).setDescription(description).setFooter({ text: `Page ${result.page} · ${result.total} active memories` })] });
+    return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setTitle(`🧠 ${title}`).setDescription(description).setFooter({ text: `Page ${result.page} · ${result.total} ${candidates ? "candidate" : "active"} memories` })] });
   }
   if (interaction.commandName === "forget") {
     const id = interaction.options.getInteger("memory_id", true), memory = await store.getMemory(guildId, id);

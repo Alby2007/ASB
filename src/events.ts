@@ -78,26 +78,6 @@ export class EventStore {
     return Promise.all(rows.map(r => this.hydrate(r)));
   }
 
-  /** All open events across a guild (used by retroactive reference scan). */
-  async openEventsForGuild(guildId: string): Promise<StoredEvent[]> {
-    const rows = await this.sql<EventRow[]>`
-      SELECT id, guild_id, channel_id, title, summary, significance, tier, occurred_at, closed_at, reference_count, created_at, updated_at
-      FROM events WHERE guild_id = ${guildId} AND closed_at IS NULL
-      ORDER BY occurred_at DESC
-    `;
-    return Promise.all(rows.map(r => this.hydrate(r)));
-  }
-
-  /** All events that a given message_id is part of. */
-  async eventsForMessage(messageId: string): Promise<StoredEvent[]> {
-    const rows = await this.sql<EventRow[]>`
-      SELECT e.id, e.guild_id, e.channel_id, e.title, e.summary, e.significance, e.tier,
-             e.occurred_at, e.closed_at, e.reference_count, e.created_at, e.updated_at
-      FROM events e JOIN event_messages em ON em.event_id = e.id WHERE em.message_id = ${messageId}
-    `;
-    return Promise.all(rows.map(r => this.hydrate(r)));
-  }
-
   /** All events that a given memory is linked to. */
   async eventsForMemory(memoryId: number): Promise<StoredEvent[]> {
     const rows = await this.sql<EventRow[]>`

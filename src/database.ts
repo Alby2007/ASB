@@ -181,6 +181,24 @@ export class MemoryStore {
     await this.upsertMember(event.guildId, event.authorId, event.authorName, event.createdAt, inserted.count > 0);
   }
 
+  /** Edited message — update the archive row only. Evidence snapshots keep the
+   * extraction-time text on purpose: rewriting them would falsify the record
+   * of what the memory was actually derived from. */
+  async updateMessageContent(guildId: string, messageId: string, content: string): Promise<void> {
+    await this.sql`UPDATE messages SET content = ${content} WHERE guild_id = ${guildId} AND id = ${messageId}`;
+  }
+
+  /** Deleted message — remove the raw row so sweeps and context never see it
+   * again, and scrub the verbatim text columns on any evidence it produced.
+   * Evidence metadata (type, effect, reason) stays: the audit trail keeps the
+   * "why" without keeping the deleted words. */
+  async deleteMessage(guildId: string, messageId: string): Promise<void> {
+    await this.sql.begin(async sql => {
+      await sql`DELETE FROM messages WHERE guild_id = ${guildId} AND id = ${messageId}`;
+      await sql`UPDATE memory_evidence SET quote = '', message_content_snapshot = '' WHERE message_id = ${messageId}`;
+    });
+  }
+
   // ── Members ────────────────────────────────────────────────────────────────
   // The members table is the member registry: one row per (guild, user) tracking every
   // display name observed, message counts, and first/last activity. It backs the
@@ -283,6 +301,32 @@ export class MemoryStore {
     return rows[0]?.author_name ?? userId;
   }
 
+  /** Bulk displayNameFor — at most two queries for any batch size: one member
+   * lookup plus a DISTINCT ON fallback scan for ids with no known names. */
+  async displayNamesFor(guildId: string, userIds: string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    if (!userIds.length) return out;
+    const members = await this.sql<Array<{ user_id: string; known_names: string[] }>>`
+      SELECT user_id, known_names FROM members WHERE guild_id = ${guildId} AND user_id = ANY(${userIds})
+    `;
+    const missing: string[] = [];
+    for (const id of userIds) {
+      const m = members.find(r => r.user_id === id);
+      if (m && m.known_names.length) out.set(id, m.known_names[m.known_names.length - 1]);
+      else missing.push(id);
+    }
+    if (missing.length) {
+      const rows = await this.sql<Array<{ author_id: string; author_name: string }>>`
+        SELECT DISTINCT ON (author_id) author_id, author_name FROM messages
+        WHERE guild_id = ${guildId} AND author_id = ANY(${missing})
+        ORDER BY author_id, created_at DESC
+      `;
+      for (const r of rows) out.set(r.author_id, r.author_name);
+    }
+    for (const id of userIds) if (!out.has(id)) out.set(id, id);
+    return out;
+  }
+
   // ── Relationships ──────────────────────────────────────────────────────────
   // Relationship assertions are stored as idempotent observations keyed by
   // (subject_id, other_id, message_id). Observations carry a sincerity verdict;
@@ -325,6 +369,30 @@ export class MemoryStore {
   // jokes are re-classified sarcasm_or_joke, verified literal self-reports go
   // active, and third-party literals stay candidate pending corroboration.
 
+  /** Per-row "preceding context" in one round trip: for each (channel, ts)
+   * anchor the LATERAL grabs the 5 messages before it, keyed back to the row
+   * index. Replaces a per-row query in the verification list functions. */
+  private async _contextBefore(guildId: string, anchors: Array<{ ix: number; channelId: string; createdAt: Date | string }>): Promise<Map<number, Array<{ authorName: string; content: string }>>> {
+    const out = new Map<number, Array<{ authorName: string; content: string }>>();
+    if (!anchors.length) return out;
+    const rows = await this.sql<Array<{ ix: number; author_name: string; content: string; created_at: Date | string }>>`
+      SELECT t.ix, m.author_name, m.content, m.created_at
+      FROM unnest(${anchors.map(a => a.ix)}::int[], ${anchors.map(a => a.channelId)}::text[], ${anchors.map(a => new Date(a.createdAt).toISOString())}::timestamptz[]) AS t(ix, channel_id, ts)
+      JOIN LATERAL (
+        SELECT author_name, content, created_at FROM messages
+        WHERE guild_id = ${guildId} AND channel_id = t.channel_id AND created_at < t.ts
+        ORDER BY created_at DESC LIMIT 5
+      ) m ON true
+      ORDER BY t.ix, m.created_at DESC
+    `;
+    for (const r of rows) {
+      const list = out.get(r.ix) ?? [];
+      list.unshift({ authorName: r.author_name, content: r.content });
+      out.set(r.ix, list);
+    }
+    return out;
+  }
+
   /** Candidate memories with promotable evidence types, joined to their first source message.
    * Carries the author's known names and the messages preceding the source so the
    * verifier can spot pasted/quoted text and jokes that only read literal in isolation. */
@@ -356,22 +424,13 @@ export class MemoryStore {
       ORDER BY m.id
       LIMIT ${limit}
     `;
-    return await Promise.all(rows.map(async r => {
-      let contextBefore: Array<{ authorName: string; content: string }> = [];
-      if (r.channel_id && r.msg_created_at) {
-        const ctx = await this.sql<Array<{ author_name: string; content: string }>>`
-          SELECT author_name, content FROM messages
-          WHERE guild_id = ${guildId} AND channel_id = ${r.channel_id} AND created_at < ${r.msg_created_at}
-          ORDER BY created_at DESC LIMIT 5
-        `;
-        contextBefore = ctx.reverse().map(c => ({ authorName: c.author_name, content: c.content }));
-      }
-      return {
-        memoryId: Number(r.memory_id), subjectId: r.subject_id, kind: r.kind as Memory["kind"],
-        content: r.content, evidenceType: r.primary_evidence_type, selfReport: r.self_report,
-        authorName: r.author_name ?? r.subject_id, authorNames: r.author_names ?? [],
-        sourceMessage: r.source_message, contextBefore,
-      };
+    const ctxMap = await this._contextBefore(guildId, rows.flatMap((r, i) =>
+      r.channel_id && r.msg_created_at ? [{ ix: i, channelId: r.channel_id, createdAt: r.msg_created_at }] : []));
+    return rows.map((r, i) => ({
+      memoryId: Number(r.memory_id), subjectId: r.subject_id, kind: r.kind as Memory["kind"],
+      content: r.content, evidenceType: r.primary_evidence_type, selfReport: r.self_report,
+      authorName: r.author_name ?? r.subject_id, authorNames: r.author_names ?? [],
+      sourceMessage: r.source_message, contextBefore: ctxMap.get(i) ?? [],
     }));
   }
 
@@ -496,9 +555,12 @@ export class MemoryStore {
     aliasMap: Map<string, string>,
     excludeIds: string[] = []
   ): Promise<Array<{ aId: string; bId: string; count: number; firstAt: string; lastAt: string }>> {
+    // Bounded to 90 days — the interaction graph is a recency signal anyway,
+    // and this is the one query that reads the entire archive otherwise.
     const rows = await this.sql<Array<{ author_id: string; content: string; created_at: Date | string }>>`
       SELECT author_id, content, created_at FROM messages
       WHERE guild_id = ${guildId} AND length(content) > 0
+        AND created_at > NOW() - interval '90 days'
       ORDER BY created_at
     `;
     const skip = new Set(excludeIds);
@@ -577,21 +639,12 @@ export class MemoryStore {
       WHERE o.guild_id = ${guildId} AND o.verdict IS NULL
       ORDER BY o.id LIMIT ${limit}
     `;
-    return await Promise.all(rows.map(async r => {
-      let contextBefore: Array<{ authorName: string; content: string }> = [];
-      if (r.channel_id && r.msg_created_at) {
-        const ctx = await this.sql<Array<{ author_name: string; content: string }>>`
-          SELECT author_name, content FROM messages
-          WHERE guild_id = ${guildId} AND channel_id = ${r.channel_id} AND created_at < ${r.msg_created_at}
-          ORDER BY created_at DESC LIMIT 5
-        `;
-        contextBefore = ctx.reverse().map(c => ({ authorName: c.author_name, content: c.content }));
-      }
-      return {
-        observationId: Number(r.id), subjectId: r.subject_id, otherId: r.other_id,
-        nature: r.nature, authorName: r.author_name ?? r.subject_id,
-        authorNames: r.author_names ?? [], sourceMessage: r.source_message, contextBefore,
-      };
+    const ctxMap = await this._contextBefore(guildId, rows.flatMap((r, i) =>
+      r.channel_id && r.msg_created_at ? [{ ix: i, channelId: r.channel_id, createdAt: r.msg_created_at }] : []));
+    return rows.map((r, i) => ({
+      observationId: Number(r.id), subjectId: r.subject_id, otherId: r.other_id,
+      nature: r.nature, authorName: r.author_name ?? r.subject_id,
+      authorNames: r.author_names ?? [], sourceMessage: r.source_message, contextBefore: ctxMap.get(i) ?? [],
     }));
   }
 

@@ -151,15 +151,6 @@ export type ProfileSynthesis = {
   roleInServer: string;
 };
 
-export function createMemoryCandidate(candidate: Omit<MemoryCandidate, "confidence" | "importance" | "explicitness"> & { confidence?: number; importance?: number; explicitness?: number; evidenceType: EvidenceType; effect: EvidenceEffect }): MemoryCandidate {
-  return {
-    ...candidate,
-    confidence: candidate.confidence,
-    importance: candidate.importance,
-    explicitness: candidate.explicitness,
-  };
-}
-
 /** Sincerity verdict for a candidate memory, judged against its source message.
  * "misattributed" = the source is quoting/pasting/describing someone other than the poster. */
 export type VerificationVerdict = "literal" | "joke" | "unclear" | "misattributed";
