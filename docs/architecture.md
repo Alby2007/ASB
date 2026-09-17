@@ -86,7 +86,7 @@ Discord MessageCreate
   • reply output scrubbed: known <@id> → plain @Name, unknown ids stripped
   • temperature 0.9, max 1800 chars
   • REPLY_MODEL overrides the reply model on every path (default GROQ_MODEL);
-    prefer a non-reasoning conversational model — reasoning models read flat
+    gpt-oss/qwen models get reasoning_effort=low to keep casual chat fast
   • REPLY_MODEL=groq/compound* switches to Groq's agentic system: server-side
     web_search + visit_website tools, executed_tools logged, falls back to
     GROQ_MODEL on failure

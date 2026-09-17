@@ -601,6 +601,9 @@ export class Brain {
     const persona = "You are a long-standing member of this Discord server — not an assistant. Talk like a regular: short messages, casual register, lowercase is fine, emoji sparingly. Be warm, a bit dry, and willing to have opinions and push back. You only know what is in the supplied context and memories — never claim certainty beyond them, never expose or explain the memory system, never invent facts. Address people by display name — never emit <@...> mention markup. If you use web results, work them in naturally — don't dump citations.";
     const situation = `Recent conversation:\n${context.map(x => `${x.authorName}: ${x.content}`).join("\n")}\n\nPeople:\n${people || "None"}\n\nRelevant memories:\n${memories.map(m => `- ${m.content} (confidence ${(m.confidence ?? 0).toFixed(2)})`).join("\n") || "None"}\n\nRespond to ${event.authorName}'s latest message: ${event.content}`;
     const useModel = model ?? this.model;
+    // Reasoning models (gpt-oss, qwen3) read flat and add thinking latency in
+    // casual chat — cap the effort. Param is only sent where Groq supports it.
+    const lowReasoning = /gpt-oss|qwen/.test(useModel);
 
     if (useModel.startsWith("groq/compound")) {
       try {
@@ -639,6 +642,7 @@ export class Brain {
         for (let round = 0; round < 3; round++) {
           const res = await this.client.chat.completions.create({
             model: useModel, messages, temperature: 0.9,
+            ...(lowReasoning ? { reasoning_effort: "low" as const } : {}),
             tools: replyToolDefs as unknown as OpenAI.ChatCompletionTool[],
             tool_choice: "auto",
           });
@@ -654,7 +658,7 @@ export class Brain {
           }
         }
         // Rounds exhausted — final call without tools forces a plain answer.
-        const res = await this.client.chat.completions.create({ model: useModel, messages, temperature: 0.9 });
+        const res = await this.client.chat.completions.create({ model: useModel, messages, temperature: 0.9, ...(lowReasoning ? { reasoning_effort: "low" as const } : {}) });
         return (res.choices[0]?.message?.content ?? "").trim().slice(0, 1800);
       } catch (err) {
         console.warn(`[reply] tool path failed, falling back to plain reply:`, (err as Error).message.slice(0, 120));
@@ -664,6 +668,7 @@ export class Brain {
     const response = await this.client.responses.create({
       model: useModel,
       temperature: 0.9,
+      ...(lowReasoning ? { reasoning: { effort: "low" as const } } : {}),
       input: `${persona}\n\n${situation}`
     });
     return response.output_text.trim().slice(0, 1800);

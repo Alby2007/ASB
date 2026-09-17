@@ -24,7 +24,7 @@ ASB is configured through environment variables validated at startup by `src/con
 | `SPEAK_THRESHOLD` | `0.70` | Minimum `brain.decide()` score required to send a reply. Range 0–1. A score of 0.70 means the bot will normally only speak when directly @mentioned (which scores 0.90). Lowering this value enables more frequent unsolicited replies. |
 | `RAW_MESSAGE_RETENTION_DAYS` | `30` | How many days of raw Discord messages to keep in the `messages` table. Messages older than this are deleted by the daily maintenance job. Evidence quotes in `memory_evidence` are **not** affected by this purge. Range 1–365. |
 | `CANDIDATE_CONFIDENCE_THRESHOLD` | `0.70` | Minimum confidence required to auto-promote a candidate memory to active status (subject to evidence type gates). Range 0–1. |
-| `REPLY_MODEL` | `GROQ_MODEL` | Model used for Discord replies, across all reply paths. Any Groq model id, or `groq/compound*` for Groq's agentic system with built-in web tools. Prefer a non-reasoning conversational model (e.g. `llama-3.3-70b-versatile`) — reasoning models read flat and add latency in casual chat. |
+| `REPLY_MODEL` | `GROQ_MODEL` | Model used for Discord replies, across all reply paths. Any Groq model id, or `groq/compound*` for Groq's agentic system with built-in web tools. Reasoning models (gpt-oss, qwen3) get `reasoning_effort=low` automatically to cut latency and flatten the register. |
 | `REPLY_TOOLS` | (off) | `1` attaches free local `web_search`/`visit_url` tools to replies when a message matches tool cues (links, "look up", etc.). |
 
 ---
