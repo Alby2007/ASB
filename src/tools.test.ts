@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { executeTool, isSafeUrl, parseDdgLite, stripHtml } from "./tools.js";
+import { guardedLlmFetch } from "./brains.js";
 import { toolCues } from "./perception.js";
 
 // Pure tests — no network. webSearch/visitUrl correctness against live
@@ -69,6 +70,17 @@ test("parseDdgLite extracts results and decodes uddg redirect URLs", () => {
   assert.equal(results[0].snippet, "A snippet about the thing.");
   assert.equal(results[1].url, "https://direct.example.org/");
   assert.equal(results[1].snippet, "Second snippet here.");
+});
+
+test("guardedLlmFetch blocks private targets at connect time", async () => {
+  // safeLookup runs inside the socket connect path — these reject during DNS
+  // resolution, before any packet leaves for the private address. undici wraps
+  // the lookup failure as the cause of a "fetch failed" TypeError.
+  for (const url of ["http://127.0.0.1:8080/", "http://localhost:8080/", "http://169.254.169.254/latest/meta-data"]) {
+    const err = await guardedLlmFetch(url).then(() => null, (e: unknown) => e);
+    assert.ok(err, `${url} should reject`);
+    assert.match(String((err as { cause?: unknown }).cause ?? err), /private|blocked/i);
+  }
 });
 
 test("executeTool returns error strings for bad input, never throws", async () => {

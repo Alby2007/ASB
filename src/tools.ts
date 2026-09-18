@@ -71,8 +71,10 @@ export function isSafeUrl(raw: string): boolean {
   return true;
 }
 
-/** DNS check: block hosts that resolve to private addresses (rebinding defence). */
-async function resolvesToPrivateAddress(host: string): Promise<boolean> {
+/** DNS check: block hosts that resolve to private addresses (rebinding defence).
+ * Exported for setup-time validation — the authoritative gate is safeLookup at
+ * connect time; this catches bad hostnames early, at input time. */
+export async function resolvesToPrivateAddress(host: string): Promise<boolean> {
   if (isPrivateAddress(host)) return true; // literal already handled, belt-and-braces
   try {
     const addrs = await lookup(host, { all: true });
@@ -88,7 +90,7 @@ async function resolvesToPrivateAddress(host: string): Promise<boolean> {
 // safeLookup runs INSIDE the socket connect path, so the same answer that is
 // validated is the one connected to — the TOCTOU window closes entirely.
 
-const safeLookup: LookupFunction = ((hostname: string, options: { all?: boolean } & Record<string, unknown>, callback: (err: NodeJS.ErrnoException | null, address?: unknown, family?: number) => void) => {
+export const safeLookup: LookupFunction = ((hostname: string, options: { all?: boolean } & Record<string, unknown>, callback: (err: NodeJS.ErrnoException | null, address?: unknown, family?: number) => void) => {
   dnsLookupCb(hostname, { ...options, all: true }, (err, addrs) => {
     if (err) return callback(err);
     if (!addrs?.length || addrs.some(a => isPrivateAddress(a.address))) {

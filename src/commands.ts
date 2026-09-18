@@ -5,7 +5,8 @@ import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
 import { ProfileStore } from "./profiles.js";
 import { encryptSecret, logError, maskKey, validateLlmKey } from "./secrets.js";
-import { isSafeUrl } from "./tools.js";
+import { isSafeUrl, resolvesToPrivateAddress } from "./tools.js";
+import { guardedLlmFetch } from "./brains.js";
 import { runProfileBuild, PROFILE_BUILD_COOLDOWN_MS } from "./profile-build.js";
 import { runServerIngest } from "./server-ingest.js";
 import { metricsSnapshot } from "./metrics.js";
@@ -443,18 +444,28 @@ export async function handleSetupModal(
   validate: typeof validateLlmKey = validateLlmKey
 ) {
   if (interaction.customId !== "setup-key" || !interaction.guildId) return;
+  // Re-check on submit — permissions can be revoked between /setup and the
+  // modal submission, and the modal itself carries no permission gate.
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+    return interaction.reply({ content: "Setup requires the Manage Server permission.", ephemeral: true });
+  }
   const guildId = interaction.guildId;
   const key = interaction.fields.getTextInputValue("api-key").trim();
   const baseUrl = interaction.fields.getTextInputValue("base-url").trim() || null;
   await interaction.deferReply({ ephemeral: true });
   // The base URL steers every later LLM call carrying this key — a guild admin
   // is less trusted than the operator, so apply the same SSRF guard the web
-  // tool uses: public http(s) only, no private/loopback/metadata hosts.
+  // tool uses: public http(s) only, no private/loopback/metadata hosts. The
+  // DNS check catches innocent-looking names that resolve to private/internal
+  // addresses; brains.ts re-validates at connect time on every later call.
   if (baseUrl && !isSafeUrl(baseUrl)) {
     return interaction.editReply("That base URL isn't allowed — it must be a public http(s) endpoint. Leave it blank to use the default provider.");
   }
+  if (baseUrl && await resolvesToPrivateAddress(new URL(baseUrl).hostname)) {
+    return interaction.editReply("That base URL isn't allowed — it resolves to a private or internal address. Leave it blank to use the default provider.");
+  }
   try {
-    const result = await validate(key, baseUrl ?? config.groqBaseUrl);
+    const result = await validate(key, baseUrl ?? config.groqBaseUrl, guardedLlmFetch);
     if (!result.ok && "status" in result) {
       return interaction.editReply("That key was rejected by the provider (auth failed) — nothing was stored. Check the key and try again.");
     }

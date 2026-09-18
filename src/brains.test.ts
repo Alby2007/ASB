@@ -44,6 +44,45 @@ test("undecryptable row → null (dormant), not a crash", async () => {
   assert.equal(await brainFor("g1"), null);
 });
 
+test("unverified guild row revalidates once and marks validated on success", async () => {
+  const marked: string[] = [];
+  const seen: Array<{ key: string; baseUrl: string }> = [];
+  const { brainFor } = createBrainResolver({
+    getKey: async () => ({ ...row("guild-key", "https://guild.example/v1"), validatedAt: null }),
+    ...ENV, requireGuildKeys: false,
+    markValidated: async g => { marked.push(g); },
+    revalidate: async (key, baseUrl) => { seen.push({ key, baseUrl }); return true; },
+  });
+  await brainFor("g1");
+  await new Promise(r => setTimeout(r, 0)); // flush the fire-and-forget revalidate chain
+  assert.deepEqual(seen, [{ key: "guild-key", baseUrl: "https://guild.example/v1" }]);
+  assert.deepEqual(marked, ["g1"]);
+});
+
+test("already-validated rows skip revalidation; failed revalidation doesn't mark", async () => {
+  const marked: string[] = [];
+  let revalidateCalls = 0;
+  const validated = createBrainResolver({
+    getKey: async () => ({ ...row("guild-key"), validatedAt: "2026-01-01T00:00:00Z" }),
+    ...ENV, requireGuildKeys: false,
+    markValidated: async g => { marked.push(g); },
+    revalidate: async () => { revalidateCalls++; return true; },
+  });
+  await validated.brainFor("g1");
+  await new Promise(r => setTimeout(r, 0));
+  assert.equal(revalidateCalls, 0);
+
+  const failing = createBrainResolver({
+    getKey: async () => ({ ...row("guild-key"), validatedAt: null }),
+    ...ENV, requireGuildKeys: false,
+    markValidated: async g => { marked.push(g); },
+    revalidate: async () => false,
+  });
+  await failing.brainFor("g2");
+  await new Promise(r => setTimeout(r, 0));
+  assert.deepEqual(marked, []);
+});
+
 test("invalidate forces re-resolution (key rotation)", async () => {
   let current: { keyEnc: Buffer; baseUrl: string | null } | null = row("key-v1");
   const { brainFor, invalidate } = resolver(async () => current);

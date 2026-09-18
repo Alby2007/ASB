@@ -334,12 +334,14 @@ test("/server-build refuses non-admins and wants a channel from admins", async (
 
 // ── /setup (BYOK) ─────────────────────────────────────────────────────────────
 
-function stubModal(opts: { key?: string; baseUrl?: string; guildId?: string }) {
+function stubModal(opts: { key?: string; baseUrl?: string; guildId?: string; admin?: boolean }) {
   const replies: Replies = [];
   const interaction = {
     customId: "setup-key",
     guildId: opts.guildId ?? "g1",
+    memberPermissions: { has: () => opts.admin !== false },
     fields: { getTextInputValue: (id: string) => id === "api-key" ? (opts.key ?? "") : (opts.baseUrl ?? "") },
+    reply: async (r: { content: string }) => { replies.push({ content: r.content }); return r; },
     deferReply: async () => {},
     editReply: async (r: string) => { replies.push({ content: r }); return r; },
   };
@@ -382,6 +384,21 @@ test("/setup modal: valid key stores ciphertext + masked hint and invalidates th
       assert.equal(invalidated, "g1");
       assert.match(replies.at(-1)?.content ?? "", /…1234/);
       assert.doesNotMatch(replies.at(-1)?.content ?? "", /gsk_test_secretkey1234/); // never echo the key
+    } finally { config.keyEncryptionSecret = saved; }
+  } finally { await sql.end(); }
+});
+
+test("/setup modal: non-admin submit is re-checked and rejected", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const saved = config.keyEncryptionSecret;
+    config.keyEncryptionSecret = "test-master-passphrase";
+    try {
+      const denied = stubModal({ key: "gsk_test_secretkey1234", guildId: "g-setup-nonadmin", admin: false });
+      await handleSetupModal(denied.interaction, store, () => {}, async () => ({ ok: true }));
+      assert.match(denied.replies[0]?.content ?? "", /Manage Server|permission/i);
+      assert.equal(await store.getGuildKey("g-setup-nonadmin"), null, "nothing should be stored for a non-admin submit");
     } finally { config.keyEncryptionSecret = saved; }
   } finally { await sql.end(); }
 });

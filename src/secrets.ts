@@ -4,11 +4,10 @@ import { config } from "./config.js";
 /**
  * At-rest encryption for per-guild LLM keys (BYOK). AES-256-GCM with a random
  * IV per write; the master key is SHA-256 of KEY_ENCRYPTION_SECRET so any
- * passphrase works — no format foot-gun. Blobs are `iv ‖ tag ‖ ciphertext`.
+ * passphrase works — no format foot-gun. Blobs are `iv ‖ ciphertext ‖ tag`.
  *
  * decrypt throws on auth-tag failure — that's the tamper/wrong-master-key
  * signal; callers (brains.ts) translate it to "guild dormant" + a metric.
- * Blobs are `iv ‖ ciphertext ‖ tag`.
  */
 
 const IV_LEN = 12;

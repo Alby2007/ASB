@@ -4,7 +4,8 @@ import { config } from "./config.js";
 import { MemoryStore } from "./database.js";
 import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
-import { createBrainResolver } from "./brains.js";
+import { createBrainResolver, guardedLlmFetch } from "./brains.js";
+import { validateLlmKey } from "./secrets.js";
 import { runServerIngest } from "./server-ingest.js";
 
 // CLI entry for the server-level historical build. The work itself lives in
@@ -21,6 +22,8 @@ client.once("ready", async () => {
     getKey: guildId => store.getGuildKey(guildId),
     envKey: config.groqKey, envModel: config.model, envBaseUrl: config.groqBaseUrl,
     requireGuildKeys: config.requireGuildKeys,
+    markValidated: guildId => store.markGuildKeyValidated(guildId),
+    revalidate: async (key, baseUrl) => (await validateLlmKey(key, baseUrl, guardedLlmFetch)).ok,
   });
 
   const guild = client.guilds.cache.get(config.guildId!);

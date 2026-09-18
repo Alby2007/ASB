@@ -3,7 +3,7 @@ import OpenAI from "openai";
 import { config } from "./config.js";
 import { sql } from "./db.js";
 import { MemoryStore } from "./database.js";
-import { createBrainResolver } from "./brains.js";
+import { createBrainResolver, guardedLlmFetch } from "./brains.js";
 import { commandDefinitions, handleMemoryButton, handleMemoryCommand, handleSetupModal } from "./commands.js";
 import { detectDismissal, detectNamingRequest, detectSelfNaming, detectWakeWord, questionKeywords, roomAddressCue, shouldInspectForMemory, toolCues } from "./perception.js";
 import { EngagementTracker } from "./engagement.js";
@@ -18,7 +18,7 @@ import { buildPairContext, type ToolCtx } from "./lookup-tools.js";
 import { qualifyingImages, formatImageContext, IMAGE_MAX_PER_MESSAGE, type AttachmentMeta } from "./vision.js";
 import { withRetry } from "./retry.js";
 import { inc } from "./metrics.js";
-import { logError, redactSecrets, registerSecret } from "./secrets.js";
+import { logError, redactSecrets, registerSecret, validateLlmKey } from "./secrets.js";
 import { isSafeUrl } from "./tools.js";
 import type { MessageEvent, PairContext } from "./types.js";
 
@@ -52,6 +52,8 @@ const { brainFor, invalidate: invalidateBrain } = createBrainResolver({
   getKey: guildId => store.getGuildKey(guildId),
   envKey: config.groqKey, envModel: config.model, envBaseUrl: config.groqBaseUrl,
   requireGuildKeys: config.requireGuildKeys,
+  markValidated: guildId => store.markGuildKeyValidated(guildId),
+  revalidate: async (key, baseUrl) => (await validateLlmKey(key, baseUrl, guardedLlmFetch)).ok,
 });
 // Vision can live on a different provider than the main key (e.g. Gemini's
 // free tier, since Groq rotated its vision models off) — a second client is
