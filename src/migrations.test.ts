@@ -321,3 +321,43 @@ test("migration v16 flips observe defaults to dormant and adds announced_at", as
     assert.ok(!("announced_at" in rb), "announced_at should be dropped on rollback");
   } finally { await sql.end(); }
 });
+
+test("migration v17 creates jobs + guild_usage and the scale-rails columns", async () => {
+  const sql = makeTestSql();
+  try {
+    await resetSchema(sql);
+    await runMigrations(sql as any);
+
+    const tables = await sql<Array<{ table_name: string }>>`
+      SELECT table_name FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_name IN ('jobs', 'guild_usage')
+    `;
+    assert.deepEqual(tables.map(t => t.table_name).sort(), ["guild_usage", "jobs"]);
+
+    const cols = await sql<Array<{ column_name: string; column_default: string | null }>>`
+      SELECT column_name, column_default FROM information_schema.columns
+      WHERE table_name = 'server_settings' AND column_name IN ('ignored_channels', 'llm_daily_cap')
+    `;
+    const byName = Object.fromEntries(cols.map(d => [d.column_name, d.column_default]));
+    assert.ok("ignored_channels" in byName, "ignored_channels column missing");
+    assert.ok(byName.llm_daily_cap?.startsWith("1000"), "llm_daily_cap should default to 1000");
+
+    // Functional check: a fresh guild row picks up both defaults.
+    await sql`INSERT INTO server_settings (guild_id) VALUES ('g-v17')`;
+    const [r] = await sql`SELECT ignored_channels, llm_daily_cap FROM server_settings WHERE guild_id = 'g-v17'`;
+    assert.deepEqual(r.ignored_channels, []);
+    assert.equal(Number(r.llm_daily_cap), 1000);
+
+    await runMigrations(sql as any, 16);
+    const gone = await sql<Array<{ table_name: string }>>`
+      SELECT table_name FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_name IN ('jobs', 'guild_usage')
+    `;
+    assert.equal(gone.length, 0, "rollback should drop both new tables");
+    const dropped = await sql<Array<{ column_name: string }>>`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_name = 'server_settings' AND column_name IN ('ignored_channels', 'llm_daily_cap')
+    `;
+    assert.equal(dropped.length, 0, "rollback should drop both new columns");
+  } finally { await sql.end(); }
+});

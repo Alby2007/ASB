@@ -64,7 +64,10 @@ type MessageRow = {
   author_name: string; content: string; created_at: Date | string;
 };
 
-type SettingsRow = { guild_id: string; memory_enabled: number; reply_enabled: number; proactive_enabled: number; raw_retention_days: number; announced_at: Date | string | null };
+type SettingsRow = { guild_id: string; memory_enabled: number; reply_enabled: number; proactive_enabled: number; raw_retention_days: number; announced_at: Date | string | null; ignored_channels: string[] | null; llm_daily_cap: number };
+
+/** Public settings shape — server_settings projected to camelCase. */
+export type Settings = { guildId: string; memoryEnabled: number; replyEnabled: number; proactiveEnabled: number; rawRetentionDays: number; announcedAt: string | null; ignoredChannels: string[]; llmDailyCap: number };
 
 type MemberRow = {
   guild_id: string; user_id: string; known_names: string[];
@@ -148,15 +151,15 @@ export class MemoryStore {
 
   // settings() runs on every message, so it's cached per guild; setPaused is the
   // only writer and invalidates. The TTL bounds staleness from out-of-band edits.
-  private settingsCache = new Map<string, { value: { guildId: string; memoryEnabled: number; replyEnabled: number; proactiveEnabled: number; rawRetentionDays: number; announcedAt: string | null }; at: number }>();
+  private settingsCache = new Map<string, { value: Settings; at: number }>();
 
-  async settings(guildId: string, defaultRetentionDays = 30): Promise<{ guildId: string; memoryEnabled: number; replyEnabled: number; proactiveEnabled: number; rawRetentionDays: number; announcedAt: string | null }> {
+  async settings(guildId: string, defaultRetentionDays = 30): Promise<Settings> {
     const cached = this.settingsCache.get(guildId);
     if (cached && Date.now() - cached.at < 60_000) return cached.value;
     await this.ensureSettings(guildId, defaultRetentionDays);
-    const rows = await this.sql<SettingsRow[]>`SELECT guild_id, memory_enabled, reply_enabled, proactive_enabled, raw_retention_days, announced_at FROM server_settings WHERE guild_id = ${guildId}`;
+    const rows = await this.sql<SettingsRow[]>`SELECT guild_id, memory_enabled, reply_enabled, proactive_enabled, raw_retention_days, announced_at, ignored_channels, llm_daily_cap FROM server_settings WHERE guild_id = ${guildId}`;
     const r = rows[0];
-    const value = { guildId: r.guild_id, memoryEnabled: Number(r.memory_enabled), replyEnabled: Number(r.reply_enabled), proactiveEnabled: Number(r.proactive_enabled), rawRetentionDays: Number(r.raw_retention_days), announcedAt: r.announced_at ? ts(r.announced_at) : null };
+    const value = { guildId: r.guild_id, memoryEnabled: Number(r.memory_enabled), replyEnabled: Number(r.reply_enabled), proactiveEnabled: Number(r.proactive_enabled), rawRetentionDays: Number(r.raw_retention_days), announcedAt: r.announced_at ? ts(r.announced_at) : null, ignoredChannels: r.ignored_channels ?? [], llmDailyCap: Number(r.llm_daily_cap) };
     this.settingsCache.set(guildId, { value, at: Date.now() });
     return value;
   }
@@ -181,6 +184,55 @@ export class MemoryStore {
     await this.ensureSettings(guildId, defaultRetentionDays);
     await this.sql`UPDATE server_settings SET proactive_enabled = ${enabled ? 1 : 0} WHERE guild_id = ${guildId}`;
     this.settingsCache.delete(guildId);
+  }
+
+  /** Channels the bot treats as fully invisible — no archive, replies, or
+   * member writes there, and server-build scans skip them. */
+  async setIgnoredChannels(guildId: string, channelIds: string[], defaultRetentionDays = 30): Promise<void> {
+    await this.ensureSettings(guildId, defaultRetentionDays);
+    await this.sql`UPDATE server_settings SET ignored_channels = ${channelIds} WHERE guild_id = ${guildId}`;
+    this.settingsCache.delete(guildId);
+  }
+
+  /** Per-guild daily LLM-call bound — enforced by the metered client in
+   * brains.ts against guild_usage, for every key source (guild or env). */
+  async setDailyCap(guildId: string, cap: number, defaultRetentionDays = 30): Promise<void> {
+    await this.ensureSettings(guildId, defaultRetentionDays);
+    await this.sql`UPDATE server_settings SET llm_daily_cap = ${cap} WHERE guild_id = ${guildId}`;
+    this.settingsCache.delete(guildId);
+  }
+
+  /** Atomic per-guild daily LLM-call charge. The INSERT..ON CONFLICT takes the
+   * (guild_id, day) row lock, so concurrent charges serialize — the counter can
+   * never overshoot the cap. Days are UTC so the BudgetExceeded reschedule
+   * (next UTC midnight) matches the counter reset. Returns ok=false without
+   * incrementing when the guild is already at/over cap. */
+  async chargeLlmCall(guildId: string, cap: number): Promise<{ ok: boolean; used: number; cap: number }> {
+    if (cap <= 0) return { ok: false, used: 0, cap };
+    const rows = await this.sql<Array<{ llm_calls: number }>>`
+      INSERT INTO guild_usage (guild_id, day, llm_calls)
+      VALUES (${guildId}, (now() AT TIME ZONE 'UTC')::date, 1)
+      ON CONFLICT (guild_id, day) DO UPDATE SET llm_calls = guild_usage.llm_calls + 1
+      WHERE guild_usage.llm_calls < ${cap}
+      RETURNING llm_calls
+    `;
+    return rows.length ? { ok: true, used: rows[0].llm_calls, cap } : { ok: false, used: cap, cap };
+  }
+
+  async usageToday(guildId: string): Promise<number> {
+    const rows = await this.sql<Array<{ llm_calls: number }>>`
+      SELECT llm_calls FROM guild_usage WHERE guild_id = ${guildId} AND day = (now() AT TIME ZONE 'UTC')::date
+    `;
+    return rows[0]?.llm_calls ?? 0;
+  }
+
+  /** Live queue depth for /status — dead-lettered jobs (attempts >= 5) don't
+   * count; they no longer consume work. */
+  async queueDepth(guildId: string): Promise<number> {
+    const rows = await this.sql<Array<{ c: number }>>`
+      SELECT count(*)::int AS c FROM jobs WHERE guild_id = ${guildId} AND attempts < 5
+    `;
+    return rows[0].c;
   }
 
   // ── Guild LLM keys (BYOK) ────────────────────────────────────────────────────
@@ -245,6 +297,10 @@ export class MemoryStore {
       await tx`DELETE FROM members WHERE guild_id = ${guildId}`;
       await tx`DELETE FROM messages WHERE guild_id = ${guildId}`;
       await tx`DELETE FROM guild_keys WHERE guild_id = ${guildId}`;
+      // Queued jobs and usage counters are guild-scoped too — a kicked guild
+      // leaves nothing behind, including pending work.
+      await tx`DELETE FROM jobs WHERE guild_id = ${guildId}`;
+      await tx`DELETE FROM guild_usage WHERE guild_id = ${guildId}`;
       await tx`DELETE FROM server_settings WHERE guild_id = ${guildId}`;
     });
     this.settingsCache.delete(guildId);

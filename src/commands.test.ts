@@ -535,3 +535,88 @@ test("serverbuild buttons: wrong user rejected, cancel updates, confirm reaches 
     await new Promise(r => setTimeout(r, 20)); // let the failed runner release the flag
   } finally { await sql.end(); }
 });
+
+// ── /limits + ignored channels + /status usage panel ─────────────────────────
+
+test("/limits validates the range and writes llm_daily_cap", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const nonAdmin = stubCommand({ commandName: "limits", userId: "u-stranger", options: { daily_cap: 500 } });
+    await handleMemoryCommand(nonAdmin.interaction, store, brainFor);
+    assert.match(nonAdmin.replies[0]?.content ?? "", /administrator/i);
+
+    for (const bad of [-1, 200000]) {
+      const cmd = stubCommand({ commandName: "limits", userId: "u-admin", admin: true, options: { daily_cap: bad } });
+      await handleMemoryCommand(cmd.interaction, store, brainFor);
+      assert.match(cmd.replies[0]?.content ?? "", /between/i, `cap ${bad} should be rejected`);
+    }
+
+    const ok = stubCommand({ commandName: "limits", userId: "u-admin", admin: true, options: { daily_cap: 250 } });
+    await handleMemoryCommand(ok.interaction, store, brainFor);
+    assert.match(ok.replies[0]?.content ?? "", /250/);
+    assert.equal((await store.settings("g1")).llmDailyCap, 250);
+
+    // 0 is the documented block-all lever.
+    const zero = stubCommand({ commandName: "limits", userId: "u-admin", admin: true, options: { daily_cap: 0 } });
+    await handleMemoryCommand(zero.interaction, store, brainFor);
+    assert.match(zero.replies[0]?.content ?? "", /blocked/i);
+    assert.equal((await store.settings("g1")).llmDailyCap, 0);
+  } finally { await sql.end(); }
+});
+
+test("/ignore-channel + /unignore-channel manage the ignored set; /memory-settings lists it", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const deny = stubCommand({ commandName: "ignore-channel", userId: "u-stranger", options: { channel: { id: "ch-9" } } });
+    await handleMemoryCommand(deny.interaction, store, brainFor);
+    assert.match(deny.replies[0]?.content ?? "", /administrator/i);
+    assert.deepEqual((await store.settings("g1")).ignoredChannels, []);
+
+    const add = stubCommand({ commandName: "ignore-channel", userId: "u-admin", admin: true, options: { channel: { id: "ch-9" } } });
+    await handleMemoryCommand(add.interaction, store, brainFor);
+    assert.match(add.replies[0]?.content ?? "", /invisible/i);
+    assert.deepEqual((await store.settings("g1")).ignoredChannels, ["ch-9"]);
+
+    // Idempotent add → "already ignored".
+    const again = stubCommand({ commandName: "ignore-channel", userId: "u-admin", admin: true, options: { channel: { id: "ch-9" } } });
+    await handleMemoryCommand(again.interaction, store, brainFor);
+    assert.match(again.replies[0]?.content ?? "", /already/i);
+    assert.equal((await store.settings("g1")).ignoredChannels.length, 1);
+
+    // /memory-settings surfaces the list.
+    const view = stubCommand({ commandName: "memory-settings", userId: "u-admin", admin: true });
+    await handleMemoryCommand(view.interaction, store, brainFor);
+    assert.match(view.replies[0]?.content ?? "", /ch-9|Ignored channels/i);
+
+    const remove = stubCommand({ commandName: "unignore-channel", userId: "u-admin", admin: true, options: { channel: { id: "ch-9" } } });
+    await handleMemoryCommand(remove.interaction, store, brainFor);
+    assert.match(remove.replies[0]?.content ?? "", /visible/i);
+    assert.deepEqual((await store.settings("g1")).ignoredChannels, []);
+
+    // /server-build refuses an ignored channel before the consent prompt.
+    await store.setIgnoredChannels("g1", ["ch-1"]);
+    const build = stubCommand({ commandName: "server-build", userId: "u-admin", admin: true, options: { channel: { id: "ch-1", type: 0, name: "general" } } });
+    await handleMemoryCommand(build.interaction, store, brainFor);
+    assert.match(build.replies[0]?.content ?? "", /ignored/i);
+    assert.ok(!build.replies[0]?.components?.length, "no consent prompt for an ignored channel");
+  } finally { await sql.end(); }
+});
+
+test("/status renders the LLM usage panel", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    await store.setDailyCap("g1", 500);
+    await store.chargeLlmCall("g1", 500);
+    await sql`INSERT INTO jobs (guild_id, type, payload) VALUES ('g1', 'extract', '{}')`;
+    const cmd = stubCommand({ commandName: "status", userId: "u-admin", admin: true });
+    await handleMemoryCommand(cmd.interaction, store, brainFor);
+    const desc = JSON.stringify(cmd.replies[0]?.embeds ?? []);
+    assert.match(desc, /LLM usage/i);
+    assert.match(desc, /500/);
+    assert.match(desc, /queue/i);
+    assert.match(desc, /LLM key/i);
+  } finally { await sql.end(); }
+});

@@ -138,8 +138,44 @@ One row per guild. Controls pause state and retention.
 | `proactive_enabled` | INTEGER | 0 = off (default); 1 = server opted in to proactive answers — requires the global `PROACTIVE=1` env flag too |
 | `raw_retention_days` | INTEGER | Rolling window for raw message purge |
 | `announced_at` | TIMESTAMPTZ NULL | Set once the join disclosure card posts — the idempotency marker for `announceIfNeeded` |
+| `ignored_channels` | TEXT[] | Channels excluded from archiving, replies, member writes, and historical ingest — managed via `/ignore-channel` / `/unignore-channel` |
+| `llm_daily_cap` | INTEGER | Per-guild LLM call budget per UTC day (default 1000; 0 = all calls blocked) — set via `/limits` |
 
 Row is created with dormant defaults (`memory_enabled=0`, `reply_enabled=0`) on first sight of a guild — an admin enables observation via `/memory-resume`. Administrators can override via `/memory-pause`, `/memory-resume`, `/proactive enabled:<bool>`, and the `RAW_MESSAGE_RETENTION_DAYS` env variable.
+
+---
+
+### `jobs`
+
+The deferred-cognition queue (v17). One row per pending unit of background work — currently only `extract` jobs, carrying a `message_id` payload.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | BIGINT PK | `GENERATED ALWAYS AS IDENTITY` |
+| `guild_id` | TEXT | Owning guild — claims exclude at-cap guilds; `purgeGuild` deletes the guild's rows |
+| `type` | TEXT | Job kind — the worker dispatches on it (`extract`) |
+| `payload` | JSONB | Handler input (`{ message_id }` for extract) |
+| `run_after` | TIMESTAMPTZ | Earliest claim time — backoff delays and claim leases live here |
+| `attempts` | INTEGER | Claim count; `attempts >= 5` dead-letters the row (kept for inspection, never claimed) |
+| `created_at` | TIMESTAMPTZ | Enqueue time |
+
+**Index:** `jobs_claim (run_after) WHERE attempts < 5` — the claim query touches only live jobs.
+
+Claim protocol (`src/jobs.ts`): `UPDATE … SET attempts+1, run_after = now()+10min` inside `FOR UPDATE SKIP LOCKED` — a claimed job leases itself out of the runnable set; completion deletes the row, failure re-schedules to backoff, and a crashed worker's job becomes claimable again when the lease expires. `BudgetExceeded` reschedules to next UTC midnight **without** consuming an attempt.
+
+---
+
+### `guild_usage`
+
+Per-guild daily LLM-call counters (v17) — the `meteredClient` seam charges here before every `responses.create`/`chat.completions.create`.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `guild_id` | TEXT | Composite PK with `day` |
+| `day` | DATE | UTC day — counters reset automatically at the boundary |
+| `llm_calls` | INTEGER | Calls charged that day |
+
+`chargeLlmCall` increments atomically (`INSERT … ON CONFLICT DO UPDATE … WHERE llm_calls < cap RETURNING`) — a zero-row result throws `BudgetExceeded`. `cap=0` blocks every call.
 
 ---
 
@@ -381,3 +417,4 @@ Version tracking for the migration system.
 | 14 | `v14_member_opted_in` | `opted_in` on `members` — derived data becomes consent-gated: person memories, relationships, attributes, profiles form only for `opted_in=1 AND opted_out=0` |
 | 15 | `v15_guild_keys` | `guild_keys` table — BYOK: per-guild LLM keys encrypted AES-256-GCM, written by `/setup` |
 | 16 | `v16_consent_posture` | `server_settings` defaults flip to dormant (`memory_enabled=0`, `reply_enabled=0`); `announced_at` marks the join disclosure |
+| 17 | `v17_scale_rails` | `jobs` queue + `guild_usage` daily counters; `ignored_channels` and `llm_daily_cap` on `server_settings` |

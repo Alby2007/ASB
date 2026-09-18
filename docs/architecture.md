@@ -15,13 +15,16 @@ ASB (Artificial Server Member) is a single TypeScript/Node process that connects
 | `src/persist-extraction.ts` | `persistExtraction` | The single consent-gated write path for extraction results — person memories need an opted-in subject; relationships need one opted-in party |
 | `src/brains.ts` | `createBrainResolver` | Per-guild `Brain` resolver (BYOK): guild's encrypted key → env fallback → null (dormant). Cached per guild, invalidated by `/setup` |
 | `src/guild-lifecycle.ts` | `announceIfNeeded`, `handleGuildDelete` | Join disclosure card (idempotent via `announced_at`) + kick-purge — GuildDelete never fires on outage (`unavailable`) |
+| `src/jobs.ts` | `enqueue`, `claimNext`, `startWorker` | Postgres job queue for deferrable cognition — `SKIP LOCKED` claims with a 10-min visibility lease, per-guild serial + global cap 8, backoff retry, 5-attempt dead-letter, `NOTIFY`/`LISTEN` wake + 3s poll |
+| `src/extract-job.ts` | `runExtractJob` | The deferred extract pipeline — alias-learn → describe → extract → consent-gated persist → `extracted` mark → contest → event pipeline (extracted from index.ts so it's unit-testable) |
+| `src/budget.ts` | `meteredClient`, `BudgetExceeded` | Per-guild daily LLM budget — wraps every `responses.create`/`chat.completions.create` with an atomic `guild_usage` charge against `llm_daily_cap` |
 | `src/secrets.ts` | `encryptSecret`, `decryptSecret`, `maskKey`, `redactSecrets`, `validateLlmKey` | AES-256-GCM at-rest encryption for guild keys + live key validation against `/models` |
 | `src/brain.ts` | `Brain` | All LLM calls: extract memories, correct, assess continuity, classify events, reply |
 | `src/config.ts` | `config` | Env-variable validation (zod); single exported config object |
 | `src/types.ts` | `MessageEvent`, `MemoryCandidate`, `StoredEvent`, `Decision`, … | Shared TypeScript types shared across modules |
 | `src/database.ts` | `MemoryStore` | Postgres persistence: memory CRUD, lifecycle, conflict resolution, episode consolidation |
 | `src/events.ts` | `EventStore` | Postgres persistence: event CRUD, participants, message/memory attachments |
-| `src/migrations.ts` | `runMigrations`, `getMigrationVersion` | Versioned schema migrations (v1–v14, `LATEST_MIGRATION_VERSION`) with rollback support |
+| `src/migrations.ts` | `runMigrations`, `getMigrationVersion` | Versioned schema migrations (v1–v17, `LATEST_MIGRATION_VERSION`) with rollback support |
 | `src/confidence.ts` | `calculateInitialConfidence`, `updateConfidence`, `calculateDefaultImportance`, `calculateDefaultExplicitness` | Deterministic numeric formulas; no LLM involvement |
 | `src/perception.ts` | `shouldInspectForMemory`, `detectNamingRequest`, `detectSelfNaming`, `detectWakeWord`, `detectDismissal`, `contestCue`, `botMemoryCue`, `toolCues` | Cheap pre-filter: prevents LLM calls for ordinary chat; detects naming requests, self-naming, wake words, and dismissal cues |
 | `src/event-detection.ts` | `EventPipeline` | Heuristic + LLM continuity decisions; nightly maintenance |
@@ -50,49 +53,12 @@ Discord MessageCreate
         ▼
   perception.ts: shouldInspectForMemory()?  (or: has image attachments)
         │ yes                     no ──────────────────────────────┐
-        ▼   (passes durableSignals regex, or any bot-addressed msg) │
-  brain.ts: describeImage() per attachment (VISION_MODEL — off when  │
-   unset; image/* minus gif, ≤IMAGE_MAX_BYTES, ≤3/message) then      │
-   extractMemories() with the descriptions as observed-content       │
-   context — downstream code sees only text                          │
-  (LLM — returns subjectId, subjectName, kind, content,            │
-   reason, evidenceType, effect + relationship assertions;         │
-   no numeric values)                                              │
-        ▼                                                           │
-  entity-resolution.ts: resolveSubject()                           │
-  • subjectName → real user ID via the members alias map           │
-  • ambiguous names → "unknown" (correctness over recall)          │
-        │                                                           │
-        ▼                                                           │
-  persist-extraction.ts: consent gate (shared by live/sweep/       │
-    ingest/profile-build — see "Consent model")                    │
-  • person memories persist only for opted-in subjects             │
-  • relationship observations persist when ≥1 party opted in       │
-    → relationship_observations, verdict column (v8) records       │
-    sincerity; recomputeEdges() rebuilds edges from 'literal'      │
-    verdicts only — unverified/joke assertions never surface       │
-        │                                                           │
-        ▼                                                           │
-  database.ts: saveMemory()                                         │
-  • confidence.ts formulas set initial confidence                   │
-  • UNIQUE(guild_id, subject_id, kind, content) dedup, with a pg_trgm
-    similarity fallback so rephrased extractions reinforce one row              │
-  • evidence inserted idempotently by (memory_id, message_id)      │
-  • lifecycle: candidate → active (if promotable evidence type     │
-    and confidence ≥ threshold)                                    │
-  • contested memories: confidence frozen; net_score updated       │
-  • history row appended                                           │
+        ▼                                                          │
+  jobs.ts: enqueue 'extract' job + mark message triage='queued'     │
+  (live path keeps only recordMessage/decide/reply — deferrable     │
+   cognition runs in the worker, per-guild serial, global cap 8)    │
         │                                                           │
         ▼◄──────────────────────────────────────────────────────────┘
-  event-detection.ts: EventPipeline.process()                          │
-  • regex-failed messages aren't dropped: a 15-min sweep in index.ts   │
-    re-triages recent uninspected messages via brain.triageBatch and   │
-    routes durable verdicts into the same extraction path            │
-  • scoreOpenEvents() heuristic (no LLM)
-  • if ambiguous: brain.assessContinuity() (LLM)
-  • attach / new / reference / bridge
-        │
-        ▼
   brain.ts: decide()
   • baseline 0.05 + direct mention +0.85, else engaged +0.70 + question +0.10
   • "direct mention" = @-mention, reply-to-bot, or wake word — the bot's
@@ -149,6 +115,28 @@ Discord MessageCreate
         ▼
   Discord: message.reply()
 ```
+
+## Deferred extraction — the job queue (v17)
+
+Every durable message used to run 3+ sequential LLM calls inside `handleMessage`, so a busy guild stacked unbounded concurrent extractions. Now the live path enqueues one `extract` job per durable message and returns; the worker drains `jobs` (Postgres, `FOR UPDATE SKIP LOCKED`).
+
+- **Fairness:** `extract` jobs are per-guild serial (`maxPerGuild = 1`) — pipeline/event ordering is preserved — inside a global in-flight cap of 8.
+- **Claims lease** the row (`attempts+1`, `run_after = now()+10min`) so a row is never double-claimed; completion deletes it, failure reschedules with exponential backoff, and a crashed worker's job becomes claimable again when the lease expires. `attempts ≥ 5` dead-letters (row kept for inspection, never claimed).
+- **Wake:** `pg_notify('jobs', …)` on enqueue + `LISTEN` in the worker; a 3s poll is the resilient baseline so a missed notification costs one poll.
+- **Sweep integration:** the 15-min missed-signal sweep keeps its `triageBatch` role but enqueues durable verdicts into the same queue (marking `queued`) rather than extracting inline — one extraction path, one set of semantics.
+- **Worker handler** (`extract-job.ts`, deps injected for testability): alias-learn → per-image `describeImage` → `extractMemories` → consent-gated `persistExtraction` → terminal `extracted` triage mark → `runContestCheck` → `pipeline.process`. A guild that went dormant between enqueue and claim drops the job (`jobs.dropped_dormant`).
+
+### Per-guild LLM budget
+
+`brains.ts` wraps every constructed `OpenAI` client in `meteredClient` (`budget.ts`) — the Phase-1 `LlmClient` seam, so BYOK, env-fallback, and guarded-fetch paths all meter identically. Each `responses.create`/`chat.completions.create` first runs `chargeLlmCall` — an atomic `INSERT … ON CONFLICT` on `guild_usage (guild_id, day)` gated by `llm_calls < llm_daily_cap`. At/over cap → `BudgetExceeded`: the worker reschedules the job to next UTC midnight **without** burning an attempt; the reply path posts a one-per-channel-per-day notice instead of going silent. `cap = 0` blocks every call; `/limits` sets the cap; `/status` shows today's usage.
+
+### Ignored channels
+
+`server_settings.ignored_channels` (`/ignore-channel`, `/unignore-channel`, listed in `/memory-settings`) makes a channel fully invisible: `handleMessage` returns before `recordMessage`/`brainFor`/member writes, the sweep filters archived rows from ignored channels, and `runServerIngest` early-returns — so `/server-build` never scans one either.
+
+### Cross-guild isolation
+
+`isolation.test.ts` is the dedicated proof: every store read path and every command surface is invoked as guild A against a seeded guild B and must return A's rows only (or a refusal) — including `jobs`/`guild_usage`/`guild_keys` and `purgeGuild` scoping.
 
 ## Proactive speaking (v1: stranded questions)
 

@@ -18,7 +18,7 @@ export function makeTestSql() {
 export async function clearData(sql: ReturnType<typeof postgres>) {
   // Truncate data tables only — schema_migrations is NOT truncated so runMigrations stays idempotent.
   // Use CASCADE to handle FK constraints; RESTART IDENTITY resets sequences.
-  await sql`TRUNCATE TABLE profile_attributes, profiles, relationships, relationship_observations, members, event_memories, event_messages, event_participants, events, behavioral_patterns, memory_history, memory_evidence, server_settings, memories, messages, guild_keys, unresolved_names, alias_candidates RESTART IDENTITY CASCADE`;
+  await sql`TRUNCATE TABLE profile_attributes, profiles, relationships, relationship_observations, members, event_memories, event_messages, event_participants, events, behavioral_patterns, memory_history, memory_evidence, server_settings, memories, messages, guild_keys, unresolved_names, alias_candidates, jobs, guild_usage RESTART IDENTITY CASCADE`;
 }
 
 /** Create a MemoryStore + EventStore pair backed by the given sql connection and wipe all data. */

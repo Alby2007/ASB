@@ -71,9 +71,12 @@ Administrators can adjust per-server behaviour at runtime without restarting the
 | `/memory-pause` | Sets `memory_enabled=0` and `reply_enabled=0`. The bot stops observing and replying immediately. |
 | `/memory-resume` | Sets both back to 1. |
 | `/proactive enabled:<true|false>` | Sets `proactive_enabled` for this server. Off by default and independently required alongside the global `PROACTIVE=1` env flag — unprompted speech is a different risk profile than replying when addressed, so both must explicitly opt in. |
-| `/memory-settings` | Shows current values of `memory_enabled`, `reply_enabled`, `proactive_enabled`, and `raw_retention_days`. |
+| `/memory-settings` | Shows current values of `memory_enabled`, `reply_enabled`, `proactive_enabled`, `raw_retention_days`, `llm_daily_cap`, and the `ignored_channels` list. |
+| `/limits daily_cap:N` | Sets `llm_daily_cap` — the per-guild LLM-call budget per UTC day (default 1000, range 0–100000). `0` blocks every LLM call for the guild; usage resets at UTC midnight. Deferrable work (extract jobs) reschedules to the next day rather than failing; a reply-path call at cap posts a one-per-channel-per-day notice. |
+| `/ignore-channel channel:#c` | Adds a channel to `ignored_channels` — fully invisible to the bot: no archiving, no replies, no member writes, no `/server-build` scans. |
+| `/unignore-channel channel:#c` | Removes a channel from `ignored_channels`. |
 | `/memory-purge older_than_days:N` | Manually deletes raw messages older than N days for this server (regardless of the global retention setting). |
-| `/status` | Shows bot uptime and in-process operational counters (LLM errors, contest misses, memories saved). |
+| `/status` | Shows bot uptime, in-process operational counters, and today's LLM usage vs the guild's cap. |
 | `/memory-triage` | Shows the 15 most recently stored memories across all members, with status, kind, and subject. |
 
 ### How runtime settings interact with env variables
@@ -82,6 +85,11 @@ Administrators can adjust per-server behaviour at runtime without restarting the
 - `RAW_MESSAGE_RETENTION_DAYS` sets the initial default for new guilds. Once a guild row exists in `server_settings`, the `raw_retention_days` column is the authoritative value for that guild.
 - `reply_enabled` is checked before `SPEAK_THRESHOLD`. A paused server will never receive a reply even if the score exceeds the threshold.
 - `proactive_enabled` requires `PROACTIVE=1` globally AND the per-server flag — double opt-in. Either switch independently suppresses the entire feature. Proactive answers draw only on `server_lore` memories and promoted events; `person_fact`/`person_preference` memories are excluded at the query layer, so the bot never volunteers personal facts unprompted. |
+- `llm_daily_cap` bounds a guild's total LLM spend per UTC day — every call through the guild's resolved `Brain` (extraction, triage, replies, verification, tools) charges `guild_usage` atomically before executing. `0` means "no LLM calls at all"; archived messages still record, they just queue for extraction until the cap resets.
+
+### Job queue (fixed parameters)
+
+Deferrable cognition (memory extraction, contest checks, event-pipeline processing) runs on a Postgres-backed queue rather than inside the live message handler. The constants are compile-time in `src/jobs.ts`, not env-configurable: global in-flight cap **8**, per-guild concurrency **1** (preserves event ordering), 3-second poll with `LISTEN`/`NOTIFY` wake hints, 10-minute claim lease, exponential backoff, dead-letter at **5** attempts. Jobs that hit `BudgetExceeded` reschedule to the next UTC midnight without consuming an attempt.
 
 ---
 

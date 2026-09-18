@@ -451,6 +451,49 @@ const migrations: Migration[] = [
       await sql`ALTER TABLE server_settings DROP COLUMN IF EXISTS announced_at`;
     },
   },
+  {
+    version: 17,
+    name: "v17_scale_rails",
+    // Deferrable cognition moves off the live message path into a Postgres job
+    // queue ('extract' is the only type for now). Claims are UPDATE..RETURNING
+    // inside a tx (FOR UPDATE SKIP LOCKED), so a crashed worker can't hold
+    // claims — no locked_at needed. attempts >= 5 dead-letters by exclusion
+    // from the claim index (rows stay inspectable, nothing is deleted).
+    // guild_usage meters LLM calls per guild per UTC day; llm_daily_cap is the
+    // per-guild bound enforced by the metered client in brains.ts.
+    // ignored_channels: channels the bot treats as fully invisible — no
+    // archive, no replies, no member writes, excluded from server-build scans.
+    up: async (sql) => {
+      await sql`
+        CREATE TABLE IF NOT EXISTS jobs (
+          id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          guild_id   TEXT NOT NULL,
+          type       TEXT NOT NULL,
+          payload    JSONB NOT NULL,
+          run_after  TIMESTAMPTZ NOT NULL DEFAULT now(),
+          attempts   INTEGER NOT NULL DEFAULT 0,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `;
+      await sql`CREATE INDEX IF NOT EXISTS jobs_claim ON jobs(run_after) WHERE attempts < 5`;
+      await sql`
+        CREATE TABLE IF NOT EXISTS guild_usage (
+          guild_id  TEXT NOT NULL,
+          day       DATE NOT NULL,
+          llm_calls INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (guild_id, day)
+        )
+      `;
+      await sql`ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS ignored_channels TEXT[] NOT NULL DEFAULT '{}'`;
+      await sql`ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS llm_daily_cap INTEGER NOT NULL DEFAULT 1000`;
+    },
+    down: async (sql) => {
+      await sql`DROP TABLE IF EXISTS jobs`;
+      await sql`DROP TABLE IF EXISTS guild_usage`;
+      await sql`ALTER TABLE server_settings DROP COLUMN IF EXISTS ignored_channels`;
+      await sql`ALTER TABLE server_settings DROP COLUMN IF EXISTS llm_daily_cap`;
+    },
+  },
 ];
 
 /** Highest known migration version — tests assert against this instead of a

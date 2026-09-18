@@ -47,7 +47,16 @@ export const commandDefinitions = [
   { name: "server-build", description: "Admin: run the server-level historical build on a channel", default_member_permissions: PermissionFlagsBits.ManageGuild.toString(), options: [
     { name: "channel", description: "Text channel to build from (defaults to the configured ingest channel)", type: 7, required: false }
   ] },
-  { name: "setup", description: "Admin: configure this server's LLM API key (BYOK)", default_member_permissions: PermissionFlagsBits.ManageGuild.toString() }
+  { name: "setup", description: "Admin: configure this server's LLM API key (BYOK)", default_member_permissions: PermissionFlagsBits.ManageGuild.toString() },
+  { name: "limits", description: "Admin: set this server's daily LLM-call cap", default_member_permissions: PermissionFlagsBits.ManageGuild.toString(), options: [
+    { name: "daily_cap", description: "Max LLM calls per day, 0–100000 — 0 blocks all calls (resets at midnight UTC)", type: 4, required: true }
+  ] },
+  { name: "ignore-channel", description: "Admin: make ASB fully ignore a channel — no archive, no replies", default_member_permissions: PermissionFlagsBits.ManageGuild.toString(), options: [
+    { name: "channel", description: "Channel to ignore", type: 7, required: true }
+  ] },
+  { name: "unignore-channel", description: "Admin: restore a channel ASB was ignoring", default_member_permissions: PermissionFlagsBits.ManageGuild.toString(), options: [
+    { name: "channel", description: "Channel to restore", type: 7, required: true }
+  ] }
 ];
 
 const confidence = (value: number | undefined) => {
@@ -198,7 +207,16 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     const counterLines = Object.entries(counts).map(([k, v]) => `**${k}:** ${v.toLocaleString()}`).join("\n") || "No events recorded yet.";
     const settings = await store.settings(guildId);
     const proactiveLine = `**Proactive:** global ${config.proactiveEnabled ? "on" : "off"} · server ${settings.proactiveEnabled ? "on" : "off"}`;
-    return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setTitle("Bot status").setDescription(`**Uptime:** ${uptime}\n\n${counterLines}\n\n${proactiveLine}\n\n*${value.messages.toLocaleString()} raw messages · ${value.memories.toLocaleString()} active memories · ${value.lore.toLocaleString()} lore*`)] });
+    // Guild LLM posture: which key serves this server, whether it verified,
+    // today's spend against the cap, and pending background work.
+    const keyRow = await store.getGuildKey(guildId);
+    const keyLine = keyRow
+      ? `**LLM key:** server key \`${keyRow.keyHint}\`${keyRow.validatedAt ? ` · verified ${new Date(keyRow.validatedAt).toLocaleDateString()}` : " · unverified"}`
+      : `**LLM key:** operator default${config.requireGuildKeys ? " (guild key required — none set, dormant)" : ""}`;
+    const [usage, depth] = await Promise.all([store.usageToday(guildId), store.queueDepth(guildId)]);
+    const budgetLine = `**LLM usage:** ${usage.toLocaleString()}/${settings.llmDailyCap.toLocaleString()} calls today · **queue:** ${depth} job${depth === 1 ? "" : "s"} pending`;
+    const flagsLine = `**Flags:** memory ${settings.memoryEnabled ? "on" : "paused"} · replies ${settings.replyEnabled ? "on" : "paused"} · ignored channels ${settings.ignoredChannels.length}`;
+    return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setTitle("Bot status").setDescription(`**Uptime:** ${uptime}\n\n${counterLines}\n\n${proactiveLine}\n${flagsLine}\n${keyLine}\n${budgetLine}\n\n*${value.messages.toLocaleString()} raw messages · ${value.memories.toLocaleString()} active memories · ${value.lore.toLocaleString()} lore*`)] });
   }
   if (interaction.commandName === "memory-triage") {
     if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content: "Only server administrators can triage memories.", ephemeral: true });
@@ -217,7 +235,35 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
   if (interaction.commandName === "memory-settings") {
     if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content: "Only server administrators can view settings.", ephemeral: true });
     const settings = await store.settings(guildId);
-    return interaction.reply({ content: `Memory collection: **${settings.memoryEnabled ? "on" : "paused"}**\nBot replies: **${settings.replyEnabled ? "on" : "paused"}**\nProactive speaking: **${settings.proactiveEnabled ? "on" : "off"}** (global flag: **${config.proactiveEnabled ? "on" : "off"}**)\nRaw-message retention: **${settings.rawRetentionDays} days**`, ephemeral: true });
+    const ignored = settings.ignoredChannels.length
+      ? settings.ignoredChannels.map(id => `<#${id}>`).join(", ")
+      : "none";
+    return interaction.reply({ content: `Memory collection: **${settings.memoryEnabled ? "on" : "paused"}**\nBot replies: **${settings.replyEnabled ? "on" : "paused"}**\nProactive speaking: **${settings.proactiveEnabled ? "on" : "off"}** (global flag: **${config.proactiveEnabled ? "on" : "off"}**)\nRaw-message retention: **${settings.rawRetentionDays} days**\nIgnored channels: ${ignored}\nDaily LLM cap: **${settings.llmDailyCap.toLocaleString()} calls**`, ephemeral: true });
+  }
+  if (interaction.commandName === "limits") {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content: "Only server administrators can change the LLM budget.", ephemeral: true });
+    const cap = interaction.options.getInteger("daily_cap", true);
+    if (cap < 0 || cap > 100000) return interaction.reply({ content: "The daily cap must be between **0** and **100,000** calls (0 blocks all LLM calls).", ephemeral: true });
+    await store.setDailyCap(guildId, cap);
+    return interaction.reply({ content: cap === 0
+      ? "Daily LLM cap set to **0** — all LLM calls for this server are now blocked until the cap is raised (usage resets at midnight UTC)."
+      : `Daily LLM cap set to **${cap.toLocaleString()} calls** for this server (resets at midnight UTC).`, ephemeral: true });
+  }
+  if (interaction.commandName === "ignore-channel" || interaction.commandName === "unignore-channel") {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content: "Only server administrators can change ignored channels.", ephemeral: true });
+    const channel = interaction.options.getChannel("channel", true);
+    const settings = await store.settings(guildId);
+    const ignored = new Set(settings.ignoredChannels);
+    if (interaction.commandName === "ignore-channel") {
+      if (ignored.has(channel.id)) return interaction.reply({ content: `<#${channel.id}> is already ignored.`, ephemeral: true });
+      ignored.add(channel.id);
+      await store.setIgnoredChannels(guildId, [...ignored]);
+      return interaction.reply({ content: `<#${channel.id}> is now invisible to ASB — nothing there is archived, answered, or scanned by \`/server-build\`. Restore it with \`/unignore-channel\`.`, ephemeral: true });
+    }
+    if (!ignored.has(channel.id)) return interaction.reply({ content: `<#${channel.id}> isn't ignored.`, ephemeral: true });
+    ignored.delete(channel.id);
+    await store.setIgnoredChannels(guildId, [...ignored]);
+    return interaction.reply({ content: `<#${channel.id}> is visible to ASB again — messages there are archived and answered normally.`, ephemeral: true });
   }
   if (interaction.commandName === "event") {
     if (!evStore) return interaction.reply({ content: "Event inspection is not available right now.", ephemeral: true });
@@ -406,6 +452,12 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     const channel = (channelOpt ?? interaction.guild?.channels.cache.find(c => c.name === config.ingestChannel && c.type === ChannelType.GuildText)) ?? null;
     if (!channel || channel.type !== ChannelType.GuildText) {
       return interaction.reply({ content: "Pick a text channel to build from (or set INGEST_CHANNEL and omit the option).", ephemeral: true });
+    }
+    // Ignored means invisible — a historical scan over an ignored channel
+    // would archive exactly what the admin excluded.
+    const buildSettings = await store.settings(guildId);
+    if (buildSettings.ignoredChannels.includes(channel.id)) {
+      return interaction.reply({ content: `<#${channel.id}> is on the ignored list — nothing there is archived. Restore it with \`/unignore-channel\` first if you really want to scan it.`, ephemeral: true });
     }
     // Consent gate — this scans and archives channel history, including
     // messages written before the bot arrived by people who never consented

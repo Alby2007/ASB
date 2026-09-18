@@ -60,8 +60,10 @@ All replies are ephemeral (private to the invoker) unless noted.
 | `/memory-triage` | Newest memories across all members + contested attributes |
 | `/memory-purge` | Purge raw archived messages older than N days |
 | `/memory-pause` / `/memory-resume` | Stop/restart observing and replying — archiving included |
-| `/memory-settings` | Show effective guild settings |
-| `/status` | Uptime, error counters, pipeline health |
+| `/memory-settings` | Show effective guild settings (including the ignored-channel list and daily LLM cap) |
+| `/ignore-channel` / `/unignore-channel` | Exclude a channel entirely — no archiving, no replies, no member writes, no `/server-build` scans |
+| `/limits` | Set this server's daily LLM-call cap (0 = block all calls; usage resets each UTC day) |
+| `/status` | Uptime, error counters, pipeline health, today's LLM usage vs cap |
 | `/server-build` | Backfill a channel's history — asks for an explicit confirm click first, since it archives messages from people who never consented (owner/admin only; archives + lore + events for everyone, derived person data for opted-in members only) |
 | `/setup` | Configure this server's own LLM API key via a secure modal (BYOK — the key is encrypted at rest and pays for this server's cognition; re-run to rotate) |
 

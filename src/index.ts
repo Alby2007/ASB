@@ -5,15 +5,14 @@ import { sql } from "./db.js";
 import { MemoryStore } from "./database.js";
 import { createBrainResolver, guardedLlmFetch } from "./brains.js";
 import { commandDefinitions, handleMemoryButton, handleMemoryCommand, handleSetupModal } from "./commands.js";
-import { detectDismissal, detectNamingRequest, detectSelfNaming, detectWakeWord, questionKeywords, roomAddressCue, shouldInspectForMemory, toolCues } from "./perception.js";
+import { detectDismissal, detectWakeWord, questionKeywords, roomAddressCue, shouldInspectForMemory, toolCues } from "./perception.js";
 import { EngagementTracker } from "./engagement.js";
 import { ProactiveScheduler } from "./proactive.js";
-import { runContestCheck } from "./contest.js";
 import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
 import { ProfileStore } from "./profiles.js";
 import { buildAliasMap, demangleMentions, findMentionedUsers, scrubMentions, type AliasMap } from "./entity-resolution.js";
-import { persistExtraction } from "./persist-extraction.js";
+import { enqueue, startWorker } from "./jobs.js";
 import { buildPairContext, type ToolCtx } from "./lookup-tools.js";
 import { qualifyingImages, formatImageContext, IMAGE_MAX_PER_MESSAGE, type AttachmentMeta } from "./vision.js";
 import { withRetry } from "./retry.js";
@@ -21,6 +20,8 @@ import { inc } from "./metrics.js";
 import { logError, redactSecrets, registerSecret, validateLlmKey } from "./secrets.js";
 import { announceIfNeeded, handleGuildDelete } from "./guild-lifecycle.js";
 import { isSafeUrl } from "./tools.js";
+import { BudgetExceeded, meteredClient } from "./budget.js";
+import { runExtractJob, type ExtractJobPayload } from "./extract-job.js";
 import type { MessageEvent, PairContext } from "./types.js";
 
 // Register every credential before any code path can log it — redactSecrets
@@ -55,6 +56,12 @@ const { brainFor, invalidate: invalidateBrain } = createBrainResolver({
   requireGuildKeys: config.requireGuildKeys,
   markValidated: guildId => store.markGuildKeyValidated(guildId),
   revalidate: async (key, baseUrl) => (await validateLlmKey(key, baseUrl, guardedLlmFetch)).ok,
+  // Every LLM call a guild makes — BYOK or env key — charges its daily budget.
+  // getCap reads settings() (60s cache — fine for a daily bound).
+  meter: (guildId, c) => meteredClient(c, {
+    guildId, store,
+    getCap: async () => (await store.settings(guildId, config.rawMessageRetentionDays)).llmDailyCap,
+  }),
 });
 // Vision can live on a different provider than the main key (e.g. Gemini's
 // free tier, since Groq rotated its vision models off) — a second client is
@@ -87,11 +94,18 @@ proactive.setFireHandler((key, messageId) => {
 let store: MemoryStore;
 let eventStore: EventStore;
 let profileStore: ProfileStore;
+let worker: { stop: () => Promise<void> } | undefined;
 
 async function init() {
   store = await MemoryStore.create();
   eventStore = new EventStore();
   profileStore = new ProfileStore();
+  // Deferrable cognition runs here — extract jobs claimed per-guild-serial,
+  // global cap 8. LISTEN 'jobs' for wake hints, 3s poll as the baseline.
+  worker = startWorker({
+    sql, handle: job => runExtractJob(job.payload as ExtractJobPayload, extractDeps),
+    onError: (m, e) => logError(m, e),
+  });
 }
 
 client.once(Events.ClientReady, async ready => {
@@ -261,7 +275,6 @@ setInterval(() => applyRetention().catch(error => { inc("maintenance.error"); lo
 const SWEEP_INTERVAL_MS = 15 * 60_000;
 const SWEEP_WINDOW_MS = 2 * 60 * 60_000;
 const SWEEP_TRIAGE_BATCH = 10;
-const SWEEP_EXTRACT_BATCH = 5;
 
 setInterval(() => sweepMissedSignals(SWEEP_WINDOW_MS), SWEEP_INTERVAL_MS).unref();
 
@@ -269,10 +282,10 @@ setInterval(() => sweepMissedSignals(SWEEP_WINDOW_MS), SWEEP_INTERVAL_MS).unref(
 // this sweep gives it the same LLM triage ingest already uses, so durable
 // preferences in unpatterned phrasing ("can you just call me Riley from now on",
 // said to nobody in particular) still land within ~15 minutes. Marks persist on
-// messages.triage_result, so each message is classified once; a durable or
-// regex verdict with no evidence is re-extracted on the next pass (crash-safe),
-// and 'extracted' marks the terminal state so empty results don't re-extract
-// forever.
+// messages.triage_result, so each message is classified once; durable/regex
+// verdicts enqueue 'extract' jobs and flip to 'queued' (a failed enqueue keeps
+// the mark so the next pass retries — crash-safe), and 'extracted' marks the
+// terminal state so empty results don't re-extract forever.
 async function sweepMissedSignals(windowMs: number) {
   for (const guild of client.guilds.cache.values()) {
     try {
@@ -281,7 +294,8 @@ async function sweepMissedSignals(windowMs: number) {
       // No key → nothing to triage or extract with — skip the guild entirely.
       const brain = await brainFor(guild.id);
       if (!brain) continue;
-      const pending = await store.listUninspectedMessages(guild.id, new Date(Date.now() - windowMs), client.user!.id);
+      const pending = (await store.listUninspectedMessages(guild.id, new Date(Date.now() - windowMs), client.user!.id))
+        .filter(m => !settings.ignoredChannels.includes(m.channelId)); // ignored = invisible, including rows archived before the flag
       if (!pending.length) continue;
       const toEvent = (m: (typeof pending)[number]): MessageEvent => ({
         guildId: guild.id, channelId: m.channelId, messageId: m.id,
@@ -290,15 +304,15 @@ async function sweepMissedSignals(windowMs: number) {
         mentionsBot: m.content.includes(`<@${client.user!.id}>`) || m.content.includes(`<@!${client.user!.id}>`),
       });
       const marks: Array<{ id: string; result: string }> = [];
-      const queue: Array<{ event: MessageEvent; replyToId?: string; replyToContent?: string; note?: string }> = [];
+      const toEnqueue: Array<{ event: MessageEvent; replyToId?: string }> = [];
       const triageQueue: typeof pending = [];
       for (const m of pending) {
         const event = toEvent(m);
         if (m.triageResult === "durable" || m.triageResult === "regex") {
-          queue.push({ event, replyToId: m.replyToId ?? undefined }); // marked earlier but never extracted
+          toEnqueue.push({ event, replyToId: m.replyToId ?? undefined }); // marked earlier but never extracted
         } else if (shouldInspectForMemory(event)) {
           marks.push({ id: m.id, result: "regex" });
-          queue.push({ event, replyToId: m.replyToId ?? undefined });
+          toEnqueue.push({ event, replyToId: m.replyToId ?? undefined });
         } else if (m.content.trim().length >= 4) {
           triageQueue.push(m);
         } else {
@@ -315,56 +329,31 @@ async function sweepMissedSignals(windowMs: number) {
           for (const item of batch) {
             const durable = verdicts.get(item.id)?.durable ?? false;
             marks.push({ id: item.id, result: durable ? "durable" : "noise" });
-            if (durable) queue.push({ event: toEvent(item), replyToId: item.replyToId ?? undefined });
+            if (durable) toEnqueue.push({ event: toEvent(item), replyToId: item.replyToId ?? undefined });
           }
         } catch { /* batch stays unmarked — next sweep retries it */ }
       }
-      // Persist marks before extraction: durable marks survive a crash and are
-      // picked back up on the next pass via the no-evidence filter.
+      // Persist marks before enqueueing: durable/regex marks survive a crash
+      // and are picked back up on the next pass via the no-evidence filter.
       await store.setTriageResults(marks);
-      if (!queue.length) continue;
-      const members = await store.listMembers(guild.id);
-      // Opt-in consent: derived data persists only for members who asked for it.
-      const optedIn = new Set(members.filter(m => m.optedIn && !m.optedOut).map(m => m.userId));
-      if (client.user) optedIn.add(client.user.id); // the bot is a willing subject
-      const isConsented = (id: string) => id === "unknown" || id === "server" || optedIn.has(id);
-      const memberNames = new Map(members.map(m => [m.userId, m.knownNames]));
-      const aliases = await buildAliasMap(guild.id, store);
-      for (let i = 0; i < queue.length; i += SWEEP_EXTRACT_BATCH) {
-        const batch = queue.slice(i, i + SWEEP_EXTRACT_BATCH);
-        for (const item of batch) {
-          if (item.replyToId) {
-            const ref = await store.getMessage(guild.id, item.replyToId);
-            if (ref) item.replyToContent = `${ref.authorName}: ${ref.content}`;
-          }
-          // Alias learning must not be live-path-only: naming requests archived
-          // while the bot was down (or on an older build) reach the sweep only
-          // through this queue. Mirror the live order — explicit request first.
-          const authorNames = memberNames.get(item.event.authorId) ?? [item.event.authorName];
-          const requested = detectNamingRequest(item.event.content, authorNames);
-          const named = requested ?? detectSelfNaming(item.event.content, authorNames);
-          if (named) {
-            await store.learnAlias(guild.id, item.event.authorId, named, requested ? "naming_request" : "self_naming", item.event.messageId);
-            memberNames.set(item.event.authorId, [...authorNames, named]);
-            aliases.set(named.toLowerCase(), item.event.authorId);
-            item.note = requested
-              ? `the author asked to be called "${requested}" — treat it as their preferred name`
-              : `the author may be naming themselves "${named}" (a previously unknown alias) or quoting/describing "${named}" — attribute accordingly`;
-          }
+      if (!toEnqueue.length) continue;
+      // Extraction defers to the job queue — the sweep's role is triage, and
+      // routing through the queue gets per-guild serial execution, backoff,
+      // and budget-aware rescheduling for free. A failed enqueue leaves the
+      // durable mark in place so the next pass retries.
+      const queuedMarks: Array<{ id: string; result: string }> = [];
+      for (const item of toEnqueue) {
+        let replyToContent: string | undefined;
+        if (item.replyToId) {
+          const ref = await store.getMessage(guild.id, item.replyToId);
+          if (ref) replyToContent = `${ref.authorName}: ${ref.content}`;
         }
         try {
-          const results = await withRetry(() => brain.extractMemoriesBatch(batch, config.ingestModel ?? config.model), 3);
-          for (const item of batch) {
-            const result = results.get(item.event.messageId) ?? { memories: [], relationships: [] };
-            await persistExtraction(result, item.event, { store, aliases, isConsented });
-          }
-          // Terminal mark: the batch returned and every item was processed, so
-          // these messages never qualify for re-extraction — even the ones that
-          // legitimately yielded nothing. A throw anywhere above leaves them
-          // 'durable'/'regex', which the no-evidence filter retries next pass.
-          await store.setTriageResults(batch.map(item => ({ id: item.event.messageId, result: "extracted" })));
-        } catch (error) { inc("sweep.extract_error"); logError("Sweep extraction failed", error); }
+          await enqueue(sql, guild.id, "extract", { event: item.event, replyToId: item.replyToId, replyToContent });
+          queuedMarks.push({ id: item.event.messageId, result: "queued" });
+        } catch (error) { inc("jobs.enqueue_error"); logError("Sweep enqueue failed", error); }
       }
+      if (queuedMarks.length) await store.setTriageResults(queuedMarks);
       inc("sweep.runs");
     } catch (error) { inc("sweep.error"); logError(`Missed-signal sweep failed in ${guild.name}`, error); }
   }
@@ -442,6 +431,17 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
 const lookupCache = new Map<string, { map: AliasMap; names: Map<string, string>; at: number }>();
 const LOOKUP_TTL_MS = 5 * 60_000;
 
+// BudgetExceeded on the reply path → one short notice per channel per UTC
+// day: silence on a direct request is rude, spam is worse. In-memory —
+// a restart re-noticing once is harmless.
+const budgetNotices = new Set<string>();
+function budgetNoticeOnce(channelId: string): boolean {
+  const key = `${channelId}:${new Date().toISOString().slice(0, 10)}`;
+  if (budgetNotices.has(key)) return false;
+  budgetNotices.add(key);
+  return true;
+}
+
 async function guildLookups(guildId: string): Promise<{ map: AliasMap; names: Map<string, string> }> {
   const cached = lookupCache.get(guildId);
   if (cached && Date.now() - cached.at < LOOKUP_TTL_MS) return cached;
@@ -453,6 +453,24 @@ async function guildLookups(guildId: string): Promise<{ map: AliasMap; names: Ma
   lookupCache.set(guildId, entry);
   return entry;
 }
+
+// The extract-job handler lives in extract-job.ts (deps injected) so it's
+// unit-testable — index.ts can't be imported (it logs in on load). The worker
+// deps bind this process's live singletons; getAliases/invalidateLookups close
+// over the TTL lookup cache.
+const extractDeps = {
+  get store() { return store; },
+  brainFor,
+  get eventStore() { return eventStore; },
+  pipeline,
+  get botId() { return client.user!.id; },
+  get visionModel() { return config.visionModel; },
+  visionClient,
+  get contestModel() { return config.contestModel ?? config.model; },
+  get imageMaxBytes() { return config.imageMaxBytes; },
+  getAliases: (guildId: string) => guildLookups(guildId).then(e => e.map),
+  invalidateLookups: (guildId: string) => { lookupCache.delete(guildId); },
+};
 
 /**
  * A pending question's timer survived — the room stayed silent. Re-verify
@@ -533,6 +551,9 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   // sweep skips paused guilds anyway, so archive-during-pause rows would be
   // orphaned the moment they're written.
   if (!settings.memoryEnabled && !settings.replyEnabled) return;
+  // Ignored channels are truly invisible: no archive, no replies, no member
+  // writes — checked before brainFor/recordMessage so nothing at all happens.
+  if (settings.ignoredChannels.includes(event.channelId)) return;
   // BYOK dormant guild: no key → no archive, no reply — everything below
   // (extraction, contest, pipeline, decide, reply) binds this guild's brain.
   const brain = await brainFor(event.guildId);
@@ -547,7 +568,6 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     if (settings.memoryEnabled) await store.setTriageResults([{ id: event.messageId, result: "noise" }]);
     return;
   }
-  const savedMemoryIds: number[] = [];
   let replyToContent: string | undefined;
   if (replyToId) {
     const ref = await store.getMessage(event.guildId, replyToId);
@@ -559,9 +579,6 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
       if (live) replyToContent = `${live.member?.displayName ?? live.author.username}: ${live.content}`;
     }
   }
-  // The alias map is built lazily on first use so ordinary chatter costs no extra queries.
-  let aliasMap: Promise<AliasMap> | undefined;
-  const getAliasMap = () => (aliasMap ??= guildLookups(event.guildId).then(e => e.map));
   // Per-image describe, per-image fault tolerance — a dead URL or a 429 skips
   // that image, never the message's text. Memoized so extraction and the reply
   // path share one describe pass for the same message.
@@ -575,66 +592,17 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     })).then(list => list.filter((d): d is string => !!d));
   let imageDescs: Promise<string[]> | undefined;
   const getImageDescriptions = () => (imageDescs ??= describeImages(images));
+  // Extraction, contest detection, and the event pipeline all defer to the
+  // 'extract' job — the live path keeps only recordMessage/decide/reply so a
+  // busy guild can't stack unbounded concurrent LLM calls inside one handler.
+  // 'queued' marks the row so the sweep (NULL/'durable'/'regex' only) can't
+  // double-extract; a dead job just stays 'queued' — bounded loss, metric'd.
   if (settings.memoryEnabled && (shouldInspectForMemory(event) || images.length)) {
     try {
-      // Naming signals: "call me Riley" is an explicit request (strong);
-      // "I am Sage" from a non-matching name is a pasted/quoted-bio tell (weak).
-      const member = await store.getMember(event.guildId, event.authorId);
-      const authorNames = member?.knownNames ?? [event.authorName];
-      const requested = detectNamingRequest(event.content, authorNames);
-      const named = requested ?? detectSelfNaming(event.content, authorNames);
-      // An unknown self-name is the bot's alias-learning signal: "I am Sage"
-      // posted by nightowl teaches sage → nightowl.
-      if (named) {
-        await store.learnAlias(event.guildId, event.authorId, named, requested ? "naming_request" : "self_naming", event.messageId);
-        lookupCache.delete(event.guildId); // so this message resolves the new alias
-      }
-      const note = requested
-        ? `the author asked to be called "${requested}" — treat it as their preferred name`
-        : named ? `the author may be naming themselves "${named}" (a previously unknown alias) or quoting/describing "${named}" — attribute accordingly` : undefined;
-      const imageContext = images.length
-        ? formatImageContext(await getImageDescriptions(), event.authorName) || undefined
-        : undefined;
-      const { memories: candidates, relationships } = await withRetry(() => brain.extractMemories(event, replyToContent, note, imageContext), 3);
-      const aliases = (candidates.length || relationships.length) ? await getAliasMap() : new Map<string, string>();
-      // Derived data is opt-in: person memories and relationship observations
-      // persist only for consenting members (raw archive is unaffected — that's
-      // covered by message retention, not consent). The bot itself is treated
-      // as consented so the room's claims about it stay memorable.
-      const consentCache = new Map<string, boolean>();
-      const isConsented = async (userId: string) => {
-        if (userId === "unknown" || userId === "server" || userId === client.user!.id) return true;
-        const cached = consentCache.get(userId);
-        if (cached !== undefined) return cached;
-        const m = await store.getMember(event.guildId, userId);
-        const ok = !!m?.optedIn && !m.optedOut;
-        consentCache.set(userId, ok);
-        return ok;
-      };
-      const { savedIds } = await persistExtraction(
-        { memories: candidates, relationships },
-        event,
-        { store, aliases, isConsented, onMemorySaved: () => inc("memory.saved") }
-      );
-      savedMemoryIds.push(...savedIds);
-      // Terminal mark: extraction ran to completion, even if it yielded
-      // nothing — without this a zero-yield regex message gets one redundant
-      // sweep pass before ingest-side marking would catch it.
-      await store.setTriageResults([{ id: event.messageId, result: "extracted" }]);
-    } catch (error) { inc("llm.extract_error"); logError("Memory extraction failed", error); }
-  }
-  // Contest detection: bot-addressed denials/corrections update the memories they target
-  if (settings.memoryEnabled) {
-    try {
-      await runContestCheck(event, brain, store, client.user!.id, config.contestModel ?? config.model);
-    } catch (error) { inc("contest.error"); logError("Contest check failed", error); }
-  }
-  // v0.2: event detection pipeline (runs regardless of whether memories were extracted,
-  // so back-references and reply chains are tracked even for ordinary messages)
-  if (settings.memoryEnabled) {
-    try {
-      await pipeline.process(event, savedMemoryIds, eventStore, store, brain, replyToId);
-    } catch (error) { inc("pipeline.error"); logError("Event pipeline failed", error); }
+      await enqueue(sql, event.guildId, "extract", { event, replyToId, replyToContent });
+      await store.setTriageResults([{ id: event.messageId, result: "queued" }]);
+      inc("jobs.enqueued");
+    } catch (error) { inc("jobs.enqueue_error"); logError("Extraction enqueue failed", error); }
   }
 
   const key = `${event.guildId}:${event.channelId}`;
@@ -762,7 +730,16 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
       // never a memory source — keep it out of the sweep's extraction set.
       await store.setTriageResults([{ id: sent.id, result: "noise" }]);
     }
-  } catch (error) { inc("llm.reply_error"); logError("Reply generation failed", error); }
+  } catch (error) {
+    if (error instanceof BudgetExceeded) {
+      inc("budget.reply_blocked");
+      if (budgetNoticeOnce(event.channelId)) {
+        await message.reply({ content: "I've hit this server's daily LLM limit, so I can't respond right now — it resets at midnight UTC. An admin can raise it with `/limits`.", allowedMentions: { parse: [], repliedUser: false } }).catch(() => {});
+      }
+      return;
+    }
+    inc("llm.reply_error"); logError("Reply generation failed", error);
+  }
 }
 
 // Graceful shutdown — close the Discord socket and the pg pool cleanly so
@@ -770,6 +747,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, async () => {
     console.log(`Received ${sig}, shutting down`);
+    await worker?.stop(); // finish in-flight jobs, claim nothing new
     client.destroy();
     await sql.end();
     process.exit(0);

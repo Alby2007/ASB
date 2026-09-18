@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import { Agent, fetch as undiciFetch } from "undici";
-import { Brain } from "./brain.js";
+import { Brain, type LlmClient } from "./brain.js";
 import { decryptSecret, errorText } from "./secrets.js";
 import { inc } from "./metrics.js";
 import { isPrivateAddress, safeLookup } from "./tools.js";
@@ -49,11 +49,16 @@ export function createBrainResolver(opts: {
   markValidated?: (guildId: string) => Promise<void>;
   /** Re-check a stored-unverified key; injectable for tests. */
   revalidate?: (key: string, baseUrl: string) => Promise<boolean>;
+  /** Wraps every constructed client — the budget meter hooks in here so ALL
+   * key sources (guild BYOK + env fallback) pay the guild's daily cap.
+   * Injectable so tests can observe/stub without a live counter. */
+  meter?: (guildId: string, client: LlmClient) => LlmClient;
 }) {
   const cache = new Map<string, Brain | null>();
 
   async function brainFor(guildId: string): Promise<Brain | null> {
     if (cache.has(guildId)) return cache.get(guildId)!;
+    const wrap = (c: LlmClient): LlmClient => opts.meter ? opts.meter(guildId, c) : c;
 
     let brain: Brain | null = null;
     const row = await opts.getKey(guildId);
@@ -62,8 +67,8 @@ export function createBrainResolver(opts: {
         const key = decryptSecret(row.keyEnc);
         const baseUrl = row.baseUrl ?? opts.envBaseUrl;
         brain = row.baseUrl
-          ? new Brain(key, opts.envModel, baseUrl, new OpenAI({ apiKey: key, baseURL: baseUrl, fetch: guardedLlmFetch }))
-          : new Brain(key, opts.envModel, baseUrl);
+          ? new Brain(key, opts.envModel, baseUrl, wrap(new OpenAI({ apiKey: key, baseURL: baseUrl, fetch: guardedLlmFetch })))
+          : new Brain(key, opts.envModel, baseUrl, wrap(new OpenAI({ apiKey: key, ...(baseUrl ? { baseURL: baseUrl } : {}) })));
         // Rows stored unverified (provider unreachable at /setup) get one
         // re-check per process — flips validated_at once the provider answers.
         if (!row.validatedAt && opts.markValidated && opts.revalidate) {
@@ -76,7 +81,8 @@ export function createBrainResolver(opts: {
         console.warn(`guild_keys decrypt failed for ${guildId} — guild dormant until /setup re-runs`, errorText(error));
       }
     } else if (opts.envKey && !opts.requireGuildKeys) {
-      brain = new Brain(opts.envKey, opts.envModel, opts.envBaseUrl);
+      brain = new Brain(opts.envKey, opts.envModel, opts.envBaseUrl,
+        wrap(new OpenAI({ apiKey: opts.envKey, ...(opts.envBaseUrl ? { baseURL: opts.envBaseUrl } : {}) })));
     }
 
     cache.set(guildId, brain);

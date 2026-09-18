@@ -65,6 +65,14 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
 
   let total = 0, archived = 0, batchCalls = 0, memoriesSaved = 0, eventsCreated = 0, llmErrors = 0, relationshipsRecorded = 0, durableFound = 0;
 
+  // Ignored channels are excluded from scans — /server-build checks before
+  // prompting, this is the belt for CLI/direct invocation.
+  const settings = await store.settings(guild.id, config.rawMessageRetentionDays);
+  if (settings.ignoredChannels.includes(channel.id)) {
+    console.log(`#${channel.name} is on the ignored list — skipping build`);
+    return { total, archived, durableFound, batchCalls, memoriesSaved, relationshipsRecorded, eventsCreated, llmErrors, profilesBuilt: 0 };
+  }
+
   /** Archive all messages. Returns the extraction queue (regex pass, no evidence)
    * and the triage queue (regex fail, no evidence, not yet triaged). */
   async function archiveAndFilter(msgs: RawMsg[]): Promise<{ toExtract: ExtractItem[]; toTriage: ExtractItem[] }> {
