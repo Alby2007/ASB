@@ -85,8 +85,14 @@ test("worker drains jobs, retries failures with backoff, and reschedules BudgetE
       assert.ok(new Date(failed.run_after).getTime() > Date.now(), "failure must push run_after forward");
       const capped = rows.find(r => r.payload.n === "capped")!;
       assert.equal(capped.attempts, 0, "BudgetExceeded must not burn an attempt");
-      const msToRun = new Date(capped.run_after).getTime() - Date.now();
-      assert.ok(msToRun > 60 * 60_000 && msToRun <= 24 * 60 * 60_000, "capped job reschedules to next UTC midnight");
+      // "Next UTC midnight" can be minutes away — asserting a minimum distance
+      // flakes between 23:00–24:00 UTC. Check the semantics instead: exactly a
+      // UTC midnight, within the next day (small negative tolerance in case the
+      // assert itself runs just past midnight).
+      const runAt = new Date(capped.run_after).getTime();
+      assert.equal(runAt % 86_400_000, 0, "run_after must land exactly on a UTC midnight");
+      const msToRun = runAt - Date.now();
+      assert.ok(msToRun > -60_000 && msToRun <= 24 * 60 * 60_000, "capped job reschedules to next UTC midnight");
     } finally { await worker.stop(); }
   } finally { await sql.end(); }
 });
