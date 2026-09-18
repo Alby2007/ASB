@@ -207,7 +207,7 @@ setInterval(() => sweepMissedSignals(SWEEP_WINDOW_MS), SWEEP_INTERVAL_MS).unref(
 
 // Live traffic that fails the durableSignals regex is never inspected inline —
 // this sweep gives it the same LLM triage ingest already uses, so durable
-// preferences in unpatterned phrasing ("can you just call me Alby from now on",
+// preferences in unpatterned phrasing ("can you just call me Riley from now on",
 // said to nobody in particular) still land within ~15 minutes. Marks persist on
 // messages.triage_result, so each message is classified once; a durable or
 // regex verdict with no evidence is re-extracted on the next pass (crash-safe),
@@ -507,14 +507,14 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   const getImageDescriptions = () => (imageDescs ??= describeImages(images));
   if (settings.memoryEnabled && (shouldInspectForMemory(event) || images.length)) {
     try {
-      // Naming signals: "call me Alby" is an explicit request (strong);
+      // Naming signals: "call me Riley" is an explicit request (strong);
       // "I am Sage" from a non-matching name is a pasted/quoted-bio tell (weak).
       const member = await store.getMember(event.guildId, event.authorId);
       const authorNames = member?.knownNames ?? [event.authorName];
       const requested = detectNamingRequest(event.content, authorNames);
       const named = requested ?? detectSelfNaming(event.content, authorNames);
       // An unknown self-name is the bot's alias-learning signal: "I am Sage"
-      // posted by tinyriot teaches sage → tinyriot.
+      // posted by nightowl teaches sage → nightowl.
       if (named) {
         await store.learnAlias(event.guildId, event.authorId, named, requested ? "naming_request" : "self_naming", event.messageId);
         lookupCache.delete(event.guildId); // so this message resolves the new alias

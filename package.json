@@ -1,7 +1,16 @@
 {
   "name": "artificial-server-member",
   "version": "0.1.0",
+  "description": "A Discord bot that hangs out like a member — server lore for everyone, opt-in personal memory.",
+  "license": "MIT",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Alby2007/ASB.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",

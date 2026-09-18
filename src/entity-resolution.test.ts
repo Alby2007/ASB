@@ -26,9 +26,9 @@ test("resolveSubject passes through <@ID> mentions and raw IDs", () => {
 });
 
 test("resolveSubject resolves a written name via the alias map", () => {
-  const map = alias([["Starz", "u-starz"]]);
-  assert.equal(resolveSubject({ subjectId: "unknown", subjectName: "Starz" }, map, msg("Starz is a Muslim")), "u-starz");
-  assert.equal(resolveSubject({ subjectName: "starz" }, map, msg("x")), "u-starz");
+  const map = alias([["Nova", "u-nova"]]);
+  assert.equal(resolveSubject({ subjectId: "unknown", subjectName: "Nova" }, map, msg("Nova is a Buddhist")), "u-nova");
+  assert.equal(resolveSubject({ subjectName: "nova" }, map, msg("x")), "u-nova");
 });
 
 test("resolveSubject resolves self-referential names to the author", () => {
@@ -42,10 +42,10 @@ test("resolveSubject returns unknown for unresolvable names and preserves server
 });
 
 test("findMentionedUsers matches longest names first and respects word boundaries", () => {
-  const map = alias([["al", "u-al"], ["alby", "u-alby"], ["tom", "u-tom"]]);
-  // "al" must not match inside "alby"
-  assert.deepEqual(findMentionedUsers("alby won again", map), ["u-alby"]);
-  assert.deepEqual(findMentionedUsers("al and tom are here", map).sort(), ["u-al", "u-tom"]);
+  const map = alias([["ri", "u-ri"], ["riley", "u-riley"], ["tom", "u-tom"]]);
+  // "ri" must not match inside "riley"
+  assert.deepEqual(findMentionedUsers("riley won again", map), ["u-riley"]);
+  assert.deepEqual(findMentionedUsers("ri and tom are here", map).sort(), ["u-ri", "u-tom"]);
   assert.deepEqual(findMentionedUsers("nobody mentioned", map), []);
 });
 
@@ -61,11 +61,11 @@ test("findMentionedUsers: a longer alias wins over a different user's prefix-wor
 });
 
 test("aliasKeyVariants expands nicknames: tokens ≥4 and first-token prefixes ≥4", () => {
-  assert.deepEqual(aliasKeyVariants("paarthurnax").sort(),
-    ["paar", "paart", "paarth", "paarthu", "paarthur", "paarthurn", "paarthurna", "paarthurnax"].sort());
+  assert.deepEqual(aliasKeyVariants("zephyrine").sort(),
+    ["zeph", "zephy", "zephyr", "zephyri", "zephyrin", "zephyrine"].sort());
   // Multi-token: full name + each long token + first-token prefixes
-  assert.deepEqual(aliasKeyVariants("Starz is a Muslim").sort(),
-    ["Starz is a Muslim", "Starz", "Muslim", "Star"].sort());
+  assert.deepEqual(aliasKeyVariants("Nova is a Buddhist").sort(),
+    ["Nova is a Buddhist", "Nova", "Buddhist"].sort());
   // Short names get no variants
   assert.deepEqual(aliasKeyVariants("al"), ["al"]);
   assert.deepEqual(aliasKeyVariants("  "), []);

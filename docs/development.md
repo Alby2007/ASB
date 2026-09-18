@@ -41,6 +41,22 @@ On first run the bot connects to Postgres, creates all tables, and applies migra
 
 ---
 
+## scripts/ utilities
+
+One-shot operational scripts. They import `src/*.ts` sources directly, so run them through `tsx` — `npx tsx scripts/<name>.mjs` — with the usual env (`DATABASE_URL`, `GUILD_ID`, `GROQ_API_KEY` where needed).
+
+| Script | Purpose |
+|--------|---------|
+| `maintain.mjs` | Runs the nightly maintenance pass on demand (memory lifecycle + event maintenance). |
+| `build-profiles.mjs` | Backfills the member registry from the archive, then runs `buildProfiles` — useful after ingest or schema changes. |
+| `verify-memories.mjs` | Batch-runs sincerity verification over pending candidate memories (`VERIFY_MODEL`). |
+| `contest-sweep.mjs` | Retroactively applies bot-addressed denials/corrections as contest evidence on archived messages. |
+| `backfill-relationships.mjs` | One-off: re-extracts relationship observations over the archive, verifies, recomputes edges, rebuilds profiles. |
+| `purge-nonopted.mjs` | Hard-deletes all derived data (memories, evidence, attributes, profiles, relationships) for non-consenting members. Requires `PURGE_CONFIRM=1` — irreversible. See README privacy section. |
+| `dev/` | Quarantined one-offs and diagnostics (`migrate-sqlite`, `check-db`, `list-models`, `audit-filter`) — kept for reference, not maintained. |
+
+---
+
 ## Test suite
 
 Tests live alongside source files as `*.test.ts`. Run them all with `npm test`.
@@ -150,10 +166,10 @@ No local files are written. There is no `data/` directory.
 
 ### Groq rate limits (ingest)
 
-`ingest.ts` paces LLM calls with `BATCH_DELAY_MS = 3000` between extraction batches and `TRIAGE_DELAY_MS = 1500` between triage calls. If you hit 429 errors:
+`server-ingest.ts` paces LLM calls with `BATCH_DELAY_MS = 3000` between extraction batches, `EVENT_DELAY_MS = 3000` between pipeline calls, and `TRIAGE_DELAY_MS = 1500` between triage calls. If you hit 429 errors:
 - The script reads the `x-ratelimit-reset-tokens` header and waits accordingly (shared `withRetry` in `src/retry.ts`).
 - Up to 6 retries are attempted with exponential backoff.
-- You can increase the `*_DELAY_MS` constants at the top of `ingest.ts` if your Groq tier has tighter limits.
+- You can increase the `*_DELAY_MS` constants at the top of `server-ingest.ts` if your Groq tier has tighter limits.
 
 ### Bot not responding to direct mentions
 

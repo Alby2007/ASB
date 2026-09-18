@@ -204,7 +204,7 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
   // Map messageId → saved memory IDs so the event pipeline can link them
   const savedIdsByMessage = new Map<string, number[]>();
   // The member registry is fully populated by the archive step, so the alias map
-  // can resolve names like "Starz" to real user IDs throughout extraction.
+  // can resolve names like "Nova" to real user IDs throughout extraction.
   const aliasMap = await buildAliasMap(guild.id, store);
   // userId → known display names, for the pasted/echoed self-naming guard
   const members = await store.listMembers(guild.id);

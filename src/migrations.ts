@@ -277,7 +277,7 @@ const migrations: Migration[] = [
     version: 9,
     name: "v05_alias_learning",
     // Provenance for learned aliases: a self-naming hit ("I am Sage" posted by
-    // tinyriot) both records the candidate and applies it to known_names.
+    // nightowl) both records the candidate and applies it to known_names.
     up: async (sql) => {
       await sql`
         CREATE TABLE IF NOT EXISTS alias_candidates (

@@ -3,7 +3,7 @@ import type { MessageEvent } from "./types.js";
 
 // ── Entity resolution ─────────────────────────────────────────────────────────
 // Memories about people are often written with a display name rather than a
-// Discord mention ("Starz is a Muslim", "Tom lost the bet"). The alias map turns
+// Discord mention ("Nova is a Buddhist", "Tom lost the bet"). The alias map turns
 // those names into real user IDs so memories attach to a person instead of
 // "unknown". Correctness beats recall: ambiguous names resolve to "unknown".
 
@@ -19,8 +19,8 @@ function escapeRegExp(s: string): string {
 
 /**
  * Alias-map keys for a display name: the full name, every token ≥4 chars, and
- * every prefix ≥4 of the first token — nickname shortenings ("paarth" for
- * "paarthurnax", "starz" for "Starz is a Muslim") resolve without a learned
+ * every prefix ≥4 of the first token — nickname shortenings ("zeph" for
+ * "zephyrine", "nova" for "Nova is a Buddhist") resolve without a learned
  * alias. Variants funnel through buildAliasMap's uniqueness rule, so an
  * ambiguous variant resolves unknown rather than guessing.
  */
@@ -126,7 +126,7 @@ function aliasPattern(aliasMap: AliasMap): RegExp | null {
 
 /**
  * Find user IDs referenced by name in message text. Word boundaries apply so
- * "al" can't match inside "alby". Discord <@ID> mentions are handled separately
+ * "ri" can't match inside "riley". Discord <@ID> mentions are handled separately
  * via message.mentions.
  */
 export function findMentionedUsers(content: string, aliasMap: AliasMap): string[] {

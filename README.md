@@ -77,9 +77,13 @@ All replies are ephemeral (private to the invoker) unless noted.
 - **Self-service.** Every member can see, export, correct, and forget their own data without admin involvement.
 - **One-shot purge.** `scripts/purge-nonopted.mjs` (`PURGE_CONFIRM=1`) hard-deletes the pre-consent derived corpus for members who never opted in — run once after deploying the consent model.
 
+Legal: [Privacy Policy](PRIVACY.md) · [Terms of Service](TERMS.md) · [Security](SECURITY.md) — also mirrored publicly at [Alby2007/asb-docs](https://github.com/Alby2007/asb-docs) for Discord verification.
+
 ---
 
 ## Quick start
+
+_A hosted instance (bring-your-own-key) is planned — invite link lands here when it exists. Until then, self-host:_
 
 **Prerequisites:** Node.js 20+, a Postgres database (a free [Supabase](https://supabase.com) project works — use the Session pooler URL), a Discord bot token with the Message Content intent, and a Groq API key.
 

@@ -4,3 +4,5 @@ data/
 .devin/config.local.json
 *.key
 docs/handoff.md
+*.log
+*.tmp.*

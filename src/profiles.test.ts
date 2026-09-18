@@ -56,7 +56,7 @@ test("recordMessage trackMember=false archives the row without a member entry", 
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
-    await store.recordMessage(msg("skyrim rant", { authorId: "bot-1", authorName: "paarthbot" }), undefined, false);
+    await store.recordMessage(msg("skyrim rant", { authorId: "bot-1", authorName: "helperbot" }), undefined, false);
     assert.equal(await store.getMember("g1", "bot-1"), undefined);
     // ...but the transcript carries it — references resolve, context shows it.
     const ctx = await store.recentContext("g1", "c1");
@@ -81,10 +81,10 @@ test("buildAliasMap maps known_names to user IDs", async () => {
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
-    await store.recordMessage(msg("hi", { authorId: "u1", authorName: "Starz" }));
+    await store.recordMessage(msg("hi", { authorId: "u1", authorName: "Nova" }));
     await store.recordMessage(msg("hi", { authorId: "u2", authorName: "Tom" }));
     const map = await buildAliasMap("g1", store);
-    assert.equal(map.get("starz"), "u1");
+    assert.equal(map.get("nova"), "u1");
     assert.equal(map.get("tom"), "u2");
     assert.equal(map.get("u1"), "u1");
   } finally { await sql.end(); }
@@ -279,12 +279,12 @@ test("relevantMemories surfaces promotable-type candidates but keeps weak eviden
     await store.setMemberOptIn("g1", "u1", true); // relevantMemories only surfaces consented subjects
     const active = await store.saveMemory(msg("x"), { subjectId: "u1", kind: "person_fact", content: "Lives in Leeds", reason: "t", evidenceType: "explicit_fact", effect: "support" });
     await store.confirm("g1", active.id);
-    await store.saveMemory(msg("y"), { subjectId: "u1", kind: "person_preference", content: "Wants to be called Alby", reason: "t", evidenceType: "clear_preference", effect: "support" });
+    await store.saveMemory(msg("y"), { subjectId: "u1", kind: "person_preference", content: "Wants to be called Riley", reason: "t", evidenceType: "clear_preference", effect: "support" });
     await store.saveMemory(msg("z"), { subjectId: "u1", kind: "person_fact", content: "Is a great guy lol", reason: "t", evidenceType: "sarcasm_or_joke", effect: "support" });
 
     const contents = (await store.relevantMemories("g1", "u1")).map(m => m.content);
     assert.ok(contents.includes("Lives in Leeds"));
-    assert.ok(contents.includes("Wants to be called Alby")); // fresh preference reaches replies pre-verification
+    assert.ok(contents.includes("Wants to be called Riley")); // fresh preference reaches replies pre-verification
     assert.ok(!contents.includes("Is a great guy lol"));      // sarcasm stays gated
   } finally { await sql.end(); }
 });
@@ -293,13 +293,13 @@ test("saveMemory persists the extracted subject name even when unresolved", asyn
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
-    const event = msg("Starz is a Muslim");
+    const event = msg("Nova is a Buddhist");
     const saved = await store.saveMemory(event, {
-      subjectId: "unknown", subjectName: "Starz", kind: "person_fact",
-      content: "Starz is a Muslim", reason: "test", evidenceType: "reported_by_other", effect: "context",
+      subjectId: "unknown", subjectName: "Nova", kind: "person_fact",
+      content: "Nova is a Buddhist", reason: "test", evidenceType: "reported_by_other", effect: "context",
     });
     assert.equal(saved.subjectId, "unknown");
-    assert.equal(saved.subjectName, "Starz");
+    assert.equal(saved.subjectName, "Nova");
   } finally { await sql.end(); }
 });
 
@@ -330,8 +330,8 @@ test("applyVerification promotes literal self-reports, flags jokes, leaves third
     assert.equal(flagged!.status, "candidate");
 
     // Third-party literal: stays candidate (corroboration still required)
-    const thirdParty = await store.saveMemory(msg("Starz is a Muslim"), {
-      subjectId: "u-other", subjectName: "Starz", kind: "person_fact", content: "Starz is a Muslim",
+    const thirdParty = await store.saveMemory(msg("Nova is a Buddhist"), {
+      subjectId: "u-other", subjectName: "Nova", kind: "person_fact", content: "Nova is a Buddhist",
       reason: "test", evidenceType: "explicit_fact", effect: "support",
     });
     assert.equal(await store.applyVerification(thirdParty.id, "literal", "reads literal"), "unchanged");
@@ -351,8 +351,8 @@ test("applyVerification promotes literal self-reports, flags jokes, leaves third
 
 test("detectSelfNaming flags capitalized third-person names only", () => {
   // The motivating case: pasted "I am <other person>" bio text
-  assert.equal(detectSelfNaming("I am Sage, a dragon lover, mother of the group", ["BIG MOMMA", "tinyriot11"]), "Sage");
-  assert.equal(detectSelfNaming("I'm Paarthurnax and I love dragons", ["Alice"]), "Paarthurnax");
+  assert.equal(detectSelfNaming("I am Sage, a dragon lover, mother of the group", ["BIG MOMMA", "nightowl11"]), "Sage");
+  assert.equal(detectSelfNaming("I'm Barnabas and I love dragons", ["Alice"]), "Barnabas");
   // Genuine self-reports and lowercase predicates don't fire
   assert.equal(detectSelfNaming("i am depressed", ["Alice"]), undefined);
   assert.equal(detectSelfNaming("i am so cooked rn", ["Alice"]), undefined);
@@ -369,7 +369,7 @@ test("contestCue catches denials and corrections, ignores chatter", () => {
   assert.ok(contestCue("Correction: I did say that"));
   assert.ok(contestCue("you're wrong, I never said that"));
   assert.ok(!contestCue("lol nice one"));
-  assert.ok(!contestCue("what do you think about xzrtsll"));
+  assert.ok(!contestCue("what do you think about qwzxv9"));
 });
 
 // ── Contest detection ─────────────────────────────────────────────────────────

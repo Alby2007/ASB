@@ -65,7 +65,7 @@ export function detectSelfNaming(content: string, authorNames: string[]): string
   return validLearnedName(m?.[1] ?? m?.[2], authorNames);
 }
 
-// Explicit naming requests — "call me Alby", "my name is X", "i go by X". The
+// Explicit naming requests — "call me Riley", "my name is X", "i go by X". The
 // capitalized-name requirement does the filtering: "call me later" and "call me
 // paranoid" don't produce a candidate. No /i flag — case is the signal.
 const namingRequest = /(?:\b[cC]all me|\b[mM]y name is|\b[mM]y name'?s|\b[iI] go by|\b[yY]ou can call me|\brefer to me as|\bprefer to be called)\s+([A-Z][\w'.-]*)/;

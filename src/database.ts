@@ -1069,7 +1069,7 @@ export class MemoryStore {
 
   async relevantMemories(guildId: string, subjectId: string, limit = 8): Promise<Memory[]> {
     // Candidates with promotable primary evidence are included so fresh direct
-    // self-reports ("call me Alby") reach replies before nightly verification
+    // self-reports ("call me Riley") reach replies before nightly verification
     // promotes them; sarcasm/joke/uncertain candidates stay gated out. The reply
     // prompt annotates each memory's confidence so the model can weigh them.
     const rows = await this.sql<MemoryRow[]>`

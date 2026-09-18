@@ -15,10 +15,10 @@ function msg(content: string, overrides: Partial<MessageEvent> = {}): MessageEve
 
 test("naming and preference phrasings pass the durable-signal gate", () => {
   for (const content of [
-    "Can you just call me Alby from now on",
-    "my name is Albert actually",
-    "i go by Alby most places",
-    "don't call me Albert please",
+    "Can you just call me Riley from now on",
+    "my name is Alex actually",
+    "i go by Riley most places",
+    "don't call me Alex please",
     "my pronouns are they/them",
     "that reminds me of the time we went to Leeds",
     "i can't stand licorice honestly",
@@ -36,23 +36,23 @@ test("bot-addressed messages always pass the gate; ordinary chatter still doesn'
 // ── detectNamingRequest ───────────────────────────────────────────────────────
 
 test("detectNamingRequest extracts names from explicit requests", () => {
-  assert.equal(detectNamingRequest("can you just call me Alby from now on", ["Alice"]), "Alby");
-  assert.equal(detectNamingRequest("my name is Albert", []), "Albert");
-  assert.equal(detectNamingRequest("i go by Alby most places", []), "Alby");
-  assert.equal(detectNamingRequest("you can call me Alby", []), "Alby");
-  assert.equal(detectNamingRequest("Call me Alby", []), "Alby");
+  assert.equal(detectNamingRequest("can you just call me Riley from now on", ["Alice"]), "Riley");
+  assert.equal(detectNamingRequest("my name is Alex", []), "Alex");
+  assert.equal(detectNamingRequest("i go by Riley most places", []), "Riley");
+  assert.equal(detectNamingRequest("you can call me Riley", []), "Riley");
+  assert.equal(detectNamingRequest("Call me Riley", []), "Riley");
 });
 
 test("detectNamingRequest ignores lowercase non-names, stopwords, and the author's own names", () => {
   assert.equal(detectNamingRequest("call me later", []), undefined);
   assert.equal(detectNamingRequest("call me paranoid but", []), undefined);
   assert.equal(detectNamingRequest("call me back in five", []), undefined);
-  assert.equal(detectNamingRequest("call me ALBY", []), undefined); // all-caps = emphasis
+  assert.equal(detectNamingRequest("call me RILEY", []), undefined); // all-caps = emphasis
   assert.equal(detectNamingRequest("call me Alice", ["Alice"]), undefined); // already a known name
 });
 
 test("detectSelfNaming still catches pasted-bio self-naming", () => {
-  assert.equal(detectSelfNaming("I am Sage, a dragon lover", ["tinyriot"]), "Sage");
+  assert.equal(detectSelfNaming("I am Sage, a dragon lover", ["nightowl"]), "Sage");
   assert.equal(detectSelfNaming("i am tired today", []), undefined);
 });
 
