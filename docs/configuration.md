@@ -25,7 +25,7 @@ ASB is configured through environment variables validated at startup by `src/con
 | `RAW_MESSAGE_RETENTION_DAYS` | `30` | How many days of raw Discord messages to keep in the `messages` table. Messages older than this are deleted by the daily maintenance job. Evidence quotes in `memory_evidence` are **not** affected by this purge. Range 1–365. |
 | `CANDIDATE_CONFIDENCE_THRESHOLD` | `0.70` | Minimum confidence required to auto-promote a candidate memory to active status (subject to evidence type gates). Range 0–1. |
 | `REPLY_MODEL` | `GROQ_MODEL` | Model used for Discord replies, across all reply paths. Any Groq model id, or `groq/compound*` for Groq's agentic system with built-in web tools. Reasoning models (gpt-oss, qwen3) get `reasoning_effort=low` automatically to cut latency and flatten the register. |
-| `REPLY_TOOLS` | (off) | `1` attaches free local `web_search`/`visit_url` tools to replies when a message matches tool cues (links, "look up", etc.). |
+| `REPLY_TOOLS` | (off) | `1` attaches free local tools to replies — `web_search`/`visit_url` plus internal lookups (`lookup_person`, `lookup_relationship`, `search_memories`, `lookup_event`) — on a direct mention or when a message matches tool cues. |
 | `VERIFY_MODEL` | `PROFILE_MODEL` → `GROQ_MODEL` | Model for memory/relationship verification and dedup passes. |
 | `PROFILE_MODEL` | `GROQ_MODEL` | Model for profile card synthesis. |
 | `DOSSIER_MODEL` | `GROQ_MODEL` | Model for dossier section synthesis. |
@@ -33,6 +33,8 @@ ASB is configured through environment variables validated at startup by `src/con
 | `INGEST_MODEL` | `qwen/qwen3.8-27b` (ingest), `GROQ_MODEL` (sweep) | Model for batch memory extraction. |
 | `INGEST_TRIAGE_MODEL` | `qwen/qwen3.8-27b` (ingest), `GROQ_MODEL` (sweep) | Model for the durability triage pass. |
 | `INGEST_CHANNEL` | `general-chat` | Channel name `npm run ingest` backfills from. |
+| `VISION_MODEL` | (off) | Vision-capable model for image understanding (e.g. `meta-llama/llama-4-scout-17b-16e-instruct` — free tier on the same `GROQ_API_KEY`). **Unset disables image handling entirely** — there is no fallback to `GROQ_MODEL`, since a text-only model could silently drop the image block and store a hallucinated description. When set, image attachments (`image/*` except GIFs, ≤`IMAGE_MAX_BYTES`, ≤3/message) are described once and the text rides the normal extraction/reply pipelines; URLs and bytes are never persisted. |
+| `IMAGE_MAX_BYTES` | `4000000` | Per-image size cap for `VISION_MODEL` processing; larger attachments are skipped. Keep at or under the provider's per-image limit. |
 
 ---
 

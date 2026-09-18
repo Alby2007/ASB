@@ -7,6 +7,10 @@ export type MessageEvent = {
   content: string;
   createdAt: Date;
   mentionsBot: boolean;
+  // Transient: populated live from Discord attachments, consumed in-flight by
+  // describeImage, never persisted — recordMessage writes explicit columns and
+  // no attachment column exists to receive these.
+  imageAttachments?: Array<{ url: string; contentType: string; size: number; name?: string }>;
 };
 
 export type MemoryCandidate = {

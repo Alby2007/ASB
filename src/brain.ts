@@ -34,12 +34,16 @@ export class Brain {
     return { shouldSpeak: score >= threshold, score: Math.max(0, Math.min(1, score)), reasons };
   }
 
-  async extractMemories(event: MessageEvent, replyToContent?: string, note?: string): Promise<ExtractionResult> {
+  async extractMemories(event: MessageEvent, replyToContent?: string, note?: string, imageContext?: string): Promise<ExtractionResult> {
     const replyContext = replyToContent ? `\n\nThis message is a reply to: "${replyToContent}"` : "";
     const noteContext = note ? `\n\nNote: ${note}` : "";
+    // Attached-image content is the bot's own observation, not the author's
+    // words — evidenceType must reflect that (observed/inferred, never stated),
+    // and depicted people are not attributed without textual naming.
+    const imgContext = imageContext ? `\n\n${imageContext}. This is your own observation of an attachment the author posted, not the author's words — prefer direct_observation or uncertain_inference over explicit_fact, and do not attribute depicted people to named individuals without textual naming.` : "";
     const response = await this.client.responses.create({
       model: this.model,
-      input: `Extract only durable, useful memories from this Discord message. Do not infer sensitive traits, diagnoses, private information, or insults. A single casual message rarely merits memory. Classify the language as evidenceType and its relation to the proposed memory as effect, but do not decide lifecycle transitions. Provide language interpretation only; confidence, importance, and explicitness will be calculated deterministically by the database.\n\nsubjectId rules: use the Author ID below when the memory is about the message author. If the memory is about a different person mentioned in the message, use their Discord user ID if it appears in the message as a mention (<@ID>). If the subject cannot be resolved to a Discord user ID, use "unknown". Never use descriptive labels or slugs.\nsubjectName: the subject's name exactly as written in the message (empty string if none).\n\nQuoted text: if the message's first-person text describes someone other than the author — e.g. "I am <other person's name>", a pasted bio or profile card, or clearly copied/generated text — do not attribute it to the author. Attribute it to the named person via subjectName, or skip it entirely if it reads as pasted content rather than a genuine statement.\n\nAlso emit relationship assertions when the message describes a durable interpersonal dynamic between two people (friendship, conflict, dating, rivalry). For each: subjectName (empty string = the message author), otherName, nature (e.g. "close friends", "antagonizes", "dating"), valence from -1 (hostile) to +1 (close), and a short reason.\n\nAuthor ID: ${event.authorId}\nMessage: ${event.content}${replyContext}${noteContext}`,
+      input: `Extract only durable, useful memories from this Discord message. Do not infer sensitive traits, diagnoses, private information, or insults. A single casual message rarely merits memory. Classify the language as evidenceType and its relation to the proposed memory as effect, but do not decide lifecycle transitions. Provide language interpretation only; confidence, importance, and explicitness will be calculated deterministically by the database.\n\nsubjectId rules: use the Author ID below when the memory is about the message author. If the memory is about a different person mentioned in the message, use their Discord user ID if it appears in the message as a mention (<@ID>). If the subject cannot be resolved to a Discord user ID, use "unknown". Never use descriptive labels or slugs.\nsubjectName: the subject's name exactly as written in the message (empty string if none).\n\nQuoted text: if the message's first-person text describes someone other than the author — e.g. "I am <other person's name>", a pasted bio or profile card, or clearly copied/generated text — do not attribute it to the author. Attribute it to the named person via subjectName, or skip it entirely if it reads as pasted content rather than a genuine statement.\n\nAlso emit relationship assertions when the message describes a durable interpersonal dynamic between two people (friendship, conflict, dating, rivalry). For each: subjectName (empty string = the message author), otherName, nature (e.g. "close friends", "antagonizes", "dating"), valence from -1 (hostile) to +1 (close), and a short reason.\n\nAuthor ID: ${event.authorId}\nMessage: ${event.content}${replyContext}${noteContext}${imgContext}`,
       text: { format: { type: "json_schema", name: "memory_candidates", strict: true, schema: {
         type: "object", properties: {
           memories: { type: "array", items: { type: "object", properties: {
@@ -53,6 +57,36 @@ export class Brain {
     });
     const raw = JSON.parse(response.output_text) as { memories?: MemoryCandidate[]; relationships?: ExtractionResult["relationships"] };
     return { memories: raw.memories ?? [], relationships: raw.relationships ?? [] };
+  }
+
+  /**
+   * The only function that ever touches an image: describe one attachment once
+   * via a vision-capable model. The description is text from here on — it rides
+   * the ordinary extraction/reply pipelines; the URL and bytes are never
+   * persisted. Callers pass a vision-capable model explicitly (config.visionModel).
+   */
+  async describeImage(input: { url: string; contextText?: string }, model: string): Promise<{ description: string; category: "photo" | "screenshot" | "meme" | "art" | "document" | "other" }> {
+    const contextLine = input.contextText?.trim()
+      ? ` The sender's own caption was: "${input.contextText.trim()}" — use it only to disambiguate, not as part of the description.`
+      : "";
+    const response = await this.client.chat.completions.create({
+      model,
+      messages: [{ role: "user", content: [
+        { type: "text", text: `Describe this image factually in one or two sentences: what it depicts, any clearly legible text in it, and its apparent purpose in a Discord conversation. Do not guess at the identity of any person shown.${contextLine}` },
+        { type: "image_url", image_url: { url: input.url } },
+      ] }],
+      response_format: { type: "json_schema", json_schema: {
+        name: "image_description", strict: true,
+        schema: {
+          type: "object", properties: {
+            description: { type: "string" },
+            category: { type: "string", enum: ["photo", "screenshot", "meme", "art", "document", "other"] },
+          },
+          required: ["description", "category"], additionalProperties: false,
+        },
+      } },
+    });
+    return JSON.parse(response.choices[0].message.content);
   }
 
   async correctMemory(authorId: string, statement: string, existing: Memory[]): Promise<{ replacement: MemoryCandidate; supersedes: number[] }> {
@@ -666,7 +700,7 @@ export class Brain {
    * in-process (free — no per-tool billing). Either path's failure falls back
    * to the plain Responses-API call on this.model.
    */
-  async reply(event: MessageEvent, context: Array<{ authorName: string; authorId?: string; replyToAuthorId?: string; replyToAuthor?: string; replyToSnippet?: string; content: string }>, memories: Memory[], profiles: ReplyProfile[] = [], relationships: PairContext[] = [], model?: string, toolsEnabled = false, botId?: string, room?: { guildName: string; ownerName?: string }, toolCtx?: ToolCtx): Promise<string> {
+  async reply(event: MessageEvent, context: Array<{ authorName: string; authorId?: string; replyToAuthorId?: string; replyToAuthor?: string; replyToSnippet?: string; content: string }>, memories: Memory[], profiles: ReplyProfile[] = [], relationships: PairContext[] = [], model?: string, toolsEnabled = false, botId?: string, room?: { guildName: string; ownerName?: string }, toolCtx?: ToolCtx, imageContext?: string): Promise<string> {
     const people = profiles.map(formatReplyProfile).join("\n");
     const rels = relationships.map(formatPairContext).join("\n");
     const persona = "You are a long-standing member of this Discord server — not an assistant, not a moderator. This room is profane and jokey; match its energy exactly. If someone swears at you, banters, or talks shit, respond like a real member would — fire back, brush it off, roll with it. If regulars ask you to roast, nickname, or rib another member, play along — that's normal here. Never lecture, moralize, de-escalate, or refuse like a terms-of-service bot; declining kills the vibe. When you don't know something — including things about yourself — riff on not knowing; never invent specifics or backstory. Style reference: 'lmao what'd i do', 'nah that's cap', 'bro is tweaking', 'you good?'. Keep replies to a line or two unless the moment calls for more. You only know what is in the supplied context and memories — never claim certainty beyond them, never expose or explain the memory system, never invent facts. The Relationships section lists what people have asserted about each other and events they shared — reference it naturally ('didn't you two argue about this'), but never invent a dynamic or shared history beyond what's listed. Facet confidences tell you how sure to be — state high-confidence attributes plainly; hedge medium and low naturally ('I think you're into X, correct me if not'); never state a low-confidence attribute as fact. Address people by display name — never emit <@...> mention markup. If you use web results, work them in naturally — don't dump citations.";
@@ -676,7 +710,7 @@ export class Brain {
       return `${who}${edge}: ${x.content}`;
     }).join("\n");
     const roomLine = room ? `You are in the Discord server "${room.guildName}"${room.ownerName ? ` and were built by ${room.ownerName}, a member here` : ""}.` : "";
-    const situation = `${roomLine}\n\nRecent conversation:\n${transcript}\n\nPeople:\n${people || "None"}${rels ? `\n\nRelationships:\n${rels}` : ""}\n\nRelevant memories:\n${memories.map(m => `- ${m.content} (confidence ${(m.confidence ?? 0).toFixed(2)})`).join("\n") || "None"}\n\nRespond to ${event.authorName}'s latest message: ${event.content}`;
+    const situation = `${roomLine}\n\nRecent conversation:\n${transcript}\n\nPeople:\n${people || "None"}${rels ? `\n\nRelationships:\n${rels}` : ""}\n\nRelevant memories:\n${memories.map(m => `- ${m.content} (confidence ${(m.confidence ?? 0).toFixed(2)})`).join("\n") || "None"}\n\nRespond to ${event.authorName}'s latest message: ${event.content}${imageContext ? `\n${imageContext}` : ""}`;
     const useModel = model ?? this.model;
     // Reasoning models (gpt-oss, qwen3) read flat and add thinking latency in
     // casual chat — cap the effort. Param is only sent where Groq supports it.

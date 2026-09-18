@@ -28,6 +28,7 @@ ASB (Artificial Server Member) is a single TypeScript/Node process that connects
 | `src/tools.ts` | `replyToolDefs`, `executeTool` | Never-throw tool dispatcher: SSRF-hardened web fetch + internal lookup routing |
 | `src/lookup-tools.ts` | `ToolCtx`, `executeLookupTool`, `buildPairContext` | Read-only internal lookup tools (person/relationship/memories/event) over the existing stores |
 | `src/reply-format.ts` | `formatReplyProfile`, `formatPairContext` | Pure formatters shared by the reply prompt and tool outputs |
+| `src/vision.ts` | `qualifyingImages`, `formatImageContext` | Pure image-attachment gate (image/*, byte cap, ≤3/message) + observation-framed label |
 
 ---
 
@@ -40,10 +41,13 @@ Discord MessageCreate
   index.ts: record raw message in MemoryStore
         │
         ▼
-  perception.ts: shouldInspectForMemory()?
+  perception.ts: shouldInspectForMemory()?  (or: has image attachments)
         │ yes                     no ──────────────────────────────┐
         ▼   (passes durableSignals regex, or any bot-addressed msg) │
-  brain.ts: extractMemories()                                      │
+  brain.ts: describeImage() per attachment (VISION_MODEL — off when  │
+   unset; image/* minus gif, ≤IMAGE_MAX_BYTES, ≤3/message) then      │
+   extractMemories() with the descriptions as observed-content       │
+   context — downstream code sees only text                          │
   (LLM — returns subjectId, subjectName, kind, content,            │
    reason, evidenceType, effect + relationship assertions;         │
    no numeric values)                                              │

@@ -11,6 +11,7 @@ import { EventPipeline } from "./event-detection.js";
 import { ProfileStore } from "./profiles.js";
 import { buildAliasMap, demangleMentions, findMentionedUsers, resolveSubject, scrubMentions, type AliasMap } from "./entity-resolution.js";
 import { buildPairContext, type ToolCtx } from "./lookup-tools.js";
+import { qualifyingImages, formatImageContext, IMAGE_MAX_PER_MESSAGE, type AttachmentMeta } from "./vision.js";
 import { withRetry } from "./retry.js";
 import { inc } from "./metrics.js";
 import type { MessageEvent, PairContext } from "./types.js";
@@ -45,6 +46,7 @@ client.once(Events.ClientReady, async ready => {
   // Node >=15 an unhandled rejection here is fatal to the process.
   applyRetention().catch(error => { inc("maintenance.error"); console.error("Retention run failed", error); });
   sweepMissedSignals(24 * 60 * 60_000).catch(error => { inc("sweep.error"); console.error("Boot sweep failed", error); }); // wide window on boot to cover downtime
+  if (!config.visionModel) console.warn("[vision] VISION_MODEL unset — image attachments will be ignored");
   console.log(`ASM online as ${ready.user.tag}`);
 });
 
@@ -347,13 +349,19 @@ async function guildLookups(guildId: string): Promise<{ map: AliasMap; names: Ma
 }
 
 async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
-  if (!message.guild || !message.content.trim()) return;
+  // Image attachments are gated before the empty-content early-out so an
+  // image-only message still reaches extraction; VISION_MODEL unset = off.
+  const images = config.visionModel
+    ? qualifyingImages(message.attachments.values(), config.imageMaxBytes, IMAGE_MAX_PER_MESSAGE)
+    : [];
+  if (!message.guild || (!message.content.trim() && !images.length)) return;
   if (config.guildId && message.guild.id !== config.guildId) return;
   const event: MessageEvent = {
     guildId: message.guild.id, channelId: message.channel.id, messageId: message.id,
     authorId: message.author.id, authorName: message.member?.displayName ?? message.author.username,
     content: message.content, createdAt: message.createdAt,
     mentionsBot: message.mentions.has(client.user!) || message.mentions.repliedUser?.id === client.user!.id,
+    imageAttachments: images.length ? images : undefined,
   };
   const settings = await store.settings(event.guildId, config.rawMessageRetentionDays);
   // "Pause observing" must actually stop observing — a paused guild gets no
@@ -386,7 +394,20 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   // The alias map is built lazily on first use so ordinary chatter costs no extra queries.
   let aliasMap: Promise<AliasMap> | undefined;
   const getAliasMap = () => (aliasMap ??= guildLookups(event.guildId).then(e => e.map));
-  if (settings.memoryEnabled && shouldInspectForMemory(event)) {
+  // Per-image describe, per-image fault tolerance — a dead URL or a 429 skips
+  // that image, never the message's text. Memoized so extraction and the reply
+  // path share one describe pass for the same message.
+  const describeImages = (list: Array<AttachmentMeta & { contentType: string }>) =>
+    Promise.all(list.map(async a => {
+      try {
+        const d = await brain.describeImage({ url: a.url, contextText: event.content }, config.visionModel!);
+        inc("vision.described");
+        return d.description;
+      } catch (error) { inc("vision.error"); console.error("Image describe failed", error); return undefined; }
+    })).then(list => list.filter((d): d is string => !!d));
+  let imageDescs: Promise<string[]> | undefined;
+  const getImageDescriptions = () => (imageDescs ??= describeImages(images));
+  if (settings.memoryEnabled && (shouldInspectForMemory(event) || images.length)) {
     try {
       // Naming signals: "call me Alby" is an explicit request (strong);
       // "I am Sage" from a non-matching name is a pasted/quoted-bio tell (weak).
@@ -403,7 +424,10 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
       const note = requested
         ? `the author asked to be called "${requested}" — treat it as their preferred name`
         : named ? `the author may be naming themselves "${named}" (a previously unknown alias) or quoting/describing "${named}" — attribute accordingly` : undefined;
-      const { memories: candidates, relationships } = await withRetry(() => brain.extractMemories(event, replyToContent, note), 3);
+      const imageContext = images.length
+        ? formatImageContext(await getImageDescriptions(), event.authorName) || undefined
+        : undefined;
+      const { memories: candidates, relationships } = await withRetry(() => brain.extractMemories(event, replyToContent, note, imageContext), 3);
       const aliases = (candidates.length || relationships.length) ? await getAliasMap() : new Map<string, string>();
       // Opted-out members accrue no new derived data: memories or relationship
       // observations about them are skipped (raw archive is unaffected — that's
@@ -502,6 +526,19 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     // moments ago takes effect immediately, not after the next profile build.
     const authorName = await store.displayNameFor(event.guildId, event.authorId);
     const ownerName = message.guild.ownerId ? await store.displayNameFor(event.guildId, message.guild.ownerId) : undefined;
+    // Images on this message — and on the message it replies to — are described
+    // once and handed to the reply model as observed content. The replied-to
+    // fetch is needed even when the row is archived: DB rows carry no
+    // attachment data by design, and the live fetch returns fresh signed URLs.
+    const imgParts: string[] = [];
+    if (images.length) imgParts.push(formatImageContext(await getImageDescriptions(), authorName));
+    if (replyToId) {
+      const refMsg = await message.channel.messages.fetch(replyToId).catch(() => undefined);
+      const refImages = refMsg ? qualifyingImages(refMsg.attachments.values(), config.imageMaxBytes, IMAGE_MAX_PER_MESSAGE) : [];
+      if (refImages.length && refMsg)
+        imgParts.push(formatImageContext(await describeImages(refImages), refMsg.member?.displayName ?? refMsg.author.username));
+    }
+    const imageContext = imgParts.filter(Boolean).join("\n") || undefined;
     // Lookup tools get the guild's handles + name resolution — the model can
     // fetch people/pairs/memories/events beyond the pre-fetched window above.
     const toolCtx: ToolCtx = {
@@ -511,7 +548,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     // Direct mentions arm the full toolkit (they're nearly every reply at the
     // default threshold); unsolicited replies still need a toolCues signal.
     const toolsOn = config.replyTools && (toolCues(event.content) || event.mentionsBot);
-    const reply = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, relationships, config.replyModel, toolsOn, client.user!.id, { guildName: message.guild.name, ownerName }, toolCtx);
+    const reply = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, relationships, config.replyModel, toolsOn, client.user!.id, { guildName: message.guild.name, ownerName }, toolCtx, imageContext);
     const clean = reply ? scrubMentions(reply, lookups.names) : "";
     if (clean) {
       const sent = await message.reply({ content: clean, allowedMentions: { repliedUser: false } });

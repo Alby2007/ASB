@@ -24,6 +24,8 @@ const env = z.object({
   REPLY_MODEL: z.string().optional(),
   REPLY_TOOLS: z.string().optional(),
   INGEST_CHANNEL: z.string().optional(),
+  VISION_MODEL: z.string().optional(),
+  IMAGE_MAX_BYTES: z.coerce.number().int().min(1).default(4_000_000),
 }).parse(process.env);
 
 export const config = {
@@ -47,4 +49,8 @@ export const config = {
   replyModel: env.REPLY_MODEL,
   replyTools: env.REPLY_TOOLS === "1",
   ingestChannel: env.INGEST_CHANNEL ?? "general-chat",
+  // No fallback: unset means image understanding is OFF. A text-only model
+  // could silently drop the image block and store a hallucinated description.
+  visionModel: env.VISION_MODEL,
+  imageMaxBytes: env.IMAGE_MAX_BYTES,
 };
