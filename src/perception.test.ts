@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { detectDismissal, detectNamingRequest, detectSelfNaming, detectWakeWord, shouldInspectForMemory } from "./perception.js";
+import { detectDismissal, detectNamingRequest, detectSelfNaming, detectWakeWord, roomAddressCue, shouldInspectForMemory } from "./perception.js";
 import type { MessageEvent } from "./types.js";
 
 function msg(content: string, overrides: Partial<MessageEvent> = {}): MessageEvent {
@@ -87,7 +87,7 @@ test("detectWakeWord escapes regex-special characters in names", () => {
 // Call-site gated on mentionsBot, so hits only need to be plausible dismissals.
 
 test("detectDismissal catches explicit dismissals", () => {
-  assert.ok(detectDismissal("shut up casper"));
+  assert.ok(detectDismissal("shut up person larper"));
   assert.ok(detectDismissal("ok stfu"));
   assert.ok(detectDismissal("fuck off bot"));
   assert.ok(detectDismissal("alright we're done here"));
@@ -101,4 +101,33 @@ test("detectDismissal ignores ordinary conversation", () => {
   assert.equal(detectDismissal("lol nice"), false);
   assert.equal(detectDismissal("can you help me with this"), false);
   assert.equal(detectDismissal("I haven't had enough coffee"), false); // bare "enough" isn't a cue
+});
+
+test("detectDismissal catches soft and meta dismissals", () => {
+  assert.ok(detectDismissal("Okay bro shush now"));                        // unaddressed while engaged
+  assert.ok(detectDismissal("Let's end this here"));
+  assert.ok(detectDismissal("You don't have to reply to it anymore"));     // meta-instruction
+  assert.ok(detectDismissal("stop replying"));
+  assert.ok(detectDismissal("let's move on"));
+  assert.ok(detectDismissal("we're done"));
+});
+
+// ── roomAddressCue ────────────────────────────────────────────────────────────
+
+test("roomAddressCue catches messages aimed at the room, not the bot", () => {
+  assert.ok(roomAddressCue("Did anyone see that btw 🤭🤭🤭"));
+  assert.ok(roomAddressCue("does anyone know what time it is"));
+  assert.ok(roomAddressCue("you guys are crazy"));
+  assert.ok(roomAddressCue("who else saw that"));
+  assert.ok(roomAddressCue("anyone else get the reference"));
+  assert.ok(roomAddressCue("thanks everyone"));
+  assert.ok(roomAddressCue("y'all hear this?"));
+});
+
+test("roomAddressCue leaves bot-directed engaged messages alone", () => {
+  assert.equal(roomAddressCue("Why don't you get a life"), false);
+  assert.equal(roomAddressCue("He's so fucking annoying"), false);          // about the bot ≠ aimed at the room
+  assert.equal(roomAddressCue("Bro just do it"), false);
+  assert.equal(roomAddressCue("that's not what I said"), false);
+  assert.equal(roomAddressCue("lol nice"), false);
 });

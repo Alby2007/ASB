@@ -109,13 +109,24 @@ export function toolCues(content: string): boolean {
   return toolSignals.test(content);
 }
 
-// Dismissal cues on a bot-addressed message — "shut up casper", "ok we're done",
-// "fuck off". Gated at the call site on mentionsBot, so these only need to be
+// Dismissal cues — "shut up asb", "ok we're done", "shush", "let's end this".
+// Gated at the call site on mentionsBot-or-engaged, so these only need to be
 // plausible dismissals, not unambiguous ones; going quiet after being told off
 // is the correct social response even when it was playful.
-const dismissalSignals = /\b(?:shut (?:the fuck )?up|stfu|fuck off|go away|leave (?:me|us|it) alone|nobody asked|stop (?:talking|replying|responding)|be quiet|that'?s enough|enough (?:now|already)|we'?re done here|ok bye|bye for now|gtfo|zip it|shut it)\b/i;
+const dismissalSignals = /\b(?:shut (?:the fuck )?up|stfu|shush|fuck off|go away|leave (?:me|us|it) alone|nobody asked|stop (?:talking|replying|responding)|be quiet|that'?s enough|enough (?:now|already)|we'?re done(?: here)?|ok bye|bye for now|gtfo|zip it|shut it|let'?s end (?:this|it)|end (?:this|it) here|(?:stop|quit|don'?t(?: have to)?|no need to|no more) (?:replying|responding|reply|respond)|let'?s move on|moving on)\b/i;
 
-/** Cheap gate: is this addressed message telling the bot to drop out? */
+/** Cheap gate: is this message telling the bot to drop out? */
 export function detectDismissal(content: string): boolean {
   return dismissalSignals.test(content);
+}
+
+// Room-directed addressing cues on an engaged message — "did anyone see that",
+// "you guys", "who else". The author can still be in conversation with the bot
+// while aiming THIS message at the room; high-precision patterns only, since a
+// false positive means the bot wrongly ignores someone mid-conversation.
+const roomAddressSignals = /\b(?:did|does|do|can|could|has|have|is|are|was|were|will|would|didn'?t|don'?t) (?:anyone|anybody|someone|somebody|everyone|everybody|any of (?:you|u)|one of (?:you|u))\b|\b(?:anyone|anybody|someone|somebody|everyone|everybody) (?:see|hear|know|else|got|get|here|around|watching|saw|notice|remember)\b|\byou (?:guys|lot|all)\b|\by'?all\b|\bwho else\b|\bthank(?:s| you) (?:everyone|everybody|guys|y'?all)\b|\bhey guys\b|\bok guys\b|\bguys[,.!]/i;
+
+/** Cheap gate: is this engaged message aimed at the room rather than the bot? */
+export function roomAddressCue(content: string): boolean {
+  return roomAddressSignals.test(content);
 }

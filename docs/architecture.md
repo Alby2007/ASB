@@ -91,8 +91,12 @@ Discord MessageCreate
     120s) — engagement.ts tracks per-channel participants; TTL refreshes on
     addressed messages only, NOT on bot replies, so drifting side-chatter
     decays out and the bot drops mid-channel-talk (ENGAGEMENT=0 disables)
-  • explicit dismissals ("shut up casper", "we're done" + address) drop the
-    participant immediately after the ack reply (perception.ts detectDismissal)
+  • engaged ≠ every message is at the bot: room-directed cues ("did anyone",
+    "you guys" — perception.ts roomAddressCue), replying to another human, or
+    @-mentioning someone else suppress the bonus for that message only
+  • dismissals ("shut up asb", "shush", "let's end this") fire addressed OR
+    while engaged — unaddressed dismissal = silent drop-out, addressed = ack
+    reply then out (perception.ts detectDismissal)
   • pacing is per-tier: strangers get proportional recency decay
     −0.25×(1−elapsed/120s), evaluated only inside the window so it can't
     invert; engaged participants instead get share-of-voice — −0.25 when the

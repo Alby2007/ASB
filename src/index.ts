@@ -5,7 +5,7 @@ import { config } from "./config.js";
 import { sql } from "./db.js";
 import { MemoryStore } from "./database.js";
 import { commandDefinitions, handleMemoryButton, handleMemoryCommand } from "./commands.js";
-import { detectDismissal, detectNamingRequest, detectSelfNaming, detectWakeWord, shouldInspectForMemory, toolCues } from "./perception.js";
+import { detectDismissal, detectNamingRequest, detectSelfNaming, detectWakeWord, roomAddressCue, shouldInspectForMemory, toolCues } from "./perception.js";
 import { EngagementTracker } from "./engagement.js";
 import { runContestCheck } from "./contest.js";
 import { EventStore } from "./events.js";
@@ -502,14 +502,29 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   // This human message counts toward share-of-voice before scoring — it
   // dilutes the bot's floor share for the decide() below.
   engagement.noteMessage(key, false);
-  // An addressed message enrolls the author for the engagement TTL; an explicit
-  // dismissal drops them again immediately (the reply below is the ack, then
-  // they're out — going quiet after being told off is the correct response).
+  // An addressed message enrolls the author for the engagement TTL.
   if (event.mentionsBot) engagement.noteTrigger(key, event.authorId);
-  if (event.mentionsBot && detectDismissal(event.content)) engagement.dismiss(key, event.authorId);
+  let engaged = config.engagement && engagement.isEngaged(key, event.authorId);
+  // Engaged ≠ every message is at the bot: a message aimed at the room ("did
+  // anyone see that"), replying to another human, or @-mentioning someone else
+  // doesn't earn the in-conversation bonus — engagement itself is untouched.
+  if (engaged && !event.mentionsBot) {
+    const botId = client.user!.id;
+    if (roomAddressCue(event.content)
+      || (message.mentions.repliedUser !== null && message.mentions.repliedUser.id !== botId)
+      || message.mentions.users.some(u => u.id !== botId)) {
+      engaged = false;
+    }
+  }
+  // Dismissals fire addressed ("shut up asb") or while engaged ("shush"
+  // mid-convo). An unaddressed dismissal clears engaged → silence, the clean
+  // drop-out; an addressed one still gets its ack reply, then drops out.
+  if ((event.mentionsBot || engaged) && detectDismissal(event.content)) {
+    engagement.dismiss(key, event.authorId);
+    engaged = false;
+  }
   const lastSpokeAt = engagement.lastSpokeAt(key);
   const elapsedSinceLastSpoke = lastSpokeAt === undefined ? Infinity : Date.now() - lastSpokeAt;
-  const engaged = config.engagement && engagement.isEngaged(key, event.authorId);
   const decision = brain.decide(event, elapsedSinceLastSpoke, engaged, engagement.botShare(key), config.speakThreshold);
   if (!settings.replyEnabled || !decision.shouldSpeak) return;
   try {
