@@ -52,8 +52,11 @@ console.log(`Purge scope in ${guildId}: ${memN} memories · ${attrN} attributes 
 await sql.begin(async tx => {
   // Evidence/history hang off memories — delete through the memory set.
   const doomed = tx`SELECT id FROM memories WHERE guild_id = ${guildId} AND subject_id <> 'server' AND subject_id NOT IN (${CONSENTED})`;
+  // memory_history.evidence_id FKs to memory_evidence — history must go first,
+  // including rows on surviving memories that merely cite doomed evidence.
+  await tx`DELETE FROM memory_history WHERE memory_id IN (${doomed})
+    OR evidence_id IN (SELECT id FROM memory_evidence WHERE memory_id IN (${doomed}))`;
   await tx`DELETE FROM memory_evidence WHERE memory_id IN (${doomed})`;
-  await tx`DELETE FROM memory_history WHERE memory_id IN (${doomed})`;
   await tx`DELETE FROM memories WHERE id IN (${doomed})`;
   await tx`DELETE FROM profile_attributes WHERE guild_id = ${guildId} AND subject_id NOT IN (${CONSENTED})`;
   await tx`DELETE FROM profiles WHERE guild_id = ${guildId} AND subject_id NOT IN (${CONSENTED})`;
