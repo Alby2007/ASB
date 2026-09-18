@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ButtonInteraction, ChatInputCommandInteraction } from "discord.js";
 import { handleMemoryButton, handleMemoryCommand } from "./commands.js";
+import { ProfileStore } from "./profiles.js";
 import { makeTestSql, makeStore } from "./test-helpers.js";
 import type { Brain } from "./brain.js";
 import type { EventStore } from "./events.js";
@@ -259,7 +260,7 @@ test("/opt-out forgets memories and deletes the profile; /opt-in re-enables", as
     const { store } = await makeStore(sql);
     const mem = await store.saveMemory(msg("I have a cat"), candidate);
     const out = stubCommand({ commandName: "opt-out", userId: "u-user" });
-    await handleMemoryCommand(out.interaction, store, brain);
+    await handleMemoryCommand(out.interaction, store, brain, undefined, new ProfileStore(sql));
     assert.match(out.replies[0].content ?? "", /opted out/i);
     assert.equal((await store.getMember("g1", "u-user"))?.optedOut, true);
     assert.equal((await store.getMemory("g1", mem.id))?.status, "forgotten");

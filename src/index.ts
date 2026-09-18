@@ -12,7 +12,7 @@ import { ProfileStore } from "./profiles.js";
 import { buildAliasMap, demangleMentions, findMentionedUsers, resolveSubject, scrubMentions, type AliasMap } from "./entity-resolution.js";
 import { withRetry } from "./retry.js";
 import { inc } from "./metrics.js";
-import type { MessageEvent } from "./types.js";
+import type { MessageEvent, PairContext } from "./types.js";
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const brain = new Brain(config.groqKey, config.model, config.groqBaseUrl);
@@ -283,7 +283,7 @@ async function sweepMissedSignals(windowMs: number) {
 
 client.on(Events.InteractionCreate, async interaction => {
   try {
-    if (interaction.isChatInputCommand()) await handleMemoryCommand(interaction, store, brain, eventStore);
+    if (interaction.isChatInputCommand()) await handleMemoryCommand(interaction, store, brain, eventStore, profileStore);
     if (interaction.isButton()) await handleMemoryButton(interaction, store);
   } catch (error) {
     inc("handler.interaction_error");
@@ -460,6 +460,35 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     ]);
     const profiles = (await profileStore.getProfiles(event.guildId, [...peopleIds]))
       .map(p => ({ name: p.displayName, summary: p.summary, traits: p.facets.traits }));
+    // Pairwise relationship context — what the in-prompt people assert about
+    // each other, distinct from either's standalone profile. All unordered
+    // pairs among non-bot people, author-involved pairs first, capped so the
+    // prompt stays bounded. Pairs with zero signal drop out entirely.
+    const pairIds = [...peopleIds].filter(id => id !== client.user!.id);
+    const pairList: Array<[string, string]> = [];
+    for (let i = 0; i < pairIds.length; i++)
+      for (let j = i + 1; j < pairIds.length; j++) pairList.push([pairIds[i], pairIds[j]]);
+    pairList.sort((x, y) => Number(y.includes(event.authorId)) - Number(x.includes(event.authorId)));
+    const monthYear = (iso: string) => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString("en-US", { month: "short", year: "numeric" }); };
+    const relationships = (await Promise.all(pairList.slice(0, 6).map(async ([aId, bId]): Promise<PairContext | undefined> => {
+      const [pc, events] = await Promise.all([
+        store.pairwiseContext(event.guildId, aId, bId),
+        eventStore.sharedEvents(event.guildId, aId, bId, 3),
+      ]);
+      if (!pc.ab && !pc.ba && !pc.observations.length && !pc.claimsAboutA.length && !pc.claimsAboutB.length && !events.length) return undefined;
+      const [aName, bName] = await Promise.all([
+        store.displayNameFor(event.guildId, aId), store.displayNameFor(event.guildId, bId),
+      ]);
+      return {
+        aName, bName,
+        aToB: pc.ab ? { summary: pc.ab.summary, valence: pc.ab.valence, observationCount: pc.ab.observationCount } : undefined,
+        bToA: pc.ba ? { summary: pc.ba.summary, valence: pc.ba.valence, observationCount: pc.ba.observationCount } : undefined,
+        reasons: pc.observations.map(o => ({ fromName: o.fromId === aId ? aName : bName, reason: o.reason, at: o.createdAt })),
+        claimsAboutA: pc.claimsAboutA,
+        claimsAboutB: pc.claimsAboutB,
+        sharedEvents: events.map(e => `${e.title} (${monthYear(e.occurredAt)})`),
+      };
+    }))).filter((x): x is PairContext => !!x);
     // Model-facing text carries names, never raw <@id> markup — real mention
     // tokens in stored content taught the model to greet users with fabricated
     // snowflakes ("Hey <@1549171765056638>!").
@@ -469,7 +498,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     // moments ago takes effect immediately, not after the next profile build.
     const authorName = await store.displayNameFor(event.guildId, event.authorId);
     const ownerName = message.guild.ownerId ? await store.displayNameFor(event.guildId, message.guild.ownerId) : undefined;
-    const reply = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, config.replyModel, config.replyTools && toolCues(event.content), client.user!.id, { guildName: message.guild.name, ownerName });
+    const reply = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, relationships, config.replyModel, config.replyTools && toolCues(event.content), client.user!.id, { guildName: message.guild.name, ownerName });
     const clean = reply ? scrubMentions(reply, lookups.names) : "";
     if (clean) {
       const sent = await message.reply({ content: clean, allowedMentions: { repliedUser: false } });

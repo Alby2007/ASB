@@ -1,89 +1,131 @@
-# Artificial Server Member — v1
+# ASB — Artificial Server Member
 
-An intentionally quiet Discord bot that observes conversations, forms a small persistent memory of people and server lore, and joins in when it is directly invited.
+A quiet Discord bot that learns who's in your server. It observes conversations, forms a small persistent memory of people, relationships, and server lore, and speaks when it's invited — directly mentioned, or when a configured threshold says it has something worth adding.
 
-## Version 1.1 — trusted memory
+Everything it remembers is inspectable, correctable, and forgettable by the person it concerns.
 
-1. Ingest messages and retain only server-visible content.
-2. Extract a small number of confidence-scored, durable memories.
-3. Recall relevant person and server memories in later conversations.
-4. Reply reliably to direct mentions and otherwise remain silent by default.
-5. Store messages and memories in Postgres so a restart does not erase its context.
-6. Make every curated memory inspectable, correctable, and forgettable by the person it concerns.
+---
 
-### Memory commands
+## What it does
 
-All replies are private (ephemeral) by default.
+**Observes** — archives messages to Postgres (respecting per-guild pause and member opt-out), learns name↔user aliases, and tracks who talks to whom.
 
-- `/memory` — list your active memories, eight at a time.
-- `/memory page:2`, `/memory search:Arsenal` — navigate or filter them.
-- `/memory memory_id:42` — inspect confidence, dates, confirmations, source quotes, and why the bot created that memory.
-- `/memory candidates:true` and `/memory-confirm memory_id:42` — inspect and explicitly promote uncertain memories. Candidates are never used in replies.
-- `/memory server:true` — show server lore (administrators can also inspect another member with `/memory about:@member`).
-- `/forget memory_id:42` — asks for confirmation, then marks that curated memory as forgotten. It does not delete raw source messages.
-- `/correct statement:"I don't support Arsenal anymore"` — creates the replacement memory and supersedes genuinely contradictory active memories.
-- `/memory-export` — download every memory and its evidence held about you.
-- `/memory stats:true` and `/memory-purge` — server-administrator controls for counts and raw-message retention.
-- `/opt-out` and `/opt-in` — forget everything remembered about you, delete your profile, and stop the bot forming new memories or relationships about you (raw messages still age out via retention).
-- `/memory-pause`, `/memory-resume`, `/memory-settings`, `/status`, and `/memory-triage` — server-administrator emergency and operational controls (`/status` shows uptime and error counters; `/memory-triage` lists the newest memories across all members).
-- `/event memory_id:42` — inspect the server event linked to a memory: participants, significance score, summary, and message count.
+**Remembers** — an LLM extracts durable candidates from messages that pass a cheap pre-filter. Each memory carries an evidence type (`explicit_fact`, `clear_preference`, `reported_by_other`, `sarcasm_or_joke`, …), a deterministic confidence score, provenance (source message, quote, timestamp), and a lifecycle status:
 
-Every curated memory keeps its lifecycle state (`active`, `stale`, `contested`, `superseded`, or `forgotten`) plus provenance: the source message, author, observation time, extraction reason, explicitness, and confirmation count.
+`candidate → active → contested → superseded / forgotten / quarantined`
 
-Out of scope for v1: autonomous proactive posts, relationship inference, rich server history, moderation, and a web dashboard. Those rely on reliable observation and memory first.
+**Verifies before it trusts** — candidate memories get a sincerity check (`literal` / `joke` / `misattributed` / `unclear`) before promotion; only promotable evidence types can reach `active`, and candidates are never used in replies. Near-duplicates fold together via trigram matching instead of accumulating.
 
-## Build order
+**Handles contradiction** — bot-addressed denials and corrections contest memories rather than silently overwriting them; support vs. contradiction net-score resolves the dispute, with the same evidence-type gate preventing rumors from laundering into facts.
 
-1. **This foundation:** Discord ingestion, Postgres memory, LLM extraction and mention replies.
-2. Add Discord slash commands: `/memory`, `/forget`, `/status` and consent controls.
-3. Add a reviewable memory queue and tests with synthetic conversation fixtures.
-4. Enable carefully rate-limited contextual interventions in one test channel.
-5. Add relationship memories and a server-lore timeline only after accuracy is proven.
+**Builds people** — per-member structured attributes (pronouns, timezone, location, occupation, birthday, traits, interests, skills) with per-facet provenance — every attribute knows exactly which memories cite it, so a forgotten fact never lingers as a rendered facet. On top of that: synthesized profile cards and admin-only deep dossiers (psychological profile, relationships, opinions, communication style, timeline).
 
-## Architecture at a glance
+**Maps the social graph** — relationship observations between members are sincerity-verified and rolled up into edges with net valence; interaction pairs feed into dossiers.
 
-ASB is a single TypeScript process. Every Discord message goes through a pre-filter, optional LLM memory extraction, Postgres persistence, and an event-detection pipeline before a reply is considered. See [`docs/architecture.md`](docs/architecture.md) for the full module map and data-flow diagram.
+**Follows events** — a continuity pipeline groups messages into server events, scores their significance, and promotes notable ones into retrievable lore.
 
-## Run locally
+**Replies** — to direct mentions and (above `SPEAK_THRESHOLD`) unsolicited, with member profiles and relevant memories as context, optional web-search tools, and low-effort reasoning for snappy responses.
 
-1. Create a Discord application and bot at the [Discord Developer Portal](https://discord.com/developers/applications). Enable the **Message Content Intent** under Bot → Privileged Gateway Intents, then invite it with `bot` permissions to a test server.
-2. Copy `.env.example` to `.env`, then supply the Discord bot token, Groq API key, and a `DATABASE_URL` pointing at Postgres (a free [Supabase](https://supabase.com) project works; use the Session pooler URL). Set `GUILD_ID` to the test server while developing. See [`docs/configuration.md`](docs/configuration.md) for all options.
-3. Install dependencies and start it:
+**Maintains itself** — a periodic sweep re-examines messages the live path missed; daily maintenance quarantines stale candidates, resolves contested memories, purges raw messages past retention, and rebuilds profiles.
 
-   ```bash
-   npm install
-   npm run dev
-   ```
+---
 
-Memory is stored in the Postgres database configured via `DATABASE_URL`; the schema is created automatically by migrations on startup. Treat it as community data: use a private test server first and tell members what is retained. Raw messages are automatically removed after `RAW_MESSAGE_RETENTION_DAYS` (30 by default), and administrators can manually purge them earlier. Curated memories and their short evidence quotes remain until forgotten, corrected, or later decayed by a retention policy.
+## Commands
 
-### Bulk-ingest historical messages
+All replies are ephemeral (private to the invoker) unless noted.
 
-To seed the memory store from an existing channel's history before going live:
+### Members
+
+| Command | What it does |
+|---------|--------------|
+| `/memory` | List your active memories (8/page; `page:`, `search:`, `memory_id:` to navigate/inspect, `candidates:true` for your unconfirmed queue, `server:true` for lore) |
+| `/memory-confirm` | Promote one of your own candidate memories to active |
+| `/memory-export` | Download every memory + evidence held about you |
+| `/forget` | Forget one of your memories (confirmation button required) |
+| `/correct` | Replace a memory — supersedes genuinely contradictory active ones |
+| `/opt-out` | Forget everything about you, delete your profile, stop forming new memories/relationships about you |
+| `/opt-in` | Reverse an opt-out |
+| `/profile` | View your profile card (another member's: admins only) |
+| `/dossier` | Deep dossier — facets, relationships, opinions, style, timeline (another member's: admins only) |
+| `/event` | Inspect the server event a memory is attached to |
+
+### Administrators (`Manage Server`)
+
+| Command | What it does |
+|---------|--------------|
+| `/memory about:@member` | Inspect another member's memories |
+| `/memory stats:true` | Guild memory counts |
+| `/memory-triage` | Newest memories across all members + contested attributes |
+| `/memory-purge` | Purge raw archived messages older than N days |
+| `/memory-pause` / `/memory-resume` | Stop/restart observing and replying — archiving included |
+| `/memory-settings` | Show effective guild settings |
+| `/status` | Uptime, error counters, pipeline health |
+
+---
+
+## Privacy model
+
+- **Pause means pause.** `/memory-pause` stops archiving entirely — no raw rows, no member-registry writes — not just extraction.
+- **Opt-out is strong.** No new memories, relationships, or attributes form about an opted-out member; existing derived data is forgotten.
+- **Deletes propagate.** Deleting a Discord message removes its archive row *and* scrubs the verbatim quote/snapshot on any evidence it produced. Edits update the archive (extraction-time snapshots are kept as the historical record).
+- **Retention is bounded.** Raw messages age out on `RAW_MESSAGE_RETENTION_DAYS`; curated evidence outlives the raw archive by design.
+- **Self-service.** Every member can see, export, correct, and forget their own data without admin involvement.
+
+---
+
+## Quick start
+
+**Prerequisites:** Node.js 20+, a Postgres database (a free [Supabase](https://supabase.com) project works — use the Session pooler URL), a Discord bot token with the Message Content intent, and a Groq API key.
 
 ```bash
-INGEST_CHANNEL=general-chat npm run ingest
+git clone https://github.com/Alby2007/ASB.git
+cd ASB
+npm install
+cp .env.example .env   # fill in DISCORD_TOKEN, GROQ_API_KEY, DATABASE_URL
+npm run dev            # or: npm start
 ```
 
-The script fetches the entire channel history in chronological order, runs the same memory-extraction and event-detection pipeline as the live bot, and then exits. Re-running it is safe — messages already processed are skipped.
+Migrations apply automatically on first boot — no manual SQL.
+
+**Backfill history** (optional): `INGEST_CHANNEL=channel-name npm run ingest` sweeps a channel's archive through the same triage → extract → verify pipeline.
+
+### Key configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | Base model for replies, extraction, synthesis |
+| `GUILD_ID` | *(all guilds)* | Restrict to one server — recommended while testing |
+| `SPEAK_THRESHOLD` | `0.70` | Minimum `decide()` score to speak; 0.70 ≈ mentions only |
+| `RAW_MESSAGE_RETENTION_DAYS` | `30` | Raw archive retention window |
+| `CANDIDATE_CONFIDENCE_THRESHOLD` | `0.70` | Confidence needed for candidate → active promotion |
+| `VERIFY_MODEL` … `REPLY_TOOLS` | per-workload | Model overrides and reply-tool toggles |
+
+Full reference: [docs/configuration.md](docs/configuration.md)
+
+---
 
 ## Development
 
 ```bash
-npm run check    # TypeScript type-check (no output = pass)
-npm test         # run all tests
-npm run dev      # start with live reload
+npm run check   # typecheck (tsc --noEmit, strict)
+npm test        # node:test suite — DB tests need TEST_DATABASE_URL
 ```
 
-See [`docs/development.md`](docs/development.md) for a full contributor guide including test coverage map, migration instructions, and debugging tips.
+15 co-located `*.test.ts` files cover the confidence math, evidence lifecycle, dedup, entity resolution, command authorization, attribute provenance cascades, and the LLM prompt parsers (via an injected fake client). DB-backed tests run in CI against Postgres 16.
 
-## Reliability behaviour
+Docs: [architecture](docs/architecture.md) · [schema](docs/schema.md) · [event pipeline](docs/event-pipeline.md) · [development guide](docs/development.md)
 
-The bot uses a local pre-filter before calling the memory model, so ordinary chat is archived but not sent for memory extraction. Clear, highly explicit observations become active memories; weaker ones become candidates. A daily maintenance job promotes repeated candidates and marks old weak candidates or old low-confidence memories as stale. Only active memories are eligible for replies.
+### Layout
 
-## Design guardrails
-
-- The bot has no hidden knowledge: its replies are bounded by stored memories and visible channel context.
-- Memory extraction rejects sensitive inferences and stores only durable, useful observations.
-- Speaking is conservative. In this initial build it responds only to direct mentions (and obeys the configured threshold).
-- Each remembered item includes confidence, importance, recency, and confirmation count so later releases can improve or retire it rather than treating every statement as fact.
+```
+src/
+  index.ts        # Discord wiring: handlers, retention, sweep, shutdown
+  brain.ts        # every LLM call (injectable client for tests)
+  database.ts     # MemoryStore — memories, evidence, lifecycle, maintenance
+  attributes.ts   # profile_attributes: provenance-backed structured facets
+  profiles.ts     # profile cards + dossier assembly
+  commands.ts     # slash commands (authz matrix under test)
+  perception.ts   # durable-signal pre-filter, naming detection
+  entity-resolution.ts / events.ts / contest.ts / ingest.ts / retry.ts / …
+scripts/          # ops tools (sweeps, backfills, verification) — run via tsx
+```

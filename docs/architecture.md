@@ -83,6 +83,10 @@ Discord MessageCreate
   brain.ts: reply()
   • recent channel context (<@id> tokens demangled to @names) + relevant
     memories: active plus candidates with promotable primary evidence types
+  • pairwise relationship context for every unordered pair among the
+    in-prompt people (≤6, author-involved first): directed edges both ways,
+    recent literal observation reasons, active memories each authored about
+    the other, shared events — zero-signal pairs are dropped
   • author addressed by freshest known name (learned aliases apply instantly)
   • reply output scrubbed: known <@id> → plain @Name, unknown ids stripped
   • temperature 0.9, max 1800 chars
@@ -130,6 +134,8 @@ Degenerate LLM output (repeated glyphs, JSON blobs) is detected per section and 
 Candidate memories pass a **sincerity verification** gate before they can activate: `Brain.verifyMemoriesBatch` re-judges each promotable candidate against its stored source message, the author's known names, and the preceding chat lines (literal / joke / unclear / misattributed). Verified literal self-reports promote to `active`; jokes are re-classified `sarcasm_or_joke` (confidence → 0.10, never promotable); `misattributed` verdicts — pasted/quoted text describing someone other than the poster — are forgotten outright; third-party literals stay candidate pending corroboration. Verification runs in `applyRetention()` and at the end of ingest before profile builds.
 
 Relationship assertions pass the analogous gate: `Brain.verifyRelationshipsBatch` labels each observation `literal` / `joke` / `unclear` against its source message and preceding lines, and `recomputeEdges()` rebuilds the derived `relationships` table from `literal` verdicts alone — an unverified or ironic claim ("we're basically married") never surfaces in `/profile`, dossier inputs, or the reply prompt. New edges therefore materialize at the next maintenance pass rather than at record time.
+
+On the reply path, `MemoryStore.pairwiseContext()` and `EventStore.sharedEvents()` assemble the *current-message* pairs — both directed edges, recent attributed observation reasons, per-pair claims (active memories about one side authored by the other), and events both attended — injected as a `Relationships:` prompt section separate from the flat `People:` profiles, so the model can reference shared history rather than reciting isolated facts. Direction is preserved (`subject_id` is the asserting side) and claims render attributed ("Bob claimed about Alice"), never as facts.
 
 Dedup runs at two tiers. The **hot path** uses the pg_trgm fallback in `saveMemory()` — a `similarity(content)` lookup scoped to `(guild, subject, kind)` reinforces one row instead of splitting rephrased extractions (with a polarity check so contradictions can't ride the merge). The **maintenance tier** is semantic: `Brain.dedupMemoriesBatch` scans each member's memory list nightly and proposes `duplicate`/`contradicts` groups — catching pairs with no lexical overlap that trigrams can't see ("allergic to peanuts" / "can't eat nuts"). `applyDedupGroups` merges confirmed groups deterministically: the canonical row keeps its status (merging never promotes), non-colliding evidence moves over (rows sharing a `message_id` stay on the loser — `memory_history` references them via FK), losers become `superseded` with an audit link. `contradicts` verdicts are logged to history only — truth arbitration stays with the contest/supersede machinery.
 

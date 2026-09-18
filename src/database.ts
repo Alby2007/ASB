@@ -521,6 +521,64 @@ export class MemoryStore {
     }));
   }
 
+  /** Everything the graph knows about one ordered pair: directed edges both
+   * ways, recent literal observations (subject_id is the asserting side), and
+   * the active memories each has authored about the other. Reply-path input —
+   * pairwise theory of mind distinct from either member's standalone profile. */
+  async pairwiseContext(guildId: string, aId: string, bId: string): Promise<{
+    ab?: RelationshipEdge;
+    ba?: RelationshipEdge;
+    observations: Array<{ fromId: string; toId: string; nature: string; valence: number | null; reason: string; createdAt: string }>;
+    claimsAboutA: string[];   // active memories about aId authored by bId
+    claimsAboutB: string[];   // active memories about bId authored by aId
+  }> {
+    const edgeRows = await this.sql<RelationshipRow[]>`
+      SELECT id, guild_id, subject_id, other_id, summary, valence, observation_count, last_observed_at, updated_at
+      FROM relationships
+      WHERE guild_id = ${guildId}
+        AND ((subject_id = ${aId} AND other_id = ${bId}) OR (subject_id = ${bId} AND other_id = ${aId}))
+    `;
+    const toEdge = (r: RelationshipRow): RelationshipEdge => ({
+      id: Number(r.id), guildId: r.guild_id, subjectId: r.subject_id, otherId: r.other_id,
+      summary: r.summary, valence: r.valence != null ? Number(r.valence) : null,
+      observationCount: Number(r.observation_count),
+      lastObservedAt: r.last_observed_at ? ts(r.last_observed_at) : null,
+      updatedAt: ts(r.updated_at),
+    });
+
+    const obsRows = await this.sql<Array<{
+      subject_id: string; other_id: string; nature: string; valence: number | null; reason: string; created_at: Date | string;
+    }>>`
+      SELECT subject_id, other_id, nature, valence, reason, created_at FROM relationship_observations
+      WHERE guild_id = ${guildId} AND verdict = 'literal'
+        AND ((subject_id = ${aId} AND other_id = ${bId}) OR (subject_id = ${bId} AND other_id = ${aId}))
+      ORDER BY created_at DESC LIMIT 5
+    `;
+
+    const claimRows = await this.sql<Array<{ subject_id: string; content: string; confidence: number }>>`
+      SELECT DISTINCT m.subject_id, m.content, m.confidence
+      FROM memories m
+      JOIN memory_evidence e ON e.memory_id = m.id
+      WHERE m.guild_id = ${guildId} AND m.status = 'active'
+        AND ((m.subject_id = ${aId} AND e.author_id = ${bId}) OR (m.subject_id = ${bId} AND e.author_id = ${aId}))
+      ORDER BY m.subject_id, m.confidence DESC LIMIT 8
+    `;
+
+    const ab = edgeRows.find(r => r.subject_id === aId);
+    const ba = edgeRows.find(r => r.subject_id === bId);
+    return {
+      ab: ab ? toEdge(ab) : undefined,
+      ba: ba ? toEdge(ba) : undefined,
+      observations: obsRows.map(r => ({
+        fromId: r.subject_id, toId: r.other_id, nature: r.nature,
+        valence: r.valence != null ? Number(r.valence) : null,
+        reason: r.reason, createdAt: ts(r.created_at),
+      })),
+      claimsAboutA: claimRows.filter(r => r.subject_id === aId).slice(0, 3).map(r => r.content),
+      claimsAboutB: claimRows.filter(r => r.subject_id === bId).slice(0, 3).map(r => r.content),
+    };
+  }
+
   /** Memories about a subject asserted by someone else — the community-attributed
    * claims that feed the dossier reputation section. */
   async thirdPartyClaims(guildId: string, subjectId: string): Promise<Array<{

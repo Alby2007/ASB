@@ -120,6 +120,28 @@ export class EventStore {
     return { events: await Promise.all(rows.map(r => this.hydrate(r))), total: Number(countResult[0].count), page };
   }
 
+  /** Promoted events both users participated in — the shared-history layer for
+   * pairwise reply context. Roles are returned per side so the caller can
+   * attribute them correctly. */
+  async sharedEvents(guildId: string, aId: string, bId: string, limit = 3): Promise<Array<{
+    title: string; occurredAt: string; roleA: string | null; roleB: string | null;
+  }>> {
+    const rows = await this.sql<Array<{
+      title: string; occurred_at: Date | string; role_a: string | null; role_b: string | null;
+    }>>`
+      SELECT e.title, e.occurred_at, pa.role AS role_a, pb.role AS role_b
+      FROM events e
+      JOIN event_participants pa ON pa.event_id = e.id AND pa.user_id = ${aId}
+      JOIN event_participants pb ON pb.event_id = e.id AND pb.user_id = ${bId}
+      WHERE e.guild_id = ${guildId} AND e.tier = 'event' AND e.title != ''
+      ORDER BY e.significance DESC, e.occurred_at DESC LIMIT ${limit}
+    `;
+    return rows.map(r => ({
+      title: r.title, occurredAt: ts(r.occurred_at),
+      roleA: r.role_a, roleB: r.role_b,
+    }));
+  }
+
   // ── Writes ─────────────────────────────────────────────────────────────────
 
   async createEvent(candidate: Omit<EventCandidate, "messageIds" | "memoryIds">): Promise<StoredEvent> {

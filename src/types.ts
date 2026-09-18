@@ -207,3 +207,21 @@ export type StoredEvent = EventCandidate & {
   createdAt: string;
   updatedAt: string;
 };
+
+/**
+ * Pairwise relationship context for the reply prompt — what two specific
+ * people assert about each other, separate from either one's standalone
+ * profile. Direction is load-bearing: aToB is what A (subject_id, the
+ * asserting side) says about B; bToA is the reverse. Claims are attributed
+ * assertions, not facts about the subject.
+ */
+export type PairContext = {
+  aName: string;
+  bName: string;
+  aToB?: { summary: string; valence: number | null; observationCount: number };
+  bToA?: { summary: string; valence: number | null; observationCount: number };
+  reasons: Array<{ fromName: string; reason: string; at: string }>;
+  claimsAboutA: string[];   // things B asserted about A
+  claimsAboutB: string[];   // things A asserted about B
+  sharedEvents: string[];   // "Title (Sep 2026)"
+};

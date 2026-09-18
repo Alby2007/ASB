@@ -42,7 +42,7 @@ const confidence = (value: number | undefined) => {
 };
 const display = (memory: Memory) => `**#${memory.id} · ${confidence(memory.confidence)} confidence**\n${memory.content}\n*${memory.mentions} confirmation${memory.mentions === 1 ? "" : "s"}; last confirmed ${new Date(memory.lastConfirmedAt).toLocaleDateString()}*`;
 
-export async function handleMemoryCommand(interaction: ChatInputCommandInteraction, store: MemoryStore, brain: Brain, evStore?: EventStore) {
+export async function handleMemoryCommand(interaction: ChatInputCommandInteraction, store: MemoryStore, brain: Brain, evStore?: EventStore, profileStore: ProfileStore = new ProfileStore()) {
   if (!interaction.guildId) return;
   const guildId = interaction.guildId;
   if (interaction.commandName === "memory") {
@@ -174,7 +174,7 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     const subjectId = member?.id ?? interaction.user.id;
     const memberRow = await store.getMember(guildId, subjectId);
     if (memberRow?.optedOut) return interaction.reply({ content: "This member has opted out of profiles.", ephemeral: true });
-    const profile = await new ProfileStore().getProfile(guildId, subjectId);
+    const profile = await profileStore.getProfile(guildId, subjectId);
     if (!profile) return interaction.reply({ content: "No profile has been built for that member yet. Profiles are generated during daily maintenance once enough has been observed.", ephemeral: true });
 
     const [edges, memories] = await Promise.all([
@@ -239,7 +239,7 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     const subjectId = member?.id ?? interaction.user.id;
     const memberRow = await store.getMember(guildId, subjectId);
     if (memberRow?.optedOut) return interaction.reply({ content: "This member has opted out of profiles.", ephemeral: true });
-    const profile = await new ProfileStore().getProfile(guildId, subjectId);
+    const profile = await profileStore.getProfile(guildId, subjectId);
     const dossier = profile?.facets.dossier?.sections;
     if (!profile || !dossier || Object.keys(dossier).length === 0) {
       return interaction.reply({ content: "No detailed profile has been built for that member yet.", ephemeral: true });
@@ -281,7 +281,7 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     await store.setMemberOptOut(guildId, userId, true);
     const forgotten = await store.forgetAllFor(guildId, userId);
     const relForgotten = await store.forgetRelationshipsFor(guildId, userId);
-    await new ProfileStore().deleteProfile(guildId, userId);
+    await profileStore.deleteProfile(guildId, userId);
     return interaction.reply({ content: `Opted out. ${forgotten} memor${forgotten === 1 ? "y" : "ies"} and ${relForgotten} relationship record${relForgotten === 1 ? "" : "s"} about you were forgotten and your profile was deleted — no new memories, relationships, or profile data will be formed about you while you're opted out. Your messages still appear in the raw archive until the server's retention window removes them. Use /opt-in to re-enable.`, ephemeral: true });
   }
   if (interaction.commandName === "opt-in") {
