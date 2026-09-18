@@ -371,6 +371,18 @@ const migrations: Migration[] = [
       await sql`ALTER TABLE profiles DROP COLUMN IF EXISTS attr_hash`;
     },
   },
+  {
+    version: 13,
+    name: "v13_proactive_enabled",
+    // Proactive speaking is a different consent shape than replying when
+    // addressed — per-server opt-in, default off, unlike reply_enabled.
+    up: async (sql) => {
+      await addColumn(sql, "server_settings", "proactive_enabled SMALLINT NOT NULL DEFAULT 0");
+    },
+    down: async (sql) => {
+      await sql`ALTER TABLE server_settings DROP COLUMN IF EXISTS proactive_enabled`;
+    },
+  },
 ];
 
 /** Highest known migration version — tests assert against this instead of a
@@ -440,6 +452,7 @@ export async function runMigrations(sql: Sql, targetVersion?: number): Promise<v
       guild_id          TEXT PRIMARY KEY,
       memory_enabled    SMALLINT NOT NULL DEFAULT 1,
       reply_enabled     SMALLINT NOT NULL DEFAULT 1,
+      proactive_enabled SMALLINT NOT NULL DEFAULT 0,
       raw_retention_days INTEGER NOT NULL DEFAULT 30
     )
   `;

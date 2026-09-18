@@ -156,6 +156,7 @@ test("admin commands refuse non-admin callers", async () => {
       ["status", {}],
       ["memory-triage", {}],
       ["memory-settings", {}],
+      ["proactive", { enabled: true }],
     ] as const) {
       const { interaction, replies } = stubCommand({ commandName, userId: "u-stranger", options });
       await handleMemoryCommand(interaction, store, brain);
@@ -173,6 +174,21 @@ test("/memory-pause flips both settings flags for admins only", async () => {
     const settings = await store.settings("g1");
     assert.equal(settings.memoryEnabled, 0);
     assert.equal(settings.replyEnabled, 0);
+  } finally { await sql.end(); }
+});
+
+test("/proactive persists the per-server flag, defaults off", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    // Default must be OFF — proactive is opt-in per server, unlike replies.
+    assert.equal((await store.settings("g1")).proactiveEnabled, 0);
+    const { interaction } = stubCommand({ commandName: "proactive", userId: "u-admin", admin: true, options: { enabled: true } });
+    await handleMemoryCommand(interaction, store, brain);
+    assert.equal((await store.settings("g1")).proactiveEnabled, 1);
+    const { interaction: off } = stubCommand({ commandName: "proactive", userId: "u-admin", admin: true, options: { enabled: false } });
+    await handleMemoryCommand(off, store, brain);
+    assert.equal((await store.settings("g1")).proactiveEnabled, 0);
   } finally { await sql.end(); }
 });
 

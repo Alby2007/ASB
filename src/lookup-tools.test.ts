@@ -167,6 +167,24 @@ test("searchMemories is guild-wide, active-only, importance-ordered", async () =
   } finally { await sql.end(); }
 });
 
+test("searchMemories kinds filter excludes person facts at the query level", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const lore = await store.saveMemory(msg("x", { authorId: "u1" }), { subjectId: "server", kind: "server_lore", content: "The Leeds meetup is on Thursday", reason: "t", evidenceType: "explicit_fact", effect: "support" });
+    const person = await store.saveMemory(msg("y", { authorId: "u2" }), { subjectId: "u2", kind: "person_fact", content: "Bob's timezone is Leeds GMT+1", reason: "t", evidenceType: "explicit_fact", effect: "support" });
+    const pref = await store.saveMemory(msg("z", { authorId: "u2" }), { subjectId: "u2", kind: "person_preference", content: "Bob prefers Leeds pubs", reason: "t", evidenceType: "clear_preference", effect: "support" });
+    await store.confirm("g1", lore.id); await store.confirm("g1", person.id); await store.confirm("g1", pref.id);
+    // Unrestricted search still sees everything (the reply-tool path).
+    assert.equal((await store.searchMemories("g1", "leeds")).length, 3);
+    // Proactive grounding passes kinds=['server_lore'] — personal data can
+    // never slip through a post-fetch filter into an unprompted answer.
+    const scoped = await store.searchMemories("g1", "leeds", 5, ["server_lore"]);
+    assert.equal(scoped.length, 1);
+    assert.equal(scoped[0].content, "The Leeds meetup is on Thursday");
+  } finally { await sql.end(); }
+});
+
 test("searchEvents matches titles and hydrates participants", async () => {
   const sql = makeTestSql();
   try {

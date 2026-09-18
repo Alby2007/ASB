@@ -135,9 +135,10 @@ One row per guild. Controls pause state and retention.
 | `guild_id` | TEXT PK | Discord server ID |
 | `memory_enabled` | INTEGER | 0 = paused; 1 = active |
 | `reply_enabled` | INTEGER | 0 = silent; 1 = replies allowed |
+| `proactive_enabled` | INTEGER | 0 = off (default); 1 = server opted in to proactive answers — requires the global `PROACTIVE=1` env flag too |
 | `raw_retention_days` | INTEGER | Rolling window for raw message purge |
 
-Row is created with defaults on first message from a guild. Administrators can override via `/memory-pause`, `/memory-resume`, and the `RAW_MESSAGE_RETENTION_DAYS` env variable.
+Row is created with defaults on first message from a guild. Administrators can override via `/memory-pause`, `/memory-resume`, `/proactive enabled:<bool>`, and the `RAW_MESSAGE_RETENTION_DAYS` env variable.
 
 ---
 

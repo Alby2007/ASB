@@ -130,3 +130,51 @@ const roomAddressSignals = /\b(?:did|does|do|can|could|has|have|is|are|was|were|
 export function roomAddressCue(content: string): boolean {
   return roomAddressSignals.test(content);
 }
+
+// Question words and filler that carry no topical signal for an ILIKE lookup —
+// "when are we meeting friday?" should search ["meeting","friday"], not the
+// whole literal string (which substring-matches nothing).
+const QUESTION_STOPWORDS = new Set([
+  "a","an","and","are","as","at","be","been","but","by","can","could","did","do",
+  "does","doing","for","from","had","has","have","having","he","her","here","him",
+  "his","how","i","if","in","is","it","its","me","my","of","on","or","our","she",
+  "should","so","that","the","their","them","there","they","this","to","us","was",
+  "we","were","what","when","where","which","who","whos","whose","why","will",
+  "with","would","you","your","yours","any","anyone","anybody","someone","somebody",
+  "everyone","everybody","gonna","wanna","like","just","still","really","actually",
+  "about","into","over","out","up","down","off","again","then","than","too","very",
+  "not","no","yes","yeah","ok","okay","well","um","uh","lol","lmao","haha","btw",
+  "hey","hi","yo","sup","bro","dude","man","pls","please","tho","though","idk",
+  "already","yet","ever","even","thing","things","stuff","way","kind","sort",
+  "get","got","getting","say","said","says","tell","told","know","knew","knows",
+  "think","thought","mean","meant","right","sure","maybe","probably","rn","irl",
+  "u","ur","thx","ty","np","nvm","etc","vs","via","per","re","bc","cuz","cos",
+  "let","lets","im","ive","id","youre","youve","youd","theyre","weve","hes",
+]);
+
+/**
+ * Pull topical content words out of a question for grounded-context lookup.
+ * Lowercases, strips punctuation/mentions/URLs, drops stopwords and tokens
+ * under 3 chars (except all-caps acronyms like "LAX" — those carry signal).
+ * Returns up to `max` terms in order of appearance, deduped.
+ */
+export function questionKeywords(content: string, max = 5): string[] {
+  const tokens = content
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/<[@#][!&:]?\d+>/g, " ")
+    .replace(/[@#][\w.-]+/g, " ")
+    .replace(/n't\b/g, " ")              // didn't → did (stopword), not "didn"
+    .replace(/'(s|re|ll|ve|d|m|t)\b/g, " ")
+    .replace(/[^\p{L}\p{N} ]/gu, " ")
+    .split(/\s+/);
+  const out: string[] = [];
+  for (const t of tokens) {
+    if (!t || QUESTION_STOPWORDS.has(t)) continue;
+    // keep content words ≥3 chars, plus short tokens carrying digits ("9pm", "v2")
+    if (t.length < 3 && !/\d/.test(t)) continue;
+    if (!out.includes(t)) out.push(t);
+    if (out.length >= max) break;
+  }
+  return out;
+}

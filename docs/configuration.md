@@ -40,6 +40,11 @@ ASB is configured through environment variables validated at startup by `src/con
 | `WAKE_WORD` | `1` | Saying the bot's name — its username, display name, server nickname, or `"asb"` — counts as addressing it (same as an @-mention: reply trigger, always-inspect, tools armed). Word-boundary matched, names under 3 chars ignored. `0` disables if casual name-drops get noisy. |
 | `ENGAGEMENT` | `1` | Conversational engagement: once someone addresses the bot (mention, reply-to-bot, or wake word), their follow-up messages get a mid-tier reply score (+0.70) for `ENGAGEMENT_TTL_MS` without re-mentioning — the bot stays in the thread. Participants expire independently and the TTL refreshes only on addressed messages, so the bot drops out when the conversation moves on even while people keep talking. Explicit dismissals ("shut up &lt;name&gt;", "we're done") drop the speaker immediately. `0` reverts to address-only replies. |
 | `ENGAGEMENT_TTL_MS` | `120000` | How long a participant stays "in conversation" after their last addressed message. Range 10s–1h. Longer = chattier mid-flow but slower to drop out. |
+| `PROACTIVE` | unset (off) | Proactive speaking global kill switch — **opt-in**, `1` required. When on, the bot may answer a question nobody answered after a channel silence, but only when it has grounded server lore/event context, only after the server's own `proactive_enabled` flag is set via `/proactive enabled:true`, and capped per channel per day. Any other value = feature entirely off regardless of server settings. |
+| `PROACTIVE_DELAY_MS` | `75000` | Idle silence a question must survive before the bot considers answering it. Range 15s–10min. Any follow-up message or reaction on the question cancels the pending attempt — the point is waiting to see if a human answers first. |
+| `PROACTIVE_DAILY_CAP` | `3` | Hard per-channel cap on proactive messages per day. Range 1–20. In-memory (restart resets) — bounds the worst case to "a few messages" no matter how many qualifying silences occur. |
+| `PROACTIVE_RESPONSE_WINDOW_MS` | `600000` | How long a sent proactive reply waits for engagement (a reply-edge or a reaction) before counting as ignored. Range 1min–1h. |
+| `PROACTIVE_BACKOFF_MS` | `21600000` | How long the elevated confidence floor stays hot after an ignored proactive reply (6h default). Range 5min–48h. While hot, the LLM gate requires higher confidence before the bot tries again. |
 
 ---
 
@@ -63,7 +68,8 @@ Administrators can adjust per-server behaviour at runtime without restarting the
 |---------|--------|
 | `/memory-pause` | Sets `memory_enabled=0` and `reply_enabled=0`. The bot stops observing and replying immediately. |
 | `/memory-resume` | Sets both back to 1. |
-| `/memory-settings` | Shows current values of `memory_enabled`, `reply_enabled`, and `raw_retention_days`. |
+| `/proactive enabled:<true|false>` | Sets `proactive_enabled` for this server. Off by default and independently required alongside the global `PROACTIVE=1` env flag — unprompted speech is a different risk profile than replying when addressed, so both must explicitly opt in. |
+| `/memory-settings` | Shows current values of `memory_enabled`, `reply_enabled`, `proactive_enabled`, and `raw_retention_days`. |
 | `/memory-purge older_than_days:N` | Manually deletes raw messages older than N days for this server (regardless of the global retention setting). |
 | `/status` | Shows bot uptime and in-process operational counters (LLM errors, contest misses, memories saved). |
 | `/memory-triage` | Shows the 15 most recently stored memories across all members, with status, kind, and subject. |
@@ -73,6 +79,7 @@ Administrators can adjust per-server behaviour at runtime without restarting the
 - `SPEAK_THRESHOLD` and `CANDIDATE_CONFIDENCE_THRESHOLD` are process-level constants. They apply to all guilds and can only be changed by restarting with different env values.
 - `RAW_MESSAGE_RETENTION_DAYS` sets the initial default for new guilds. Once a guild row exists in `server_settings`, the `raw_retention_days` column is the authoritative value for that guild.
 - `reply_enabled` is checked before `SPEAK_THRESHOLD`. A paused server will never receive a reply even if the score exceeds the threshold.
+- `proactive_enabled` requires `PROACTIVE=1` globally AND the per-server flag — double opt-in. Either switch independently suppresses the entire feature. Proactive answers draw only on `server_lore` memories and promoted events; `person_fact`/`person_preference` memories are excluded at the query layer, so the bot never volunteers personal facts unprompted. |
 
 ---
 

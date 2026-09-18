@@ -139,6 +139,52 @@ Discord MessageCreate
   Discord: message.reply()
 ```
 
+## Proactive speaking (v1: stranded questions)
+
+Exactly one unprompted trigger, self-limiting by construction: **an unanswered
+question the bot has a grounded answer to, after a real silence.** Everything
+else (banter, corrections, volunteering personal facts) is out of scope.
+
+```
+message ends in "?" && bot chose silence (!shouldSpeak)
+        │
+        ▼
+  proactive.ts: arm(key, messageId) — debounced per-channel timer
+  • any human follow-up message cancels (room isn't silent)
+  • a reaction ON the question cancels (room engaged with it)
+  • deleting the question cancels; a newer arm replaces the old
+        │ ~75s idle (PROACTIVE_DELAY_MS)
+        ▼
+  fireProactive() re-verifies at send time
+  • PROACTIVE=1 global AND server_settings.proactive_enabled — double opt-in,
+    either switch alone kills it (v13 migration, default off)
+  • re-fetch the question: deleted → gone, edited → re-check "?"
+  • daily cap (PROACTIVE_DAILY_CAP, default 3/channel, in-memory)
+  • backoff floor: an ignored prior attempt (no reply-edge or reaction within
+    PROACTIVE_RESPONSE_WINDOW_MS) raises the LLM gate's confidence floor until
+    PROACTIVE_BACKOFF_MS cools down or engagement resets the streak
+        │
+        ▼
+  Cheap gate: questionKeywords() → searchMemories(kinds=['server_lore'])
+  + searchEvents() — person_fact/person_preference excluded AT THE QUERY
+  LAYER: opting out of storage never consented to unprompted public
+  surfacing. Zero hits → zero LLM calls (the feature's cost bound)
+        │
+        ▼
+  brain.proposeGroundedAnswer(): one classifier call — does the context
+  actually answer, is volunteering appropriate, produce a one-liner +
+  confidence; null under the caller's floor
+        │
+        ▼
+  question.reply() (no pings) → archived like any reply → noteReply()
+  (share-of-voice accounting stays honest) → noteSent() tracks the outcome
+```
+
+Reactions are **observable signals only** — the bot never places them
+(GatewayIntentBits.GuildMessageReactions + partials; MessageReactionAdd
+resolves partials before interpreting). A reply-edge or reaction on a
+proactive message marks it engaged — it never feeds the ignored streak.
+
 ---
 
 ## Data flow — bulk ingest (`npm run ingest`)

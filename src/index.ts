@@ -1,12 +1,13 @@
-import { Client, Events, GatewayIntentBits, type Message, type OmitPartialGroupDMChannel } from "discord.js";
+import { Client, Events, GatewayIntentBits, Partials, type Message, type OmitPartialGroupDMChannel } from "discord.js";
 import OpenAI from "openai";
 import { Brain } from "./brain.js";
 import { config } from "./config.js";
 import { sql } from "./db.js";
 import { MemoryStore } from "./database.js";
 import { commandDefinitions, handleMemoryButton, handleMemoryCommand } from "./commands.js";
-import { detectDismissal, detectNamingRequest, detectSelfNaming, detectWakeWord, roomAddressCue, shouldInspectForMemory, toolCues } from "./perception.js";
+import { detectDismissal, detectNamingRequest, detectSelfNaming, detectWakeWord, questionKeywords, roomAddressCue, shouldInspectForMemory, toolCues } from "./perception.js";
 import { EngagementTracker } from "./engagement.js";
+import { ProactiveScheduler } from "./proactive.js";
 import { runContestCheck } from "./contest.js";
 import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
@@ -18,7 +19,12 @@ import { withRetry } from "./retry.js";
 import { inc } from "./metrics.js";
 import type { MessageEvent, PairContext } from "./types.js";
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMessageReactions],
+  // Reactions on uncached messages arrive as partials — the listener resolves
+  // them explicitly before interpreting.
+  partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.User],
+});
 const brain = new Brain(config.groqKey, config.model, config.groqBaseUrl);
 // Vision can live on a different provider than the main key (e.g. Gemini's
 // free tier, since Groq rotated its vision models off) — a second client is
@@ -31,6 +37,21 @@ const pipeline = new EventPipeline();
 // Conversational engagement: per-channel participant set with per-user TTLs —
 // who is actively talking *with* the bot, not just when it last spoke.
 const engagement = new EngagementTracker(config.engagementTtlMs);
+// Stranded-question trigger: a question arms a debounced timer; any follow-up
+// (message or reaction) cancels it — the point is waiting to see if a human
+// answers first. In-memory like EngagementTracker — restart resets the daily
+// cap and backoff state gracefully.
+const proactive = new ProactiveScheduler({
+  delayMs: config.proactiveDelayMs,
+  dailyCap: config.proactiveDailyCap,
+  responseWindowMs: config.proactiveResponseWindowMs,
+  backoffMs: config.proactiveBackoffMs,
+  baseMinConfidence: 0.6,
+  backoffMinConfidence: 0.85,
+});
+proactive.setFireHandler((key, messageId) => {
+  void fireProactive(key, messageId).catch(error => { inc("proactive.error"); console.error("Proactive fire failed", error); });
+});
 
 // MemoryStore.create() runs migrations; EventStore shares the same sql connection.
 let store: MemoryStore;
@@ -334,8 +355,27 @@ client.on(Events.MessageDelete, message => {
   if (!store) return;
   if (!message.guild) return;
   if (config.guildId && message.guild.id !== config.guildId) return;
+  // A deleted question is no longer stranded — drop any pending proactive arm.
+  proactive.cancelPending(`${message.guild.id}:${message.channelId}`, message.id);
   store.deleteMessage(message.guild.id, message.id)
     .catch(error => { inc("handler.message_error"); console.error("Message delete handling failed", error); });
+});
+
+// Reactions are observable signals only — the bot never places them. A
+// reaction on the pending question means the room engaged with it (answered or
+// acknowledged) → cancel; a reaction on a proactive reply means it landed →
+// don't count it as ignored toward backoff.
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+  try {
+    if (reaction.partial) reaction = await reaction.fetch().catch(() => reaction);
+    const msg = reaction.message.partial ? await reaction.message.fetch().catch(() => undefined) : reaction.message;
+    if (!msg?.guildId) return;
+    if (config.guildId && msg.guildId !== config.guildId) return;
+    if (user.id === client.user?.id) return;
+    const key = `${msg.guildId}:${msg.channelId}`;
+    if (proactive.isProactiveTarget(msg.id)) proactive.observeEngagement(msg.id);
+    else proactive.cancelPending(key, msg.id);
+  } catch (error) { inc("handler.reaction_error"); console.error("Reaction handling failed", error); }
 });
 
 // Alias maps are shared per guild rather than built per message — the same map
@@ -357,6 +397,57 @@ async function guildLookups(guildId: string): Promise<{ map: AliasMap; names: Ma
   const entry = { map, names, at: Date.now() };
   lookupCache.set(guildId, entry);
   return entry;
+}
+
+/**
+ * A pending question's timer survived — the room stayed silent. Re-verify
+ * everything at send time: kill switches, the question still existing and
+ * still being a question, the daily cap, then the two-stage gate (grounded
+ * context first, one LLM proposal only if something came back).
+ */
+async function fireProactive(key: string, messageId: string): Promise<void> {
+  const [guildId, channelId] = key.split(":");
+  if (!config.proactiveEnabled) return;
+  const settings = await store.settings(guildId, config.rawMessageRetentionDays);
+  if (!settings.proactiveEnabled || !settings.replyEnabled) return;
+  const gate = proactive.allow(key);
+  if (!gate.allowed) { inc("proactive.capped"); return; }
+  // Re-fetch: a deleted question fails the fetch, an edited one may no longer
+  // be a question — neither should earn a stale proactive answer.
+  const channel = await client.channels.fetch(channelId).catch(() => undefined);
+  if (!channel?.isTextBased()) return;
+  const question = await channel.messages.fetch(messageId).catch(() => undefined);
+  if (!question || !question.content.trimEnd().endsWith("?")) { inc("proactive.stale"); return; }
+  // Grounded context is server lore + promoted events ONLY — person facts and
+  // preferences are excluded at the query layer, not filtered after the fact,
+  // because opt-out-of-storage never consented to unprompted public surfacing.
+  // Zero hits → zero LLM calls; that bound is the feature's cost control.
+  const terms = questionKeywords(question.content);
+  const grounded = new Set<string>();
+  for (const t of terms) {
+    for (const m of await store.searchMemories(guildId, t, 3, ["server_lore"])) grounded.add(m.content);
+    for (const e of await eventStore.searchEvents(guildId, t, 2)) grounded.add(`event: ${e.title}${e.summary ? ` — ${e.summary}` : ""}`);
+    if (grounded.size >= 8) break;
+  }
+  if (!grounded.size) { inc("proactive.ungrounded"); return; }
+  const names = (await guildLookups(guildId)).names;
+  const proposal = await brain.proposeGroundedAnswer(demangleMentions(question.content, names), [...grounded].slice(0, 8), gate.minConfidence, config.replyModel);
+  if (!proposal) { inc("proactive.gated"); return; }
+  const clean = scrubMentions(proposal.answer, names);
+  if (!clean) return;
+  const sent = await question.reply({ content: clean, allowedMentions: { repliedUser: false } });
+  proactive.recordFire(key);
+  proactive.noteSent(key, sent.id);
+  // Proactive speech counts toward share-of-voice like any other reply — an
+  // invisible reply would corrupt the pacing accounting.
+  engagement.noteReply(key);
+  inc("proactive.fired");
+  await store.recordMessage({
+    guildId, channelId, messageId: sent.id,
+    authorId: client.user!.id, authorName: question.guild?.members.me?.displayName ?? client.user!.username,
+    content: clean, createdAt: sent.createdAt ?? new Date(), mentionsBot: false,
+  }, messageId, false);
+  await store.setTriageResults([{ id: sent.id, result: "noise" }]);
 }
 
 async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
@@ -499,6 +590,12 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   }
 
   const key = `${event.guildId}:${event.channelId}`;
+  // Any human follow-up means the room isn't silent — a pending stranded
+  // question is answered or abandoned, either way it's cancelled. A reply-edge
+  // to a sent proactive reply counts as engagement instead: it wasn't ignored,
+  // so it must not feed the ignored-streak backoff.
+  proactive.cancelPending(key);
+  if (replyToId) proactive.observeEngagement(replyToId);
   // This human message counts toward share-of-voice before scoring — it
   // dilutes the bot's floor share for the decide() below.
   engagement.noteMessage(key, false);
@@ -526,7 +623,17 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   const lastSpokeAt = engagement.lastSpokeAt(key);
   const elapsedSinceLastSpoke = lastSpokeAt === undefined ? Infinity : Date.now() - lastSpokeAt;
   const decision = brain.decide(event, elapsedSinceLastSpoke, engaged, engagement.botShare(key), config.speakThreshold);
-  if (!settings.replyEnabled || !decision.shouldSpeak) return;
+  if (!settings.replyEnabled || !decision.shouldSpeak) {
+    // The bot stayed silent on a question — arm the stranded-question timer.
+    // A question it already answered never reaches here, so it can't be
+    // answered twice. Everything re-checks at fire time; this is only the arm.
+    if (settings.replyEnabled && !decision.shouldSpeak
+      && config.proactiveEnabled && settings.proactiveEnabled
+      && event.content.trimEnd().endsWith("?")) {
+      proactive.arm(key, event.messageId);
+    }
+    return;
+  }
   try {
     await message.channel.sendTyping();
     // Inject profile cards for the author, @-mentioned users, and name-referenced members.

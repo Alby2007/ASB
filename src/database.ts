@@ -60,7 +60,7 @@ type MessageRow = {
   author_name: string; content: string; created_at: Date | string;
 };
 
-type SettingsRow = { guild_id: string; memory_enabled: number; reply_enabled: number; raw_retention_days: number };
+type SettingsRow = { guild_id: string; memory_enabled: number; reply_enabled: number; proactive_enabled: number; raw_retention_days: number };
 
 type MemberRow = {
   guild_id: string; user_id: string; known_names: string[];
@@ -143,15 +143,15 @@ export class MemoryStore {
 
   // settings() runs on every message, so it's cached per guild; setPaused is the
   // only writer and invalidates. The TTL bounds staleness from out-of-band edits.
-  private settingsCache = new Map<string, { value: { guildId: string; memoryEnabled: number; replyEnabled: number; rawRetentionDays: number }; at: number }>();
+  private settingsCache = new Map<string, { value: { guildId: string; memoryEnabled: number; replyEnabled: number; proactiveEnabled: number; rawRetentionDays: number }; at: number }>();
 
-  async settings(guildId: string, defaultRetentionDays = 30): Promise<{ guildId: string; memoryEnabled: number; replyEnabled: number; rawRetentionDays: number }> {
+  async settings(guildId: string, defaultRetentionDays = 30): Promise<{ guildId: string; memoryEnabled: number; replyEnabled: number; proactiveEnabled: number; rawRetentionDays: number }> {
     const cached = this.settingsCache.get(guildId);
     if (cached && Date.now() - cached.at < 60_000) return cached.value;
     await this.ensureSettings(guildId, defaultRetentionDays);
-    const rows = await this.sql<SettingsRow[]>`SELECT guild_id, memory_enabled, reply_enabled, raw_retention_days FROM server_settings WHERE guild_id = ${guildId}`;
+    const rows = await this.sql<SettingsRow[]>`SELECT guild_id, memory_enabled, reply_enabled, proactive_enabled, raw_retention_days FROM server_settings WHERE guild_id = ${guildId}`;
     const r = rows[0];
-    const value = { guildId: r.guild_id, memoryEnabled: Number(r.memory_enabled), replyEnabled: Number(r.reply_enabled), rawRetentionDays: Number(r.raw_retention_days) };
+    const value = { guildId: r.guild_id, memoryEnabled: Number(r.memory_enabled), replyEnabled: Number(r.reply_enabled), proactiveEnabled: Number(r.proactive_enabled), rawRetentionDays: Number(r.raw_retention_days) };
     this.settingsCache.set(guildId, { value, at: Date.now() });
     return value;
   }
@@ -160,6 +160,13 @@ export class MemoryStore {
     await this.ensureSettings(guildId, defaultRetentionDays);
     const v = paused ? 0 : 1;
     await this.sql`UPDATE server_settings SET memory_enabled = ${v}, reply_enabled = ${v} WHERE guild_id = ${guildId}`;
+    this.settingsCache.delete(guildId);
+  }
+
+  /** Per-server proactive opt-in — independent of memory/reply pause. */
+  async setProactive(guildId: string, enabled: boolean, defaultRetentionDays = 30): Promise<void> {
+    await this.ensureSettings(guildId, defaultRetentionDays);
+    await this.sql`UPDATE server_settings SET proactive_enabled = ${enabled ? 1 : 0} WHERE guild_id = ${guildId}`;
     this.settingsCache.delete(guildId);
   }
 
@@ -1380,11 +1387,15 @@ export class MemoryStore {
   }
 
   /** Guild-wide active-memory text search — the search_memories lookup tool.
-   * Importance-weighted, bounded; only 'active' rows ever surface. */
-  async searchMemories(guildId: string, query: string, limit = 5): Promise<Array<{ subjectId: string; content: string; confidence: number }>> {
+   * Importance-weighted, bounded; only 'active' rows ever surface.
+   * `kinds` restricts at query level — proactive grounding passes
+   * ['server_lore'] so person facts/preferences can never slip through a
+   * post-fetch filter bug into an unprompted public answer. */
+  async searchMemories(guildId: string, query: string, limit = 5, kinds?: string[]): Promise<Array<{ subjectId: string; content: string; confidence: number }>> {
     const rows = await this.sql<Array<{ subject_id: string; content: string; confidence: number }>>`
       SELECT subject_id, content, confidence FROM memories
       WHERE guild_id = ${guildId} AND status = 'active' AND content ILIKE ${`%${query}%`}
+      ${kinds?.length ? this.sql`AND kind = ANY(${kinds})` : this.sql``}
       ORDER BY importance * confidence DESC LIMIT ${limit}
     `;
     return rows.map(r => ({ subjectId: r.subject_id, content: r.content, confidence: Number(r.confidence) }));

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { detectDismissal, detectNamingRequest, detectSelfNaming, detectWakeWord, roomAddressCue, shouldInspectForMemory } from "./perception.js";
+import { detectDismissal, detectNamingRequest, detectSelfNaming, detectWakeWord, questionKeywords, roomAddressCue, shouldInspectForMemory } from "./perception.js";
 import type { MessageEvent } from "./types.js";
 
 function msg(content: string, overrides: Partial<MessageEvent> = {}): MessageEvent {
@@ -130,4 +130,29 @@ test("roomAddressCue leaves bot-directed engaged messages alone", () => {
   assert.equal(roomAddressCue("Bro just do it"), false);
   assert.equal(roomAddressCue("that's not what I said"), false);
   assert.equal(roomAddressCue("lol nice"), false);
+});
+
+// ── questionKeywords ──────────────────────────────────────────────────────────
+
+test("questionKeywords pulls topical content words out of a question", () => {
+  assert.deepEqual(questionKeywords("when are we meeting friday?"), ["meeting", "friday"]);
+  assert.deepEqual(questionKeywords("didn't we already decide on Thursday for the trip?"), ["decide", "thursday", "trip"]);
+  assert.deepEqual(questionKeywords("what time is the raid starting at?"), ["time", "raid", "starting"]);
+});
+
+test("questionKeywords strips mentions, URLs, and punctuation", () => {
+  assert.deepEqual(questionKeywords("hey <@1234> when's the scrim?? https://x.com/y"), ["scrim"]);
+  assert.deepEqual(questionKeywords("is @bob coming tonight"), ["coming", "tonight"]);
+});
+
+test("questionKeywords keeps digit-carrying tokens and drops pure filler", () => {
+  assert.deepEqual(questionKeywords("are we still doing the 9pm scrim"), ["9pm", "scrim"]);
+  assert.deepEqual(questionKeywords("lol why tho"), []);                    // no topical signal
+  assert.deepEqual(questionKeywords("???"), []);
+});
+
+test("questionKeywords caps and dedupes", () => {
+  const many = questionKeywords("apple banana cherry durian elderberry fig grape");
+  assert.equal(many.length, 5);
+  assert.deepEqual(questionKeywords("raid raid raid tonight raid"), ["raid", "tonight"]);
 });

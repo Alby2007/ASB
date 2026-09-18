@@ -841,4 +841,31 @@ BOUNDARIES
     });
     return response.output_text.trim().slice(0, 1800);
   }
+
+  /**
+   * Proactive gate: does grounded server-lore/event context actually answer a
+   * stranded question? Returns a concise answer + confidence, or null when the
+   * context doesn't answer it, volunteering it is inappropriate, or confidence
+   * is under the caller's floor (which the scheduler raises while backing off).
+   * Grounding is server lore and events only — person_fact/person_preference
+   * memories are excluded at the query layer, and the prompt reinforces that
+   * volunteering personal facts unprompted is off-limits.
+   */
+  async proposeGroundedAnswer(question: string, grounded: string[], minConfidence = 0.6, model?: string): Promise<{ answer: string; confidence: number } | null> {
+    const response = await this.client.responses.create({
+      model: model ?? this.model,
+      text: { format: { type: "json_schema", name: "grounded_answer", strict: true, schema: {
+        type: "object", properties: {
+          answers: { type: "boolean" },
+          appropriate: { type: "boolean" },
+          answer: { type: "string" },
+          confidence: { type: "number" },
+        }, required: ["answers", "appropriate", "answer", "confidence"], additionalProperties: false }
+      } },
+      input: `A question was asked in a Discord server and nobody answered it. Below is grounded context from the server's own memory (server lore and events only — nothing personal about individual members).\n\nDecide:\n- answers: does the context actually answer the question? Tangentially related is not an answer.\n- appropriate: is it appropriate to volunteer this answer unprompted? Say no for rhetorical questions, inside jokes you can't verify, questions needing personal info about a member, or anything where guessing wrong would be worse than silence.\n- answer: if both are yes, a concise casual answer (one line, no preamble). Otherwise empty string.\n- confidence: 0..1 that the answer is correct and welcome.\n\nQuestion: ${question}\n\nGrounded context:\n${grounded.map((g, i) => `${i + 1}. ${g}`).join("\n")}`
+    });
+    const r = JSON.parse(response.output_text) as { answers: boolean; appropriate: boolean; answer: string; confidence: number };
+    if (!r.answers || !r.appropriate || !r.answer.trim() || r.confidence < minConfidence) return null;
+    return { answer: r.answer.trim().slice(0, 500), confidence: r.confidence };
+  }
 }

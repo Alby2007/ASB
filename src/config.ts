@@ -29,6 +29,11 @@ const env = z.object({
   WAKE_WORD: z.string().optional(),
   ENGAGEMENT: z.string().optional(),
   ENGAGEMENT_TTL_MS: z.coerce.number().int().min(10_000).max(3_600_000).default(120_000),
+  PROACTIVE: z.string().optional(),
+  PROACTIVE_DELAY_MS: z.coerce.number().int().min(15_000).max(600_000).default(75_000),
+  PROACTIVE_DAILY_CAP: z.coerce.number().int().min(1).max(20).default(3),
+  PROACTIVE_RESPONSE_WINDOW_MS: z.coerce.number().int().min(60_000).max(3_600_000).default(600_000),
+  PROACTIVE_BACKOFF_MS: z.coerce.number().int().min(300_000).max(172_800_000).default(21_600_000),
   VISION_BASE_URL: z.string().optional(),
   IMAGE_MAX_BYTES: z.coerce.number().int().min(1).default(4_000_000),
 }).parse(process.env);
@@ -71,4 +76,12 @@ export const config = {
   // window size are separate knobs — engagement is what makes the bot chattier.
   engagement: env.ENGAGEMENT !== "0",
   engagementTtlMs: env.ENGAGEMENT_TTL_MS,
+  // Proactive speaking is OPT-IN at both levels: env must say 1 AND the
+  // server's proactive_enabled flag must be set — stricter than WAKE_WORD/
+  // ENGAGEMENT because unprompted speech is a different risk profile.
+  proactiveEnabled: env.PROACTIVE === "1",
+  proactiveDelayMs: env.PROACTIVE_DELAY_MS,
+  proactiveDailyCap: env.PROACTIVE_DAILY_CAP,
+  proactiveResponseWindowMs: env.PROACTIVE_RESPONSE_WINDOW_MS,
+  proactiveBackoffMs: env.PROACTIVE_BACKOFF_MS,
 };
