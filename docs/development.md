@@ -53,7 +53,14 @@ Tests live alongside source files as `*.test.ts`. Run them all with `npm test`.
 | `reliability.test.ts` | Pre-filter (`shouldInspectForMemory`); candidate promotion gates (evidence type allowlist); lifecycle transitions; age-weighted quarantine |
 | `adversarial.test.ts` | Sarcasm and `uncertain_inference` volume accumulation cannot promote; `reported_by_other` promotion gate; confidence manipulation via contradiction timing; contested state confidence freeze |
 | `event.test.ts` | Heuristic scoring signals (reply chain, participant overlap, keyword overlap, recency, back-reference); `calculateSignificance` tier assignment; retroactive promotion threshold |
-| `brain.test.ts` | `decide()` scoring: direct mention overrides recency penalty; recency penalty applies to non-mention messages; unmentioned chatter stays below threshold |
+| `brain.test.ts` | `decide()` scoring: direct mention overrides recency penalty; recency penalty applies to non-mention messages; unmentioned chatter stays below threshold. Extraction/contest/verification prompt parsing via an injected `LlmClient` stub |
+| `attributes.test.ts` | `normalizeValue`/`attributeHash` canonicalisation; `deriveAttributeStatus` precedence (contested > active > candidate > quarantined); `applyProposals` upsert-diff: exact revive, trgm fold, singular supersession, provenance cascades |
+| `commands.test.ts` | Slash-command authorization matrix: non-admin vs admin cross-member views, opt-out/forget ownership, confirm-button userId binding, admin-gated commands |
+| `dedup.test.ts` | Trigram near-duplicate merge: same-claim phrasing reinforces instead of duplicating; distinct content stays separate; episodes never fuzzy-merge |
+| `entity-resolution.test.ts` | `resolveSubject` mention/name/self-resolution; `buildAliasMap` from `known_names`; `findMentionedUsers` matching rules |
+| `perception.test.ts` | Durable-signal pre-filter patterns; bot-addressed bypass; `detectNamingRequest`/`detectSelfNaming` extraction and stopword rejection |
+| `profiles.test.ts` | `recordMessage` member upsert/dedup/`reply_to_id`; `buildProfiles` eligibility gates, attribute pipeline, dossier build |
+| `tools.test.ts` | `isSafeUrl` SSRF guards; `stripHtml`/`parseDdgLite` parsing; `executeTool` error strings never throw |
 
 ### Adding a test
 
@@ -84,7 +91,7 @@ test("description of what you are testing", async () => {
 });
 ```
 
-`brain.test.ts` and `confidence.test.ts` are the only tests that require no database.
+`brain.test.ts`, `confidence.test.ts`, `attributes.test.ts`, `perception.test.ts`, and `tools.test.ts` run without a database.
 
 ---
 
@@ -142,10 +149,10 @@ No local files are written. There is no `data/` directory.
 
 ### Groq rate limits (ingest)
 
-`ingest.ts` paces LLM calls at ~7.5 RPM by default (`LLM_DELAY_MS = 8000`). If you hit 429 errors:
-- The script reads the `x-ratelimit-reset-tokens` header and waits accordingly.
+`ingest.ts` paces LLM calls with `BATCH_DELAY_MS = 3000` between extraction batches and `TRIAGE_DELAY_MS = 1500` between triage calls. If you hit 429 errors:
+- The script reads the `x-ratelimit-reset-tokens` header and waits accordingly (shared `withRetry` in `src/retry.ts`).
 - Up to 6 retries are attempted with exponential backoff.
-- You can increase `LLM_DELAY_MS` at the top of `ingest.ts` if your Groq tier has tighter limits.
+- You can increase the `*_DELAY_MS` constants at the top of `ingest.ts` if your Groq tier has tighter limits.
 
 ### Bot not responding to direct mentions
 

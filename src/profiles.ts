@@ -198,7 +198,11 @@ export class ProfileStore {
       // via the upsert-diff, and the catch-all for every activation path plus
       // the lazy backfill for memories that predate this feature.
       const detProposals = active.flatMap(m => extractDeterministic({ id: m.id, kind: m.kind, content: m.content }));
-      if (detProposals.length) await applyProposals(this.sql, guildId, member.userId, detProposals);
+      // A DB error here must fail this member's pass, not the guild's build.
+      if (detProposals.length) {
+        try { await applyProposals(this.sql, guildId, member.userId, detProposals); }
+        catch (error) { console.error(`Attribute upsert failed for ${member.userId}`, error); }
+      }
 
       // LLM extraction is gated: memory-fingerprint change, or the member has
       // never been through extraction (attr_hash unset = first pass / lazy

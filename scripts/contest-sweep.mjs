@@ -40,13 +40,11 @@ for (const r of flagged) {
     content: r.content, createdAt: new Date(r.created_at), mentionsBot: true,
   };
   try {
-    const mems = await store.contestableMemories(event.guildId, event.authorId);
-    const rels = mems.length ? await brain.detectContest(event, mems.map(m => ({ id: m.id, content: m.content, status: m.status })), model) : [];
-    console.log(`  ${r.author_name}: "${r.content.slice(0, 60)}" → rels: ${JSON.stringify(rels)}`);
+    // runContestCheck does its own detectContest call — calling it here too
+    // would double the LLM spend for zero benefit.
     const res = await runContestCheck(event, brain, store, botId, model);
     contests += res.contests; confirms += res.confirms;
-    const m = await store.getMemory(event.guildId, 43);
-    console.log(`    applied: ${res.contests} contests, ${res.confirms} confirms | #43 → ${m.status}@${m.confidence}`);
+    console.log(`  ${r.author_name}: "${r.content.slice(0, 60)}" → ${res.contests} contests, ${res.confirms} confirms`);
     await new Promise(x => setTimeout(x, 2000));
   } catch (err) {
     errors++;

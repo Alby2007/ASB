@@ -3,9 +3,19 @@ import type { Memory } from "./database.js";
 import { executeTool, replyToolDefs } from "./tools.js";
 import type { AttributeProposal, ContinuityDecision, Decision, DossierSection, ExtractionResult, MemoryCandidate, MessageEvent, ProfileSynthesis, ProfileSynthesisInput, StoredEvent, VerificationVerdict } from "./types.js";
 
+// Minimal client seam — anything exposing the two call shapes Brain uses
+// (responses.create + chat.completions.create) can drive it, which is what
+// makes extraction/verification/contest testable without a live API.
+export interface LlmClient {
+  responses: { create: (params: any) => Promise<any> };
+  chat: { completions: { create: (params: any) => Promise<any> } };
+}
+
 export class Brain {
-  private client: OpenAI;
-  constructor(apiKey: string, private model: string, baseURL?: string) { this.client = new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) }); }
+  private client: LlmClient;
+  constructor(apiKey: string, private model: string, baseURL?: string, client?: LlmClient) {
+    this.client = client ?? new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
+  }
 
   decide(event: MessageEvent, recentBotMessages: number, threshold = 0.7): Decision {
     const reasons: string[] = [];
@@ -707,7 +717,7 @@ export class Brain {
             tool_choice: "auto",
           });
           const msg = res.choices[0]?.message;
-          const calls = (msg?.tool_calls ?? []).filter(c => c.type === "function");
+          const calls = (msg?.tool_calls ?? []).filter((c: any) => c.type === "function");
           if (!calls.length) return (msg?.content ?? "").trim().slice(0, 1800);
           messages.push(msg!);
           for (const call of calls) {

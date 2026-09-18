@@ -1,24 +1,13 @@
 import 'dotenv/config';
 import { MemoryStore } from './src/database.ts';
 import { Brain } from './src/brain.ts';
+import { withRetry } from './src/retry.ts';
 
 const store = await MemoryStore.create();
 const brain = new Brain(process.env.GROQ_API_KEY, process.env.GROQ_MODEL, process.env.GROQ_BASE_URL ?? 'https://api.groq.com/openai/v1');
 const model = process.env.VERIFY_MODEL ?? process.env.INGEST_MODEL ?? 'qwen/qwen3.8-27b';
 const BATCH = 5;
 const DELAY_MS = 2000;
-
-async function withRetry(fn, retries = 4) {
-  for (let i = 0; i < retries; i++) {
-    try { return await fn(); } catch (err) {
-      if (err.message.includes('429') && i < retries - 1) {
-        const wait = (i + 1) * 30_000;
-        console.log(`  [429] waiting ${wait / 1000}s...`);
-        await new Promise(r => setTimeout(r, wait));
-      } else throw err;
-    }
-  }
-}
 
 const items = await store.listVerifiableCandidates(process.env.GUILD_ID);
 console.log(`verifying ${items.length} candidates (model: ${model})...`);

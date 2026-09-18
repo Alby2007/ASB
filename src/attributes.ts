@@ -171,6 +171,17 @@ export async function applyProposals(
   subjectId: string,
   proposals: AttributeProposal[]
 ): Promise<{ inserted: number; folded: number; revived: number; superseded: number }> {
+  // One transaction per call — a mid-loop failure must not leave a
+  // half-applied proposal set behind.
+  return await sql.begin(async tx => applyProposalsTx(tx, guildId, subjectId, proposals));
+}
+
+async function applyProposalsTx(
+  sql: Sql,
+  guildId: string,
+  subjectId: string,
+  proposals: AttributeProposal[]
+): Promise<{ inserted: number; folded: number; revived: number; superseded: number }> {
   let inserted = 0, folded = 0, revived = 0, superseded = 0;
 
   for (const proposal of proposals) {

@@ -6,6 +6,7 @@ import { ProfileStore } from './src/profiles.ts';
 import { EventStore } from './src/events.ts';
 import { shouldInspectForMemory } from './src/perception.ts';
 import { buildAliasMap, findMentionedUsers, resolveSubject } from './src/entity-resolution.ts';
+import { withRetry } from './src/retry.ts';
 
 // One-off backfill: relationship extraction over the archived messages.
 // Persists ONLY relationship observations — the archive's memories were already
@@ -18,23 +19,6 @@ const BATCH_SIZE = 5;
 const DELAY_MS = 3000;
 const MODEL = process.env.INGEST_MODEL ?? 'qwen/qwen3.8-27b';
 const VERIFY = process.env.VERIFY_MODEL ?? 'qwen/qwen3.8-27b';
-
-// Same 429 handling as ingest.ts: honor Groq's reset headers, then back off.
-async function withRetry(fn, retries = 6) {
-  for (let i = 0; i < retries; i++) {
-    try { return await fn(); } catch (err) {
-      if (err.message.includes('429') && i < retries - 1) {
-        const tokenReset = err.headers?.get('x-ratelimit-reset-tokens');
-        const retryAfter = err.headers?.get('retry-after');
-        const wait = tokenReset ? Math.ceil(parseFloat(tokenReset) * 1000) + 1000
-          : retryAfter ? parseInt(retryAfter) * 1000 + 1000 : (i + 1) * 30_000;
-        console.log(`  [429] waiting ${(wait / 1000).toFixed(1)}s...`);
-        await new Promise(x => setTimeout(x, wait));
-      } else throw err;
-    }
-  }
-  throw new Error('exhausted retries');
-}
 
 const sql = postgres(process.env.DATABASE_URL, { max: 1, onnotice: () => {} });
 const store = await MemoryStore.create();

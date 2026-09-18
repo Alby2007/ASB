@@ -18,7 +18,7 @@ ASB is configured through environment variables validated at startup by `src/con
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GROQ_MODEL` | `openai/gpt-oss-20b` | Model name passed to Groq. `openai/gpt-oss-20b` is fast and free; `openai/gpt-oss-120b` is more capable. |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | Model name passed to Groq. `openai/gpt-oss-120b` is the default; `openai/gpt-oss-20b` is faster and cheaper. |
 | `GROQ_BASE_URL` | `https://api.groq.com/openai/v1` | Override the Groq base URL. Useful for proxies or self-hosted endpoints. |
 | `GUILD_ID` | (empty) | If set, restricts the bot to a single Discord server. **Recommended during development** to avoid accidental activity in other servers. Leave empty to enable all servers the bot has joined. |
 | `SPEAK_THRESHOLD` | `0.70` | Minimum `brain.decide()` score required to send a reply. Range 0–1. A score of 0.70 means the bot will normally only speak when directly @mentioned (which scores 0.90). Lowering this value enables more frequent unsolicited replies. |

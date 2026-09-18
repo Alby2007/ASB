@@ -307,6 +307,7 @@ client.on(Events.MessageCreate, message => {
 // is deliberately left alone — it's the record of what was observed, not a
 // mirror of current content.
 client.on(Events.MessageUpdate, (_old, message) => {
+  if (!store) return; // before init() completes — a sync TypeError would escape .catch
   if (!message.guild || message.author?.bot || !message.content?.trim()) return;
   if (config.guildId && message.guild.id !== config.guildId) return;
   store.updateMessageContent(message.guild.id, message.id, message.content)
@@ -316,6 +317,7 @@ client.on(Events.MessageUpdate, (_old, message) => {
 // Deletes remove the raw row (so the sweep never extracts deleted content)
 // and scrub the verbatim text on any evidence it already produced.
 client.on(Events.MessageDelete, message => {
+  if (!store) return;
   if (!message.guild) return;
   if (config.guildId && message.guild.id !== config.guildId) return;
   store.deleteMessage(message.guild.id, message.id)
@@ -422,6 +424,10 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
         if (subjectId === "unknown" || otherId === "unknown") continue;
         await store.recordRelationship(event.guildId, subjectId, otherId, event.messageId, rel.nature, rel.valence, rel.reason ?? "");
       }
+      // Terminal mark: extraction ran to completion, even if it yielded
+      // nothing — without this a zero-yield regex message gets one redundant
+      // sweep pass before ingest-side marking would catch it.
+      await store.setTriageResults([{ id: event.messageId, result: "extracted" }]);
     } catch (error) { inc("llm.extract_error"); console.error("Memory extraction failed", error); }
   }
   // Contest detection: bot-addressed denials/corrections update the memories they target

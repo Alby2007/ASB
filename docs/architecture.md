@@ -15,7 +15,7 @@ ASB (Artificial Server Member) is a single TypeScript/Node process that connects
 | `src/types.ts` | `MessageEvent`, `MemoryCandidate`, `StoredEvent`, `Decision`, … | Shared TypeScript types shared across modules |
 | `src/database.ts` | `MemoryStore` | Postgres persistence: memory CRUD, lifecycle, conflict resolution, episode consolidation |
 | `src/events.ts` | `EventStore` | Postgres persistence: event CRUD, participants, message/memory attachments |
-| `src/migrations.ts` | `runMigrations`, `getMigrationVersion` | Versioned schema migrations (v1–v5) with rollback support |
+| `src/migrations.ts` | `runMigrations`, `getMigrationVersion` | Versioned schema migrations (v1–v12, `LATEST_MIGRATION_VERSION`) with rollback support |
 | `src/confidence.ts` | `calculateInitialConfidence`, `updateConfidence`, `calculateDefaultImportance`, `calculateDefaultExplicitness` | Deterministic numeric formulas; no LLM involvement |
 | `src/perception.ts` | `shouldInspectForMemory`, `detectNamingRequest`, `detectSelfNaming` | Cheap pre-filter: prevents LLM calls for ordinary chat; detects explicit naming requests and self-naming |
 | `src/event-detection.ts` | `EventPipeline` | Heuristic + LLM continuity decisions; nightly maintenance |
