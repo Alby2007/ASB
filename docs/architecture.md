@@ -13,6 +13,8 @@ ASB (Artificial Server Member) is a single TypeScript/Node process that connects
 | `src/server-ingest.ts` | `runServerIngest` | The server-level historical build (archive → triage → extract → events → verify → profiles) shared by `npm run ingest` and `/server-build` |
 | `src/profile-build.ts` | `runProfileBuild`, `PROFILE_BUILD_COOLDOWN_MS` | Self-service opt-in scan (/profile-build): targeted corpus → extraction → verification → scoped profile build |
 | `src/persist-extraction.ts` | `persistExtraction` | The single consent-gated write path for extraction results — person memories need an opted-in subject; relationships need one opted-in party |
+| `src/brains.ts` | `createBrainResolver` | Per-guild `Brain` resolver (BYOK): guild's encrypted key → env fallback → null (dormant). Cached per guild, invalidated by `/setup` |
+| `src/secrets.ts` | `encryptSecret`, `decryptSecret`, `maskKey`, `redactSecrets`, `validateLlmKey` | AES-256-GCM at-rest encryption for guild keys + live key validation against `/models` |
 | `src/brain.ts` | `Brain` | All LLM calls: extract memories, correct, assess continuity, classify events, reply |
 | `src/config.ts` | `config` | Env-variable validation (zod); single exported config object |
 | `src/types.ts` | `MessageEvent`, `MemoryCandidate`, `StoredEvent`, `Decision`, … | Shared TypeScript types shared across modules |
@@ -204,6 +206,10 @@ Derived data about a person — `person_*` memories, relationship observations, 
 - **Self-service** — `/profile-build` (24h cooldown) opts the caller in, scans their archive corpus (`messagesAboutSubject`: authored + name-references + replies-to-them), verifies their candidates, recomputes edges, and runs a scoped `buildProfiles`. `/opt-in` consents without the scan.
 - **Purge** — `scripts/purge-nonopted.mjs` (`PURGE_CONFIRM=1`) hard-deletes the pre-consent derived corpus for all non-consenting subjects; `buildProfiles` also deletes straggler profiles on sight.
 - **The bot opts itself in** (per guild, at maintenance) so the room's claims about it remain memorable — the reply persona frames them as community claims, not self-truth.
+
+## Per-guild LLM keys (BYOK)
+
+Every LLM call resolves through `createBrainResolver` (`src/brains.ts`), not a shared singleton. Resolution order: the guild's `guild_keys` row (AES-256-GCM decrypted via `KEY_ENCRYPTION_SECRET`) → the operator's env key → `null`. A `null` brain means **dormant**: `handleMessage` returns before archiving, maintenance and sweep loops `continue`, commands reply with a `/setup` pointer. `REQUIRE_GUILD_KEYS=1` removes the env fallback for hosted mode — each guild's key pays for its own cognition. The resolver caches one `Brain` per guild; `/setup` (a modal, so keys never touch channel history) is the only writer and invalidates the cache on write. Undecryptable rows (rotated master secret, tampering) degrade to dormant + a metric, never a crash — recovery is re-running `/setup`.
 
 ---
 

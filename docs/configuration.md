@@ -45,6 +45,8 @@ ASB is configured through environment variables validated at startup by `src/con
 | `PROACTIVE_DAILY_CAP` | `3` | Hard per-channel cap on proactive messages per day. Range 1–20. In-memory (restart resets) — bounds the worst case to "a few messages" no matter how many qualifying silences occur. |
 | `PROACTIVE_RESPONSE_WINDOW_MS` | `600000` | How long a sent proactive reply waits for engagement (a reply-edge or a reaction) before counting as ignored. Range 1min–1h. |
 | `PROACTIVE_BACKOFF_MS` | `21600000` | How long the elevated confidence floor stays hot after an ignored proactive reply (6h default). Range 5min–48h. While hot, the LLM gate requires higher confidence before the bot tries again. |
+| `KEY_ENCRYPTION_SECRET` | unset | Master passphrase encrypting per-guild LLM keys at rest (AES-256-GCM, SHA-256-derived). Required for `/setup` — without it the command tells admins key storage is unavailable. Any string; rotating it orphans existing `guild_keys` rows (recovery = re-run `/setup`). |
+| `REQUIRE_GUILD_KEYS` | `0` | Hosted BYOK mode: `1` disables the `GROQ_API_KEY` fallback so a guild without a stored key is fully dormant — no archiving, no replies, no LLM spend. Self-hosters leave this off. |
 
 ---
 

@@ -1,13 +1,15 @@
 import "dotenv/config";
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ButtonInteraction, ChatInputCommandInteraction } from "discord.js";
-import { handleMemoryButton, handleMemoryCommand } from "./commands.js";
+import type { ButtonInteraction, ChatInputCommandInteraction, ModalSubmitInteraction } from "discord.js";
+import { handleMemoryButton, handleMemoryCommand, handleSetupModal } from "./commands.js";
 import { ProfileStore } from "./profiles.js";
 import { makeTestSql, makeStore } from "./test-helpers.js";
 import type { Brain } from "./brain.js";
 import type { EventStore } from "./events.js";
 import type { MessageEvent } from "./types.js";
+import { config } from "./config.js";
+import { decryptSecret } from "./secrets.js";
 
 // ── Interaction stubs ─────────────────────────────────────────────────────────
 
@@ -38,6 +40,7 @@ function stubCommand(opts: {
     reply: async (r: (typeof replies)[number]) => { replies.push(r); return r; },
     editReply: async (r: string) => { replies.push({ content: r }); return r; },
     deferReply: async () => {},
+    showModal: async (m: unknown) => { replies.push({ content: `modal:${(m as { data?: { custom_id?: string } }).data?.custom_id ?? "?"}` }); },
     replied: false,
     deferred: false,
   };
@@ -57,6 +60,7 @@ function stubButton(opts: { customId: string; userId: string }): { interaction: 
 }
 
 const brain = {} as Brain; // commands under test here never reach the LLM
+const brainFor = async () => brain; // resolver signature — guild keys untested at this level
 const evStore = { eventsForMemory: async () => [] } as unknown as EventStore;
 
 function msg(content: string, overrides: Partial<MessageEvent> = {}): MessageEvent {
@@ -83,7 +87,7 @@ test("/memory about: a non-admin cannot view another member's memories", async (
       commandName: "memory", userId: "u-user",
       options: { about: { id: "u-other", username: "Other" } },
     });
-    await handleMemoryCommand(interaction, store, brain);
+    await handleMemoryCommand(interaction, store, brainFor);
     assert.match(replies[0].content ?? "", /only view your own/i);
   } finally { await sql.end(); }
 });
@@ -97,7 +101,7 @@ test("/memory about: an admin can view another member's memories", async () => {
       commandName: "memory", userId: "u-admin", admin: true,
       options: { about: { id: "u-other", username: "Other" } },
     });
-    await handleMemoryCommand(interaction, store, brain);
+    await handleMemoryCommand(interaction, store, brainFor);
     assert.ok(replies[0].embeds?.length, "expected an embed reply");
   } finally { await sql.end(); }
 });
@@ -108,10 +112,10 @@ test("/memory memory_id: non-admin cannot inspect another member's memory, admin
     const { store } = await makeStore(sql);
     const mem = await store.saveMemory(msg("I have a cat"), candidate);
     const denied = stubCommand({ commandName: "memory", userId: "u-stranger", options: { memory_id: mem.id } });
-    await handleMemoryCommand(denied.interaction, store, brain);
+    await handleMemoryCommand(denied.interaction, store, brainFor);
     assert.match(denied.replies[0].content ?? "", /couldn't find/i);
     const allowed = stubCommand({ commandName: "memory", userId: "u-admin", admin: true, options: { memory_id: mem.id } });
-    await handleMemoryCommand(allowed.interaction, store, brain);
+    await handleMemoryCommand(allowed.interaction, store, brainFor);
     assert.ok(allowed.replies[0].embeds?.length, "expected provenance embed");
   } finally { await sql.end(); }
 });
@@ -125,7 +129,7 @@ test("/profile user: and /dossier user: block non-admin cross-member views", asy
         commandName, userId: "u-stranger",
         options: { user: { id: "u-other", username: "Other" } },
       });
-      await handleMemoryCommand(interaction, store, brain);
+      await handleMemoryCommand(interaction, store, brainFor);
       assert.match(replies[0].content ?? "", /only view your own/i, commandName);
     }
   } finally { await sql.end(); }
@@ -139,7 +143,7 @@ test("/event memory_id: non-admin cannot inspect another member's memory linkage
     const { interaction, replies } = stubCommand({
       commandName: "event", userId: "u-stranger", options: { memory_id: mem.id },
     });
-    await handleMemoryCommand(interaction, store, brain, evStore);
+    await handleMemoryCommand(interaction, store, brainFor, evStore);
     assert.match(replies[0].content ?? "", /couldn't find/i);
   } finally { await sql.end(); }
 });
@@ -161,7 +165,7 @@ test("admin commands refuse non-admin callers", async () => {
       ["proactive", { enabled: true }],
     ] as const) {
       const { interaction, replies } = stubCommand({ commandName, userId: "u-stranger", options });
-      await handleMemoryCommand(interaction, store, brain);
+      await handleMemoryCommand(interaction, store, brainFor);
       assert.match(replies[0].content ?? "", /administrator/i, commandName);
     }
   } finally { await sql.end(); }
@@ -172,7 +176,7 @@ test("/memory-pause flips both settings flags for admins only", async () => {
   try {
     const { store } = await makeStore(sql);
     const { interaction } = stubCommand({ commandName: "memory-pause", userId: "u-admin", admin: true });
-    await handleMemoryCommand(interaction, store, brain);
+    await handleMemoryCommand(interaction, store, brainFor);
     const settings = await store.settings("g1");
     assert.equal(settings.memoryEnabled, 0);
     assert.equal(settings.replyEnabled, 0);
@@ -186,10 +190,10 @@ test("/proactive persists the per-server flag, defaults off", async () => {
     // Default must be OFF — proactive is opt-in per server, unlike replies.
     assert.equal((await store.settings("g1")).proactiveEnabled, 0);
     const { interaction } = stubCommand({ commandName: "proactive", userId: "u-admin", admin: true, options: { enabled: true } });
-    await handleMemoryCommand(interaction, store, brain);
+    await handleMemoryCommand(interaction, store, brainFor);
     assert.equal((await store.settings("g1")).proactiveEnabled, 1);
     const { interaction: off } = stubCommand({ commandName: "proactive", userId: "u-admin", admin: true, options: { enabled: false } });
-    await handleMemoryCommand(off, store, brain);
+    await handleMemoryCommand(off, store, brainFor);
     assert.equal((await store.settings("g1")).proactiveEnabled, 0);
   } finally { await sql.end(); }
 });
@@ -201,7 +205,7 @@ test("/memory-purge rejects a sub-one-day retention even for admins", async () =
     const { interaction, replies } = stubCommand({
       commandName: "memory-purge", userId: "u-admin", admin: true, options: { older_than_days: 0 },
     });
-    await handleMemoryCommand(interaction, store, brain);
+    await handleMemoryCommand(interaction, store, brainFor);
     assert.match(replies[0].content ?? "", /at least one day/i);
   } finally { await sql.end(); }
 });
@@ -216,7 +220,7 @@ test("/forget refuses memories owned by someone else", async () => {
     const { interaction, replies } = stubCommand({
       commandName: "forget", userId: "u-stranger", options: { memory_id: mem.id },
     });
-    await handleMemoryCommand(interaction, store, brain);
+    await handleMemoryCommand(interaction, store, brainFor);
     assert.match(replies[0].content ?? "", /couldn't find/i);
     assert.equal((await store.getMemory("g1", mem.id))?.status, "candidate");
   } finally { await sql.end(); }
@@ -230,7 +234,7 @@ test("/forget on your own memory offers a confirm button, and the button forgets
     const { interaction, replies } = stubCommand({
       commandName: "forget", userId: "u-user", options: { memory_id: mem.id },
     });
-    await handleMemoryCommand(interaction, store, brain);
+    await handleMemoryCommand(interaction, store, brainFor);
     assert.ok(replies[0].components?.length, "expected a confirmation row");
 
     const button = stubButton({ customId: `forget:g1:u-user:${mem.id}`, userId: "u-user" });
@@ -260,12 +264,12 @@ test("/memory-confirm only activates your own candidates", async () => {
     const mem = await store.saveMemory(msg("I have a cat"), candidate);
     // Someone else's candidate — refused, stays candidate.
     const denied = stubCommand({ commandName: "memory-confirm", userId: "u-stranger", options: { memory_id: mem.id } });
-    await handleMemoryCommand(denied.interaction, store, brain);
+    await handleMemoryCommand(denied.interaction, store, brainFor);
     assert.match(denied.replies[0].content ?? "", /couldn't find/i);
     assert.equal((await store.getMemory("g1", mem.id))?.status, "candidate");
     // The owner — confirmed and active.
     const own = stubCommand({ commandName: "memory-confirm", userId: "u-user", options: { memory_id: mem.id } });
-    await handleMemoryCommand(own.interaction, store, brain);
+    await handleMemoryCommand(own.interaction, store, brainFor);
     assert.equal((await store.getMemory("g1", mem.id))?.status, "active");
   } finally { await sql.end(); }
 });
@@ -278,13 +282,13 @@ test("/opt-out forgets memories and deletes the profile; /opt-in re-enables", as
     const { store } = await makeStore(sql);
     const mem = await store.saveMemory(msg("I have a cat"), candidate);
     const out = stubCommand({ commandName: "opt-out", userId: "u-user" });
-    await handleMemoryCommand(out.interaction, store, brain, undefined, new ProfileStore(sql));
+    await handleMemoryCommand(out.interaction, store, brainFor, undefined, new ProfileStore(sql));
     assert.match(out.replies[0].content ?? "", /opted out/i);
     assert.equal((await store.getMember("g1", "u-user"))?.optedOut, true);
     assert.equal((await store.getMemory("g1", mem.id))?.status, "forgotten");
 
     const back = stubCommand({ commandName: "opt-in", userId: "u-user" });
-    await handleMemoryCommand(back.interaction, store, brain);
+    await handleMemoryCommand(back.interaction, store, brainFor);
     const member = await store.getMember("g1", "u-user");
     assert.equal(member?.optedOut, false);
     assert.equal(member?.optedIn, true); // /opt-in now grants derived-data consent
@@ -298,7 +302,7 @@ test("/memory for a member who never opted in points at /profile-build", async (
   try {
     const { store } = await makeStore(sql);
     const { interaction, replies } = stubCommand({ commandName: "memory", userId: "u-user" });
-    await handleMemoryCommand(interaction, store, brain);
+    await handleMemoryCommand(interaction, store, brainFor);
     assert.match(replies[0].content ?? "", /profile-build/i);
   } finally { await sql.end(); }
 });
@@ -308,7 +312,7 @@ test("/profile-build opts the member in and reports the scan", async () => {
   try {
     const { store } = await makeStore(sql);
     const { interaction, replies } = stubCommand({ commandName: "profile-build", userId: "u-user" });
-    await handleMemoryCommand(interaction, store, brain, undefined, new ProfileStore(sql));
+    await handleMemoryCommand(interaction, store, brainFor, undefined, new ProfileStore(sql));
     assert.equal((await store.getMember("g1", "u-user"))?.optedIn, true);
     assert.match(replies.at(-1)?.content ?? "", /scanned 0 messages/i);
   } finally { await sql.end(); }
@@ -319,12 +323,93 @@ test("/server-build refuses non-admins and wants a channel from admins", async (
   try {
     const { store } = await makeStore(sql);
     const denied = stubCommand({ commandName: "server-build", userId: "u-stranger" });
-    await handleMemoryCommand(denied.interaction, store, brain);
+    await handleMemoryCommand(denied.interaction, store, brainFor);
     assert.match(denied.replies[0].content ?? "", /administrator/i);
 
     const admin = stubCommand({ commandName: "server-build", userId: "u-admin", admin: true });
-    await handleMemoryCommand(admin.interaction, store, brain);
+    await handleMemoryCommand(admin.interaction, store, brainFor);
     assert.match(admin.replies[0].content ?? "", /pick a text channel/i);
+  } finally { await sql.end(); }
+});
+
+// ── /setup (BYOK) ─────────────────────────────────────────────────────────────
+
+function stubModal(opts: { key?: string; baseUrl?: string; guildId?: string }) {
+  const replies: Replies = [];
+  const interaction = {
+    customId: "setup-key",
+    guildId: opts.guildId ?? "g1",
+    fields: { getTextInputValue: (id: string) => id === "api-key" ? (opts.key ?? "") : (opts.baseUrl ?? "") },
+    deferReply: async () => {},
+    editReply: async (r: string) => { replies.push({ content: r }); return r; },
+  };
+  return { interaction: interaction as unknown as ModalSubmitInteraction, replies };
+}
+
+test("/setup: non-admin rejected; admin without KEY_ENCRYPTION_SECRET gets the operator message", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const denied = stubCommand({ commandName: "setup", userId: "u-stranger" });
+    await handleMemoryCommand(denied.interaction, store, brainFor);
+    assert.match(denied.replies[0].content ?? "", /administrator/i);
+
+    const saved = config.keyEncryptionSecret;
+    config.keyEncryptionSecret = undefined;
+    try {
+      const admin = stubCommand({ commandName: "setup", userId: "u-admin", admin: true });
+      await handleMemoryCommand(admin.interaction, store, brainFor);
+      assert.match(admin.replies[0].content ?? "", /KEY_ENCRYPTION_SECRET/i);
+    } finally { config.keyEncryptionSecret = saved; }
+  } finally { await sql.end(); }
+});
+
+test("/setup modal: valid key stores ciphertext + masked hint and invalidates the cache", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const saved = config.keyEncryptionSecret;
+    config.keyEncryptionSecret = "test-master-passphrase";
+    try {
+      let invalidated = "";
+      const { interaction, replies } = stubModal({ key: "gsk_test_secretkey1234" });
+      await handleSetupModal(interaction, store, g => { invalidated = g; }, async () => ({ ok: true }));
+      const row = await store.getGuildKey("g1");
+      assert.ok(row, "guild key row missing");
+      assert.equal(row!.keyHint, "…1234");
+      assert.equal(decryptSecret(row!.keyEnc), "gsk_test_secretkey1234"); // ciphertext round-trips
+      assert.ok(row!.validatedAt, "validated key should carry validated_at");
+      assert.equal(invalidated, "g1");
+      assert.match(replies.at(-1)?.content ?? "", /…1234/);
+      assert.doesNotMatch(replies.at(-1)?.content ?? "", /gsk_test_secretkey1234/); // never echo the key
+    } finally { config.keyEncryptionSecret = saved; }
+  } finally { await sql.end(); }
+});
+
+test("/setup modal: rejected key stores nothing; unreachable stores unverified", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const saved = config.keyEncryptionSecret;
+    config.keyEncryptionSecret = "test-master-passphrase";
+    try {
+      const bad = stubModal({ key: "bad-key", guildId: "g-setup-bad" });
+      await handleSetupModal(bad.interaction, store, () => {}, async () => ({ ok: false, status: 401 }));
+      assert.equal(await store.getGuildKey("g-setup-bad"), null);
+      assert.match(bad.replies.at(-1)?.content ?? "", /rejected|auth/i);
+
+      const flaky = stubModal({ key: "gsk_unverified9999", guildId: "g-setup-flaky" });
+      await handleSetupModal(flaky.interaction, store, () => {}, async () => ({ ok: false, unreachable: true }));
+      const row = await store.getGuildKey("g-setup-flaky");
+      assert.ok(row, "unverified key should still be stored");
+      assert.equal(row!.validatedAt, null);
+      assert.match(flaky.replies.at(-1)?.content ?? "", /unverified|couldn't reach/i);
+
+      const ssrf = stubModal({ key: "gsk_whatever1234", baseUrl: "http://169.254.169.254/v1", guildId: "g-setup-ssrf" });
+      await handleSetupModal(ssrf.interaction, store, () => {}, async () => ({ ok: true }));
+      assert.equal(await store.getGuildKey("g-setup-ssrf"), null);
+      assert.match(ssrf.replies.at(-1)?.content ?? "", /base URL|public http/i);
+    } finally { config.keyEncryptionSecret = saved; }
   } finally { await sql.end(); }
 });
 

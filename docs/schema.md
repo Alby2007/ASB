@@ -142,6 +142,23 @@ Row is created with defaults on first message from a guild. Administrators can o
 
 ---
 
+### `guild_keys`
+
+One row per guild — the server's own LLM key (BYOK), written by `/setup`. Lives in a dedicated table so export/purge paths never casually touch ciphertext.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `guild_id` | TEXT PK | Discord server ID |
+| `key_enc` | BYTEA | AES-256-GCM ciphertext (`iv ‖ tag ‖ ciphertext`, `src/secrets.ts`) — there is no plaintext key column |
+| `key_hint` | TEXT | Last 4 chars of the key, for masked display (`…abcd`) |
+| `base_url` | TEXT NULL | Per-guild OpenAI-compatible endpoint; NULL = env default |
+| `validated_at` | TIMESTAMPTZ NULL | NULL = stored but never verified live (provider unreachable at /setup) |
+| `created_at` / `updated_at` | TIMESTAMPTZ | Upsert timestamps |
+
+Decryption requires `KEY_ENCRYPTION_SECRET`; rotating that secret orphans existing rows (recovery = re-run `/setup`).
+
+---
+
 ### `behavioral_patterns`
 
 Consolidated episode patterns. One row per recognised recurring behaviour per subject.
@@ -361,3 +378,4 @@ Version tracking for the migration system.
 | 12 | `v12_profile_attributes` | `profile_attributes` table + `profiles.attr_hash` — structured provenance-backed facets become the profile source of truth; create-only, no backfill |
 | 13 | `v13_proactive_enabled` | `proactive_enabled` on `server_settings` — per-server opt-in for proactive speaking, default off |
 | 14 | `v14_member_opted_in` | `opted_in` on `members` — derived data becomes consent-gated: person memories, relationships, attributes, profiles form only for `opted_in=1 AND opted_out=0` |
+| 15 | `v15_guild_keys` | `guild_keys` table — BYOK: per-guild LLM keys encrypted AES-256-GCM, written by `/setup` |

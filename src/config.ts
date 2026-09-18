@@ -36,6 +36,11 @@ const env = z.object({
   PROACTIVE_BACKOFF_MS: z.coerce.number().int().min(300_000).max(172_800_000).default(21_600_000),
   VISION_BASE_URL: z.string().optional(),
   IMAGE_MAX_BYTES: z.coerce.number().int().min(1).default(4_000_000),
+  // BYOK: master passphrase for encrypting per-guild LLM keys at rest. Optional —
+  // self-hosters without /setup never need it; /setup errors helpfully without it.
+  KEY_ENCRYPTION_SECRET: z.string().optional(),
+  // Hosted mode: 1 disables the env-key fallback so keyless guilds stay dormant.
+  REQUIRE_GUILD_KEYS: z.string().optional(),
 }).parse(process.env);
 
 export const config = {
@@ -84,4 +89,8 @@ export const config = {
   proactiveDailyCap: env.PROACTIVE_DAILY_CAP,
   proactiveResponseWindowMs: env.PROACTIVE_RESPONSE_WINDOW_MS,
   proactiveBackoffMs: env.PROACTIVE_BACKOFF_MS,
+  // BYOK: AES-256-GCM master passphrase (SHA-256-derived in secrets.ts) and the
+  // hosted-mode flag that turns off the env-key fallback for keyless guilds.
+  keyEncryptionSecret: env.KEY_ENCRYPTION_SECRET,
+  requireGuildKeys: env.REQUIRE_GUILD_KEYS === "1",
 };

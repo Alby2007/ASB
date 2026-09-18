@@ -171,6 +171,37 @@ export class MemoryStore {
     this.settingsCache.delete(guildId);
   }
 
+  // ── Guild LLM keys (BYOK) ────────────────────────────────────────────────────
+  // key_enc is AES-256-GCM ciphertext (secrets.ts) — never log or return it to
+  // Discord. key_hint (last-4) is the only plaintext remnant, for masked display.
+
+  async getGuildKey(guildId: string): Promise<{ keyEnc: Buffer; keyHint: string; baseUrl: string | null; validatedAt: string | null } | null> {
+    const rows = await this.sql<Array<{ key_enc: Buffer; key_hint: string; base_url: string | null; validated_at: Date | string | null }>>`
+      SELECT key_enc, key_hint, base_url, validated_at FROM guild_keys WHERE guild_id = ${guildId}
+    `;
+    const r = rows[0];
+    return r ? { keyEnc: r.key_enc, keyHint: r.key_hint, baseUrl: r.base_url, validatedAt: r.validated_at ? ts(r.validated_at) : null } : null;
+  }
+
+  async upsertGuildKey(guildId: string, key: { keyEnc: Buffer; keyHint: string; baseUrl: string | null; validatedAt: string | null }): Promise<void> {
+    await this.sql`
+      INSERT INTO guild_keys (guild_id, key_enc, key_hint, base_url, validated_at)
+      VALUES (${guildId}, ${key.keyEnc}, ${key.keyHint}, ${key.baseUrl}, ${key.validatedAt})
+      ON CONFLICT (guild_id) DO UPDATE
+      SET key_enc = ${key.keyEnc}, key_hint = ${key.keyHint}, base_url = ${key.baseUrl},
+          validated_at = ${key.validatedAt}, updated_at = now()
+    `;
+  }
+
+  /** Mark a stored key live-verified — set after the first successful use. */
+  async markGuildKeyValidated(guildId: string): Promise<void> {
+    await this.sql`UPDATE guild_keys SET validated_at = now() WHERE guild_id = ${guildId} AND validated_at IS NULL`;
+  }
+
+  async deleteGuildKey(guildId: string): Promise<void> {
+    await this.sql`DELETE FROM guild_keys WHERE guild_id = ${guildId}`;
+  }
+
   // ── Messages ───────────────────────────────────────────────────────────────
 
   async recordMessage(event: MessageEvent, replyToId?: string, trackMember = true): Promise<void> {

@@ -396,6 +396,31 @@ const migrations: Migration[] = [
       await sql`ALTER TABLE members DROP COLUMN IF EXISTS opted_in`;
     },
   },
+  {
+    version: 15,
+    name: "v15_guild_keys",
+    // BYOK: one row per guild holding its OpenAI-compatible API key, encrypted
+    // AES-256-GCM (secrets.ts). Never in server_settings — a dedicated table so
+    // export/purge paths don't casually touch ciphertext. key_hint is the only
+    // plaintext remnant (last-4 for masked display); validated_at NULL means
+    // stored but never verified live.
+    up: async (sql) => {
+      await sql`
+        CREATE TABLE IF NOT EXISTS guild_keys (
+          guild_id     TEXT PRIMARY KEY,
+          key_enc      BYTEA NOT NULL,
+          key_hint     TEXT NOT NULL,
+          base_url     TEXT,
+          validated_at TIMESTAMPTZ,
+          created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `;
+    },
+    down: async (sql) => {
+      await sql`DROP TABLE IF EXISTS guild_keys`;
+    },
+  },
 ];
 
 /** Highest known migration version — tests assert against this instead of a

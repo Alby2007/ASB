@@ -271,3 +271,22 @@ test("migration v14 adds members.opted_in, rolls back cleanly", async () => {
     assert.equal(remaining.length, 0, "opted_in should be dropped on rollback");
   } finally { await sql.end(); }
 });
+
+test("migration v15 creates guild_keys, rolls back cleanly", async () => {
+  const sql = makeTestSql();
+  try {
+    await resetSchema(sql);
+    await runMigrations(sql as any);
+    const cols = await sql<Array<{ column_name: string }>>`SELECT column_name FROM information_schema.columns WHERE table_name='guild_keys'`;
+    const names = cols.map(c => c.column_name);
+    for (const col of ["key_enc", "key_hint", "base_url", "validated_at", "created_at", "updated_at"]) {
+      assert.ok(names.includes(col), `guild_keys.${col} missing`);
+    }
+    // No plaintext key column may exist — ciphertext only.
+    assert.ok(!names.includes("api_key") && !names.includes("key"), "no plaintext key column");
+
+    await runMigrations(sql as any, 14);
+    const tables = await sql<Array<{ table_name: string }>>`SELECT table_name FROM information_schema.tables WHERE table_name='guild_keys'`;
+    assert.equal(tables.length, 0, "guild_keys should be dropped on rollback");
+  } finally { await sql.end(); }
+});

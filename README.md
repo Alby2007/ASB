@@ -62,6 +62,7 @@ All replies are ephemeral (private to the invoker) unless noted.
 | `/memory-settings` | Show effective guild settings |
 | `/status` | Uptime, error counters, pipeline health |
 | `/server-build` | Run the server-level historical build on a channel (owner/admin only; archives + lore + events for everyone, derived person data for opted-in members only) |
+| `/setup` | Configure this server's own LLM API key via a secure modal (BYOK — the key is encrypted at rest and pays for this server's cognition; re-run to rotate) |
 
 ---
 

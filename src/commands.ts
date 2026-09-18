@@ -1,9 +1,11 @@
-import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonInteraction, ButtonStyle, ChannelType, ChatInputCommandInteraction, EmbedBuilder, PermissionFlagsBits, type TextChannel } from "discord.js";
+import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonInteraction, ButtonStyle, ChannelType, ChatInputCommandInteraction, EmbedBuilder, ModalBuilder, ModalSubmitInteraction, PermissionFlagsBits, TextInputBuilder, TextInputStyle, type TextChannel } from "discord.js";
 import type { Brain } from "./brain.js";
 import type { Memory, MemoryStore } from "./database.js";
 import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
 import { ProfileStore } from "./profiles.js";
+import { encryptSecret, maskKey, validateLlmKey } from "./secrets.js";
+import { isSafeUrl } from "./tools.js";
 import { runProfileBuild, PROFILE_BUILD_COOLDOWN_MS } from "./profile-build.js";
 import { runServerIngest } from "./server-ingest.js";
 import { metricsSnapshot } from "./metrics.js";
@@ -42,7 +44,8 @@ export const commandDefinitions = [
   { name: "profile-build", description: "Opt in and build your profile: scans the archive for your messages and references to you" },
   { name: "server-build", description: "Admin: run the server-level historical build on a channel", default_member_permissions: PermissionFlagsBits.ManageGuild.toString(), options: [
     { name: "channel", description: "Text channel to build from (defaults to the configured ingest channel)", type: 7, required: false }
-  ] }
+  ] },
+  { name: "setup", description: "Admin: configure this server's LLM API key (BYOK)", default_member_permissions: PermissionFlagsBits.ManageGuild.toString() }
 ];
 
 const confidence = (value: number | undefined) => {
@@ -56,7 +59,10 @@ const OPT_IN_HINT_OTHER = "That member hasn't opted in to profiles.";
 let serverBuildRunning = false;
 const display = (memory: Memory) => `**#${memory.id} · ${confidence(memory.confidence)} confidence**\n${memory.content}\n*${memory.mentions} confirmation${memory.mentions === 1 ? "" : "s"}; last confirmed ${new Date(memory.lastConfirmedAt).toLocaleDateString()}*`;
 
-export async function handleMemoryCommand(interaction: ChatInputCommandInteraction, store: MemoryStore, brain: Brain, evStore?: EventStore, profileStore: ProfileStore = new ProfileStore()) {
+type BrainFor = (guildId: string) => Promise<Brain | null>;
+const NO_KEY_MSG = "This server hasn't configured an LLM key — an admin can set one with /setup.";
+
+export async function handleMemoryCommand(interaction: ChatInputCommandInteraction, store: MemoryStore, brainFor: BrainFor, evStore?: EventStore, profileStore: ProfileStore = new ProfileStore()) {
   if (!interaction.guildId) return;
   const guildId = interaction.guildId;
   if (interaction.commandName === "memory") {
@@ -106,6 +112,8 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     // as every other derived-data path.
     const caller = await store.getMember(guildId, interaction.user.id);
     if (!caller?.optedIn || caller.optedOut) return interaction.reply({ content: OPT_IN_HINT_SELF, ephemeral: true });
+    const brain = await brainFor(guildId);
+    if (!brain) return interaction.reply({ content: NO_KEY_MSG, ephemeral: true });
     await interaction.deferReply({ ephemeral: true });
     try {
       const existing = await store.allActiveMemories(guildId, interaction.user.id);
@@ -335,6 +343,8 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     if (existing?.updatedAt && Date.now() - new Date(existing.updatedAt).getTime() < PROFILE_BUILD_COOLDOWN_MS) {
       return interaction.reply({ content: "Your profile was built recently — you can rebuild once every 24 hours.", ephemeral: true });
     }
+    const brain = await brainFor(guildId);
+    if (!brain) return interaction.reply({ content: NO_KEY_MSG, ephemeral: true });
     await interaction.deferReply({ ephemeral: true });
     await store.setMemberOptIn(guildId, userId, true);
     await store.setMemberOptOut(guildId, userId, false);
@@ -359,6 +369,8 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     if (!channel || channel.type !== ChannelType.GuildText) {
       return interaction.reply({ content: "Pick a text channel to build from (or set INGEST_CHANNEL and omit the option).", ephemeral: true });
     }
+    const brain = await brainFor(guildId);
+    if (!brain) return interaction.reply({ content: NO_KEY_MSG, ephemeral: true });
     await interaction.reply({ content: `Server build started for #${channel.name} — this runs long; results post to this channel when done.`, ephemeral: true });
     serverBuildRunning = true;
     runServerIngest(channel as TextChannel, {
@@ -379,6 +391,68 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
       await interaction.followUp(text).catch(() => {});
     }
     return;
+  }
+  if (interaction.commandName === "setup") {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      return interaction.reply({ content: "Only server administrators can configure the LLM key.", ephemeral: true });
+    }
+    if (!config.keyEncryptionSecret) {
+      return interaction.reply({ content: "The bot operator hasn't configured key storage (KEY_ENCRYPTION_SECRET) — per-guild keys are unavailable.", ephemeral: true });
+    }
+    // Key submission goes through a modal — slash-command options land in
+    // channel history; modal field values don't.
+    const modal = new ModalBuilder().setCustomId("setup-key").setTitle("Server LLM key");
+    const keyInput = new TextInputBuilder()
+      .setCustomId("api-key").setLabel("OpenAI-compatible API key")
+      .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(200)
+      .setPlaceholder("gsk_…");
+    const urlInput = new TextInputBuilder()
+      .setCustomId("base-url").setLabel("Base URL (optional)")
+      .setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(200)
+      .setPlaceholder(config.groqBaseUrl);
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(keyInput),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(urlInput),
+    );
+    return interaction.showModal(modal);
+  }
+}
+
+/** Modal submission for /setup — validates the key live, encrypts it, stores
+ * the row, and drops the guild's cached Brain so the next call resolves the
+ * new key. The submitted value is never echoed back — only the last-4 hint. */
+export async function handleSetupModal(
+  interaction: ModalSubmitInteraction, store: MemoryStore,
+  invalidateBrain: (guildId: string) => void,
+  validate: typeof validateLlmKey = validateLlmKey
+) {
+  if (interaction.customId !== "setup-key" || !interaction.guildId) return;
+  const guildId = interaction.guildId;
+  const key = interaction.fields.getTextInputValue("api-key").trim();
+  const baseUrl = interaction.fields.getTextInputValue("base-url").trim() || null;
+  await interaction.deferReply({ ephemeral: true });
+  // The base URL steers every later LLM call carrying this key — a guild admin
+  // is less trusted than the operator, so apply the same SSRF guard the web
+  // tool uses: public http(s) only, no private/loopback/metadata hosts.
+  if (baseUrl && !isSafeUrl(baseUrl)) {
+    return interaction.editReply("That base URL isn't allowed — it must be a public http(s) endpoint. Leave it blank to use the default provider.");
+  }
+  try {
+    const result = await validate(key, baseUrl ?? config.groqBaseUrl);
+    if (!result.ok && "status" in result) {
+      return interaction.editReply("That key was rejected by the provider (auth failed) — nothing was stored. Check the key and try again.");
+    }
+    await store.upsertGuildKey(guildId, {
+      keyEnc: encryptSecret(key), keyHint: maskKey(key), baseUrl,
+      validatedAt: result.ok ? new Date().toISOString() : null,
+    });
+    invalidateBrain(guildId);
+    return interaction.editReply(result.ok
+      ? `Key stored (${maskKey(key)}) — this server now runs on its own key. Re-run /setup any time to rotate it.`
+      : `Couldn't reach the provider to verify, but the key (${maskKey(key)}) is stored unverified — it'll be checked on first use.`);
+  } catch (error) {
+    console.error("/setup failed", error);
+    return interaction.editReply("Setup failed — nothing was stored. Try again later.");
   }
 }
 

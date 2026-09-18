@@ -1,10 +1,10 @@
 import "dotenv/config";
 import { Client, GatewayIntentBits } from "discord.js";
-import { Brain } from "./brain.js";
 import { config } from "./config.js";
 import { MemoryStore } from "./database.js";
 import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
+import { createBrainResolver } from "./brains.js";
 import { runServerIngest } from "./server-ingest.js";
 
 // CLI entry for the server-level historical build. The work itself lives in
@@ -12,15 +12,22 @@ import { runServerIngest } from "./server-ingest.js";
 const CHANNEL_NAME = config.ingestChannel;
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
-const brain = new Brain(config.groqKey, config.model, config.groqBaseUrl);
 const pipeline = new EventPipeline();
 
 client.once("ready", async () => {
   const store = await MemoryStore.create();
   const eventStore = new EventStore();
+  const { brainFor } = createBrainResolver({
+    getKey: guildId => store.getGuildKey(guildId),
+    envKey: config.groqKey, envModel: config.model, envBaseUrl: config.groqBaseUrl,
+    requireGuildKeys: config.requireGuildKeys,
+  });
 
   const guild = client.guilds.cache.get(config.guildId!);
   if (!guild) { console.error("Guild not found"); process.exit(1); }
+
+  const brain = await brainFor(guild.id);
+  if (!brain) { console.error("No LLM key configured for this guild — run /setup in Discord or set GROQ_API_KEY"); process.exit(1); }
 
   const channel = guild.channels.cache.find(c => c.name === CHANNEL_NAME && c.type === 0);
   if (!channel) { console.error(`Channel "${CHANNEL_NAME}" not found`); process.exit(1); }

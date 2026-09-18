@@ -1,10 +1,10 @@
 import { Client, Events, GatewayIntentBits, Partials, type Message, type OmitPartialGroupDMChannel } from "discord.js";
 import OpenAI from "openai";
-import { Brain } from "./brain.js";
 import { config } from "./config.js";
 import { sql } from "./db.js";
 import { MemoryStore } from "./database.js";
-import { commandDefinitions, handleMemoryButton, handleMemoryCommand } from "./commands.js";
+import { createBrainResolver } from "./brains.js";
+import { commandDefinitions, handleMemoryButton, handleMemoryCommand, handleSetupModal } from "./commands.js";
 import { detectDismissal, detectNamingRequest, detectSelfNaming, detectWakeWord, questionKeywords, roomAddressCue, shouldInspectForMemory, toolCues } from "./perception.js";
 import { EngagementTracker } from "./engagement.js";
 import { ProactiveScheduler } from "./proactive.js";
@@ -26,7 +26,14 @@ const client = new Client({
   // them explicitly before interpreting.
   partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.User],
 });
-const brain = new Brain(config.groqKey, config.model, config.groqBaseUrl);
+// Per-guild Brain resolver (BYOK): a guild's own key when /setup stored one,
+// env key otherwise, null (dormant) when REQUIRE_GUILD_KEYS blocks the fallback.
+// `store` is assigned in init() before any resolution can be requested.
+const { brainFor, invalidate: invalidateBrain } = createBrainResolver({
+  getKey: guildId => store.getGuildKey(guildId),
+  envKey: config.groqKey, envModel: config.model, envBaseUrl: config.groqBaseUrl,
+  requireGuildKeys: config.requireGuildKeys,
+});
 // Vision can live on a different provider than the main key (e.g. Gemini's
 // free tier, since Groq rotated its vision models off) — a second client is
 // built only when the creds actually differ.
@@ -102,6 +109,10 @@ async function applyRetention() {
         console.log(`Pruned derived data in ${guild.name}: ${pruned.history} history, ${pruned.names} unresolved names, ${pruned.aliases} alias candidates, ${pruned.events} events`);
       }
     } catch (error) { inc("maintenance.prune_error"); console.error("Derived-data pruning failed", error); }
+    // Dormant guilds (no key) skip every LLM pass — retention/pruning above
+    // still ran; they're lifecycle ops, not cognition.
+    const brain = await brainFor(guild.id);
+    if (!brain) continue;
     // v0.2: close stale open event windows and score candidate events
     try {
       const result = await pipeline.maintainEvents(guild.id, eventStore, store, brain);
@@ -218,6 +229,9 @@ async function sweepMissedSignals(windowMs: number) {
     try {
       const settings = await store.settings(guild.id, config.rawMessageRetentionDays);
       if (!settings.memoryEnabled) continue;
+      // No key → nothing to triage or extract with — skip the guild entirely.
+      const brain = await brainFor(guild.id);
+      if (!brain) continue;
       const pending = await store.listUninspectedMessages(guild.id, new Date(Date.now() - windowMs), client.user!.id);
       if (!pending.length) continue;
       const toEvent = (m: (typeof pending)[number]): MessageEvent => ({
@@ -309,7 +323,8 @@ async function sweepMissedSignals(windowMs: number) {
 
 client.on(Events.InteractionCreate, async interaction => {
   try {
-    if (interaction.isChatInputCommand()) await handleMemoryCommand(interaction, store, brain, eventStore, profileStore);
+    if (interaction.isChatInputCommand()) await handleMemoryCommand(interaction, store, brainFor, eventStore, profileStore);
+    if (interaction.isModalSubmit()) await handleSetupModal(interaction, store, invalidateBrain);
     if (interaction.isButton()) await handleMemoryButton(interaction, store);
   } catch (error) {
     inc("handler.interaction_error");
@@ -401,6 +416,8 @@ async function fireProactive(key: string, messageId: string): Promise<void> {
   if (!config.proactiveEnabled) return;
   const settings = await store.settings(guildId, config.rawMessageRetentionDays);
   if (!settings.proactiveEnabled || !settings.replyEnabled) return;
+  const brain = await brainFor(guildId);
+  if (!brain) return; // dormant guild — no grounded answers to propose with
   const gate = proactive.allow(key);
   if (!gate.allowed) { inc("proactive.capped"); return; }
   // Re-fetch: a deleted question fails the fetch, an edited one may no longer
@@ -467,6 +484,10 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   // sweep skips paused guilds anyway, so archive-during-pause rows would be
   // orphaned the moment they're written.
   if (!settings.memoryEnabled && !settings.replyEnabled) return;
+  // BYOK dormant guild: no key → no archive, no reply — everything below
+  // (extraction, contest, pipeline, decide, reply) binds this guild's brain.
+  const brain = await brainFor(event.guildId);
+  if (!brain) return;
   // Resolve the reply target first so it can be persisted with the raw message.
   const replyToId = message.reference?.messageId ?? undefined;
   if (settings.memoryEnabled) await store.recordMessage(event, replyToId, !message.author.bot);
