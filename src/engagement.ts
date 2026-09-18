@@ -1,7 +1,13 @@
 type ChannelEngagement = {
   participants: Map<string, number>; // userId -> expiry timestamp
   lastSpokeAt?: number;
+  recentBotFlags: boolean[]; // rolling window: was each recent message ours?
 };
+
+// Share-of-voice window: the bot's fraction of the last N channel messages is
+// the engaged-tier pacing signal — members don't count seconds since they last
+// spoke, they don't dominate the floor.
+const VOICE_WINDOW = 10;
 
 /**
  * Per-channel conversational engagement: who is actively talking *with* the bot.
@@ -25,9 +31,24 @@ export class EngagementTracker {
     ch.participants.set(userId, this.now() + this.ttlMs);
   }
 
-  /** Record that the bot spoke — pacing only; does not extend participants. */
+  /** Record that the bot spoke — counts toward share-of-voice; does not extend participants. */
   noteReply(key: string): void {
     this.getOrCreate(key).lastSpokeAt = this.now();
+    this.noteMessage(key, true);
+  }
+
+  /** Record a channel message for the share-of-voice window (bounded deque). */
+  noteMessage(key: string, fromBot: boolean): void {
+    const ch = this.getOrCreate(key);
+    ch.recentBotFlags.push(fromBot);
+    if (ch.recentBotFlags.length > VOICE_WINDOW) ch.recentBotFlags.shift();
+  }
+
+  /** The bot's fraction of the last VOICE_WINDOW channel messages (0–1). */
+  botShare(key: string): number {
+    const flags = this.channels.get(key)?.recentBotFlags;
+    if (!flags?.length) return 0;
+    return flags.filter(Boolean).length / flags.length;
   }
 
   /** True if the user's last addressed message is still inside the TTL. */
@@ -59,7 +80,7 @@ export class EngagementTracker {
   private getOrCreate(key: string): ChannelEngagement {
     let ch = this.channels.get(key);
     if (!ch) {
-      ch = { participants: new Map() };
+      ch = { participants: new Map(), recentBotFlags: [] };
       this.channels.set(key, ch);
     }
     return ch;

@@ -93,11 +93,12 @@ Discord MessageCreate
     decays out and the bot drops mid-channel-talk (ENGAGEMENT=0 disables)
   • explicit dismissals ("shut up casper", "we're done" + address) drop the
     participant immediately after the ack reply (perception.ts detectDismissal)
-  • recency penalty proportional −0.25×(1−elapsed/window), evaluated only
-    inside the window so it can't invert; direct mentions exempt — the window
-    is per-tier: 120s for strangers, 30s for engaged participants (a 120s
-    engaged window meant statements needed ~96s of silence — functionally
-    "never replies mid-flow"; 30s caps interjection at ~once/30s)
+  • pacing is per-tier: strangers get proportional recency decay
+    −0.25×(1−elapsed/120s), evaluated only inside the window so it can't
+    invert; engaged participants instead get share-of-voice — −0.25 when the
+    bot is ≥~1/3 of the last 10 channel messages (members don't count seconds
+    since they last spoke, they don't dominate the floor — a time window made
+    the bot go silent exactly mid-flow); direct mentions exempt from both
   • shouldSpeak = score ≥ SPEAK_THRESHOLD (default 0.70)
         │
         ▼ (only if shouldSpeak && replyEnabled)

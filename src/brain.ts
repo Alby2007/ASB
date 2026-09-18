@@ -23,7 +23,7 @@ export class Brain {
     this.client = client ?? new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
   }
 
-  decide(event: MessageEvent, elapsedSinceLastSpokeMs: number, engaged: boolean, threshold = 0.7): Decision {
+  decide(event: MessageEvent, elapsedSinceLastSpokeMs: number, engaged: boolean, botShare: number, threshold = 0.7): Decision {
     const reasons: string[] = [];
     let score = 0.05;
     if (event.mentionsBot) { score += 0.85; reasons.push("direct mention"); }
@@ -31,17 +31,22 @@ export class Brain {
     if (event.content.endsWith("?")) { score += 0.1; reasons.push("question"); }
     // Proportional recency penalty, evaluated only inside the window so the
     // factor can never go negative and flip into a bonus. It must never
-    // suppress an explicit mention — a direct request for a reply. The window
-    // is per-tier: strangers are suppressed for 120s, engaged participants only
-    // 30s — in a live back-and-forth a 120s window means statements need ~96s
-    // of silence to clear the threshold, i.e. the bot never replies mid-flow.
-    // 30s caps the interject rate at ~once per 30s per channel while letting a
-    // real exchange hit nearly every turn.
-    const recencyWindowMs = engaged ? 30_000 : 120_000;
+    // suppress an explicit mention — a direct request for a reply. This gate
+    // applies to strangers only; engaged participants skip the time decay —
+    // their pacing is share-of-voice below, since a time window made the bot
+    // go silent exactly mid-flow.
+    const recencyWindowMs = 120_000;
     const elapsed = Math.max(0, elapsedSinceLastSpokeMs);
-    if (!event.mentionsBot && elapsed < recencyWindowMs) {
+    if (!event.mentionsBot && !engaged && elapsed < recencyWindowMs) {
       score -= 0.25 * (1 - elapsed / recencyWindowMs);
       reasons.push("bot spoke recently");
+    }
+    // Engaged pacing is share-of-voice, not time: take a turn off when the bot
+    // is already ≥~1/3 of recent channel traffic. Members don't count seconds
+    // since they last spoke — they don't dominate the floor.
+    if (!event.mentionsBot && engaged && botShare >= 0.35) {
+      score -= 0.25;
+      reasons.push("holding the floor");
     }
     return { shouldSpeak: score >= threshold, score: Math.max(0, Math.min(1, score)), reasons };
   }

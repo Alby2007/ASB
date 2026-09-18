@@ -499,6 +499,9 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   }
 
   const key = `${event.guildId}:${event.channelId}`;
+  // This human message counts toward share-of-voice before scoring — it
+  // dilutes the bot's floor share for the decide() below.
+  engagement.noteMessage(key, false);
   // An addressed message enrolls the author for the engagement TTL; an explicit
   // dismissal drops them again immediately (the reply below is the ack, then
   // they're out — going quiet after being told off is the correct response).
@@ -507,7 +510,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   const lastSpokeAt = engagement.lastSpokeAt(key);
   const elapsedSinceLastSpoke = lastSpokeAt === undefined ? Infinity : Date.now() - lastSpokeAt;
   const engaged = config.engagement && engagement.isEngaged(key, event.authorId);
-  const decision = brain.decide(event, elapsedSinceLastSpoke, engaged, config.speakThreshold);
+  const decision = brain.decide(event, elapsedSinceLastSpoke, engaged, engagement.botShare(key), config.speakThreshold);
   if (!settings.replyEnabled || !decision.shouldSpeak) return;
   try {
     await message.channel.sendTyping();
