@@ -57,14 +57,21 @@ jobs:
           ssh-private-key: ${{ secrets.ORACLE_SSH_KEY }}
       # Pinned host key instead of accept-new: a MITM on first contact can no
       # longer substitute their own key. ORACLE_HOST_KEY is the output of
-      # `ssh-keyscan 140.238.67.40` — if it's unset the strict check fails
-      # closed and the deploy cannot run.
+      # `ssh-keyscan` against the deploy host — if it's unset the strict check
+      # fails closed and the deploy cannot run. The host itself lives in
+      # ORACLE_SSH_HOST (user@ip) so the prod address isn't committed to the
+      # repo.
       - name: Trust the deployment host key
         run: |
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           echo "${{ secrets.ORACLE_HOST_KEY }}" >> ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
-      - name: Pull and restart on Oracle
+      # `npm ci` between pull and restart is load-bearing: a merged PR that
+      # adds a dependency would otherwise crash prod on restart with a missing
+      # module. Full install (not --omit=dev) because `npm start` currently
+      # runs through tsx, which lives in devDependencies — tighten this to
+      # `npm ci --omit=dev && npm run build` once the tsc build path lands.
+      - name: Pull, install, and restart on Oracle
         run: >-
-          ssh -o StrictHostKeyChecking=yes opc@140.238.67.40
-          "cd ~/ASB && git pull --ff-only && pm2 restart asb --update-env"
+          ssh -o StrictHostKeyChecking=yes ${{ secrets.ORACLE_SSH_HOST }}
+          "cd ~/ASB && git pull --ff-only && npm ci && pm2 restart asb --update-env"

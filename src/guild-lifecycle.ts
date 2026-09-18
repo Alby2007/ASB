@@ -36,7 +36,7 @@ export async function announceIfNeeded(guild: Guild, store: MemoryStore): Promis
       { name: "What it stores (when enabled)", value: `Raw messages for **${s.rawRetentionDays} days**, then deleted. Derived memories, profiles, and relationship notes form **only for members who opt in**.` },
       { name: "Your controls", value: "`/privacy` — see exactly what's stored · `/opt-in` `/opt-out` — control your derived data · `/memory-export` — export everything stored about you" },
       { name: "Admins", value: "To activate ASB: run `/setup` to configure an LLM key (or use the operator's), then `/memory-resume`. `/server-build` can additionally backfill history." },
-      { name: "Privacy policy", value: "[github.com/Alby2007/asb-docs](https://github.com/Alby2007/asb-docs) — kick the bot and every row it stored here is deleted." },
+      { name: "Privacy policy", value: "[github.com/Alby2007/ASB-Docs](https://github.com/Alby2007/ASB-Docs) — kick the bot and every row it stored here is deleted." },
     );
   await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
   return store.markAnnounced(guild.id);

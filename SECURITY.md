@@ -6,7 +6,7 @@
 
 Report vulnerabilities via:
 
-- GitHub's private vulnerability reporting on the project repository, or
+- [GitHub private vulnerability reporting](https://github.com/Alby2007/ASB-Docs/security/advisories/new) on the public docs repository, or
 - A direct message to [Alby2007](https://github.com/Alby2007) on GitHub.
 
 Include: what you found, how to reproduce it, and what data or capability it exposes. A proof of concept helps but isn't required — describe the impact honestly.

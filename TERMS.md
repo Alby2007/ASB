@@ -41,4 +41,4 @@ These terms may be updated at any time; continued use after an update constitute
 
 ## Contact
 
-[Alby2007](https://github.com/Alby2007) via the project repository.
+[Alby2007](https://github.com/Alby2007) via the [public docs repository](https://github.com/Alby2007/ASB-Docs/issues).
