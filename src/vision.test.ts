@@ -54,29 +54,60 @@ function stubClient(capture: { chat?: any; responses?: any }) {
   } as LlmClient;
 }
 
-test("describeImage sends an image_url block with strict json_schema", async () => {
-  const capture: { chat?: any } = {};
-  const brain = new Brain("k", "m", undefined, stubClient(capture));
-  const out = await brain.describeImage({ url: "https://cdn.example/x.png", contextText: "my dog" }, "vision-model");
-  assert.equal(out.description, "a golden retriever on a beach");
-  assert.equal(out.category, "photo");
-  assert.equal(capture.chat.model, "vision-model");
-  const parts = capture.chat.messages[0].content;
-  assert.equal(parts[0].type, "text");
-  assert.match(parts[0].text, /do not guess at the identity/i);
-  assert.match(parts[0].text, /my dog/); // caption passed for disambiguation
-  assert.deepEqual(parts[1], { type: "image_url", image_url: { url: "https://cdn.example/x.png" } });
-  assert.equal(capture.chat.response_format.type, "json_schema");
-  assert.deepEqual(capture.chat.response_format.json_schema.schema.required, ["description", "category"]);
+const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+
+// describeImage fetches the attachment itself (data-URI is the only portable
+// image_url shape) — stub fetch so tests never touch the network.
+function stubFetch(handler?: (url: string) => Response | Promise<Response>) {
+  const orig = globalThis.fetch;
+  globalThis.fetch = async (input: any) =>
+    handler ? handler(String(input)) : new Response(PNG, { headers: { "content-type": "image/png", "content-length": String(PNG.length) } });
+  return () => { globalThis.fetch = orig; };
+}
+
+test("describeImage fetches bytes, sends a data URI with strict json_schema", async () => {
+  const restore = stubFetch();
+  try {
+    const capture: { chat?: any } = {};
+    const brain = new Brain("k", "m", undefined, stubClient(capture));
+    const out = await brain.describeImage({ url: "https://cdn.example/x.png", contextText: "my dog" }, "vision-model");
+    assert.equal(out.description, "a golden retriever on a beach");
+    assert.equal(out.category, "photo");
+    assert.equal(capture.chat.model, "vision-model");
+    const parts = capture.chat.messages[0].content;
+    assert.equal(parts[0].type, "text");
+    assert.match(parts[0].text, /do not guess at the identity/i);
+    assert.match(parts[0].text, /my dog/); // caption passed for disambiguation
+    assert.equal(parts[1].type, "image_url");
+    assert.match(parts[1].image_url.url, /^data:image\/png;base64,/);
+    assert.equal(capture.chat.response_format.type, "json_schema");
+    assert.deepEqual(capture.chat.response_format.json_schema.schema.required, ["description", "category"]);
+  } finally { restore(); }
+});
+
+test("describeImage throws on fetch failure and oversized bodies", async () => {
+  const restore = stubFetch(() => new Response("nope", { status: 404 }));
+  try {
+    const brain = new Brain("k", "m", undefined, stubClient({}));
+    await assert.rejects(brain.describeImage({ url: "u" }, "m"), /image fetch failed/);
+  } finally { restore(); }
+  const restore2 = stubFetch(() => new Response(Buffer.alloc(100), { headers: { "content-length": "99999999" } }));
+  try {
+    const brain = new Brain("k", "m", undefined, stubClient({}));
+    await assert.rejects(brain.describeImage({ url: "u", maxBytes: 1000 }, "m"), /over byte cap/);
+  } finally { restore2(); }
 });
 
 test("describeImage uses the override client when a second provider is passed", async () => {
-  const main: { chat?: any } = {};
-  const other: { chat?: any } = {};
-  const brain = new Brain("k", "m", undefined, stubClient(main));
-  await brain.describeImage({ url: "u" }, "vision-model", stubClient(other));
-  assert.ok(other.chat, "override client should receive the call");
-  assert.equal(main.chat, undefined, "main client should not be called");
+  const restore = stubFetch();
+  try {
+    const main: { chat?: any } = {};
+    const other: { chat?: any } = {};
+    const brain = new Brain("k", "m", undefined, stubClient(main));
+    await brain.describeImage({ url: "u" }, "vision-model", stubClient(other));
+    assert.ok(other.chat, "override client should receive the call");
+    assert.equal(main.chat, undefined, "main client should not be called");
+  } finally { restore(); }
 });
 
 test("extractMemories carries the observation frame only when imageContext is passed", async () => {

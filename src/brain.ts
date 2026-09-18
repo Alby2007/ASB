@@ -65,7 +65,20 @@ export class Brain {
    * the ordinary extraction/reply pipelines; the URL and bytes are never
    * persisted. Callers pass a vision-capable model explicitly (config.visionModel).
    */
-  async describeImage(input: { url: string; contextText?: string }, model: string, client?: LlmClient): Promise<{ description: string; category: "photo" | "screenshot" | "meme" | "art" | "document" | "other" }> {
+  async describeImage(input: { url: string; contextText?: string; maxBytes?: number }, model: string, client?: LlmClient): Promise<{ description: string; category: "photo" | "screenshot" | "meme" | "art" | "document" | "other" }> {
+    const maxBytes = input.maxBytes ?? 4_000_000;
+    // Fetch the attachment ourselves — providers differ on whether image_url
+    // dereferences remote URLs (Gemini's compat endpoint doesn't), while every
+    // OpenAI-compat API accepts data: URIs. Bytes live only for this call and
+    // are never persisted.
+    const resp = await fetch(input.url, { signal: AbortSignal.timeout(10_000) });
+    if (!resp.ok) throw new Error(`image fetch failed: ${resp.status}`);
+    const declared = Number(resp.headers.get("content-length") ?? 0);
+    if (declared > maxBytes) throw new Error(`image over byte cap: ${declared}`);
+    const mime = resp.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (buf.length > maxBytes) throw new Error(`image over byte cap: ${buf.length}`);
+    const dataUri = `data:${mime};base64,${buf.toString("base64")}`;
     const contextLine = input.contextText?.trim()
       ? ` The sender's own caption was: "${input.contextText.trim()}" — use it only to disambiguate, not as part of the description.`
       : "";
@@ -73,7 +86,7 @@ export class Brain {
       model,
       messages: [{ role: "user", content: [
         { type: "text", text: `Describe this image factually in one or two sentences: what it depicts, any clearly legible text in it, and its apparent purpose in a Discord conversation. Do not guess at the identity of any person shown.${contextLine}` },
-        { type: "image_url", image_url: { url: input.url } },
+        { type: "image_url", image_url: { url: dataUri } },
       ] }],
       response_format: { type: "json_schema", json_schema: {
         name: "image_description", strict: true,

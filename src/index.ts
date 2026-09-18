@@ -408,7 +408,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   const describeImages = (list: Array<AttachmentMeta & { contentType: string }>) =>
     Promise.all(list.map(async a => {
       try {
-        const d = await brain.describeImage({ url: a.url, contextText: event.content }, config.visionModel!, visionClient);
+        const d = await brain.describeImage({ url: a.url, contextText: event.content, maxBytes: config.imageMaxBytes }, config.visionModel!, visionClient);
         inc("vision.described");
         return d.description;
       } catch (error) { inc("vision.error"); console.error("Image describe failed", error); return undefined; }
