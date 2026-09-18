@@ -276,6 +276,7 @@ test("relevantMemories surfaces promotable-type candidates but keeps weak eviden
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
+    await store.setMemberOptIn("g1", "u1", true); // relevantMemories only surfaces consented subjects
     const active = await store.saveMemory(msg("x"), { subjectId: "u1", kind: "person_fact", content: "Lives in Leeds", reason: "t", evidenceType: "explicit_fact", effect: "support" });
     await store.confirm("g1", active.id);
     await store.saveMemory(msg("y"), { subjectId: "u1", kind: "person_preference", content: "Wants to be called Alby", reason: "t", evidenceType: "clear_preference", effect: "support" });
@@ -615,6 +616,7 @@ test("deterministic extraction inside buildProfiles produces a location attribut
   try {
     const { store, eventStore } = await makeStore(sql);
     const profileStore = new ProfileStore(sql as any);
+    await store.setMemberOptIn("g1", "u1", true);
     for (let i = 0; i < 5; i++) await store.recordMessage(msg(`msg ${i}`, { authorId: "u1", authorName: "Alice" }));
     const m = await activeFact(store, "Lives in Leeds");
 
@@ -637,6 +639,7 @@ test("unchanged inputs produce zero attribute writes — the real continuity tes
   try {
     const { store, eventStore } = await makeStore(sql);
     const profileStore = new ProfileStore(sql as any);
+    await store.setMemberOptIn("g1", "u1", true);
     for (let i = 0; i < 5; i++) await store.recordMessage(msg(`msg ${i}`, { authorId: "u1", authorName: "Alice" }));
     await activeFact(store, "Lives in Leeds");
     await activeFact(store, "Loves horror films", "u1", "person_preference");
@@ -695,6 +698,7 @@ test("uncited and candidate-only LLM proposals are dropped, not stored", async (
   try {
     const { store, eventStore } = await makeStore(sql);
     const profileStore = new ProfileStore(sql as any);
+    await store.setMemberOptIn("g1", "u1", true);
     for (let i = 0; i < 5; i++) await store.recordMessage(msg(`msg ${i}`, { authorId: "u1", authorName: "Alice" }));
     const real = await activeFact(store, "Likes fishing");
     // A candidate-only memory — never confirmed.
@@ -840,6 +844,7 @@ test("opt-out deletes attribute rows alongside the profile", async () => {
   try {
     const { store, eventStore } = await makeStore(sql);
     const profileStore = new ProfileStore(sql as any);
+    await store.setMemberOptIn("g1", "u1", true);
     for (let i = 0; i < 5; i++) await store.recordMessage(msg(`msg ${i}`, { authorId: "u1", authorName: "Alice" }));
     await activeFact(store, "Lives in Leeds");
     await profileStore.buildProfiles("g1", stubBrain({ profile: 0, section: 0, sections: {}, extract: 0 }), store, eventStore);
@@ -869,6 +874,7 @@ test("LLM extraction is gated: fires on first build, quiet when unchanged", asyn
   try {
     const { store, eventStore } = await makeStore(sql);
     const profileStore = new ProfileStore(sql as any);
+    await store.setMemberOptIn("g1", "u1", true);
     for (let i = 0; i < 5; i++) await store.recordMessage(msg(`msg ${i}`, { authorId: "u1", authorName: "Alice" }));
     await activeFact(store, "Lives in Leeds");
 
