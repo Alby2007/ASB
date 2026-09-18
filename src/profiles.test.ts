@@ -853,3 +853,28 @@ test("LLM extraction is gated: fires on first build, quiet when unchanged", asyn
     assert.equal(calls.extract, 2); // changed fingerprint → extraction fires again
   } finally { await sql.end(); }
 });
+
+test("attributesForSubjects batches by subject and honors the status filter", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const m1 = await activeFact(store, "Lives in Leeds", "u1");
+    const m2 = await activeFact(store, "Plays competitive Tekken", "u1");
+    const m3 = await activeFact(store, "Works night shifts", "u2");
+    await applyProposals(sql, "g1", "u1", [{ field: "location", value: "Leeds", memoryIds: [m1.id] }]);
+    await applyProposals(sql, "g1", "u1", [{ field: "skill", value: "Tekken", memoryIds: [m2.id] }]);
+    await applyProposals(sql, "g1", "u2", [{ field: "occupation", value: "night shifts", memoryIds: [m3.id] }]);
+    // A contested row must stay invisible under the active filter.
+    await sql`UPDATE profile_attributes SET status = 'contested' WHERE field = 'skill'`;
+
+    const active = await store.attributesForSubjects("g1", ["u1", "u2", "u-ghost"], { status: "active" });
+    assert.deepEqual(active.get("u1")!.map(a => a.field), ["location"]);
+    assert.deepEqual(active.get("u2")!.map(a => a.field), ["occupation"]);
+    assert.equal(active.has("u-ghost"), false);
+
+    const all = await store.attributesForSubjects("g1", ["u1"]);
+    assert.deepEqual(all.get("u1")!.map(a => a.field).sort(), ["location", "skill"]);
+
+    assert.equal((await store.attributesForSubjects("g1", [])).size, 0);
+  } finally { await sql.end(); }
+});

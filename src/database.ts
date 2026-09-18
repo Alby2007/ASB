@@ -1,9 +1,9 @@
-import type { EvidenceEffect, EvidenceType, Member, MemoryCandidate, MemoryStatus, MessageEvent, ProfileAttribute, RelationshipEdge, VerificationVerdict } from "./types.js";
+import type { AttributeStatus, EvidenceEffect, EvidenceType, Member, MemoryCandidate, MemoryStatus, MessageEvent, ProfileAttribute, RelationshipEdge, VerificationVerdict } from "./types.js";
 import { sql as defaultSql, type Sql } from "./db.js";
 import { runMigrations } from "./migrations.js";
 import { findMentionedUsers } from "./entity-resolution.js";
 import { calculateInitialConfidence, updateConfidence, calculateDefaultImportance, calculateDefaultExplicitness } from "./confidence.js";
-import { contentPolarity, listAttributes, listContestedAttributes, recomputeForMemories, transferProvenance } from "./attributes.js";
+import { contentPolarity, listAttributes, listAttributesForSubjects, listContestedAttributes, recomputeForMemories, transferProvenance } from "./attributes.js";
 
 export type Memory = Omit<MemoryCandidate, "confidence" | "importance" | "explicitness"> & {
   // DB columns are NOT NULL, so these are always present on a persisted Memory.
@@ -1508,6 +1508,12 @@ export class MemoryStore {
   /** Structured profile attributes for a subject — the provenance-backed facet set. */
   async attributesFor(guildId: string, subjectId: string): Promise<ProfileAttribute[]> {
     return listAttributes(this.sql, guildId, subjectId);
+  }
+
+  /** Batch attribute read keyed by subject — the reply path fetches facets
+   * for every in-prompt person in one round trip. */
+  async attributesForSubjects(guildId: string, subjectIds: string[], opts: { status?: AttributeStatus } = {}): Promise<Map<string, ProfileAttribute[]>> {
+    return listAttributesForSubjects(this.sql, guildId, subjectIds, opts);
   }
 
   /** Guild-wide contested attributes — the admin triage surface. */

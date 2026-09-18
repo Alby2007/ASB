@@ -83,6 +83,9 @@ Discord MessageCreate
   brain.ts: reply()
   • recent channel context (<@id> tokens demangled to @names) + relevant
     memories: active plus candidates with promotable primary evidence types
+  • per-person structured attributes (active only) with confidence buckets —
+    high/medium/low annotations let the model hedge weak facets instead of
+    stating every trait as fact; legacy flat traits are the fallback
   • pairwise relationship context for every unordered pair among the
     in-prompt people (≤6, author-involved first): directed edges both ways,
     recent literal observation reasons, active memories each authored about
@@ -119,7 +122,7 @@ Discord MessageCreate
 2. **Card (prose)** — `Brain.synthesizeProfile()` renders `bio` + `role_in_server` from the *post-diff* active attribute set plus stats/patterns/edges/events, gated on `attr_hash` (attribute rows + that same context). Unchanged render inputs → no re-render; facets assemble deterministically (`traits`/`interests` from active rows, `notableRelationships` from verified edges).
 3. **Dossier** — unchanged: independently-hashed narrative sections (below).
 
-Only `active` attributes render; `contested` surfaces in `/memory-triage`. `/profile` shows each facet's memory citations, `/memory-export` includes the attribute rows, and opted-out members have their profile *and* attribute rows deleted. Profiles surface via `/profile` (self or admin) and are injected into `brain.reply()` for the author, @-mentioned users, and members referenced by name.
+Only `active` attributes render; `contested` surfaces in `/memory-triage`. `/profile` shows each facet's memory citations, `/memory-export` includes the attribute rows, and opted-out members have their profile *and* attribute rows deleted. Profiles surface via `/profile` (self or admin) and are injected into `brain.reply()` for the author, @-mentioned users, and members referenced by name — where each person carries their active attributes with confidence buckets (`formatReplyProfile`), so weak facets render hedged rather than as flat assertions.
 
 Members with ≥3 active memories or ≥50 messages additionally get a **dossier** — a set of independently-built sections stored under `facets_json.dossier.sections`, each rebuilt only when its own input hash changes:
 

@@ -25,6 +25,33 @@ export function formatPairContext(ctx: PairContext): string {
   return `- ${ctx.aName} ↔ ${ctx.bName}: ${parts.join(". ")}`;
 }
 
+const ATTR_PLURALS: Record<string, string> = { trait: "traits", interest: "interests", skill: "skills" };
+const confLabel = (c: number) => c >= 0.8 ? "high" : c >= 0.55 ? "medium" : "low";
+
+export type ReplyProfile = {
+  name: string; summary: string; traits?: string[];
+  attributes?: Array<{ field: string; value: string; confidence: number }>;
+};
+
+/** One person's line in the People section. Structured attributes render with
+ * field labels + confidence buckets so the model can hedge weak facets;
+ * legacy flat traits are the fallback for profiles with no attribute rows. */
+export function formatReplyProfile(p: ReplyProfile): string {
+  const attrs = p.attributes ?? [];
+  const base = `- ${p.name}${p.summary ? `: ${p.summary}` : ""}`;
+  if (!attrs.length) return `${base}${p.traits?.length ? ` (traits: ${p.traits.join(", ")})` : ""}`;
+  const byField = new Map<string, Array<{ value: string; confidence: number }>>();
+  for (const a of attrs) {
+    const list = byField.get(a.field);
+    if (list) list.push(a); else byField.set(a.field, [a]);
+  }
+  const fields = [...byField.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([field, list]) => {
+    const items = [...list].sort((x, y) => y.confidence - x.confidence).map(a => `${a.value} (${confLabel(a.confidence)})`).join(", ");
+    return `${list.length > 1 ? (ATTR_PLURALS[field] ?? field) : field}: ${items}`;
+  });
+  return `${base} — ${fields.join("; ")}`;
+}
+
 // Minimal client seam — anything exposing the two call shapes Brain uses
 // (responses.create + chat.completions.create) can drive it, which is what
 // makes extraction/verification/contest testable without a live API.
@@ -682,10 +709,10 @@ export class Brain {
    * in-process (free — no per-tool billing). Either path's failure falls back
    * to the plain Responses-API call on this.model.
    */
-  async reply(event: MessageEvent, context: Array<{ authorName: string; authorId?: string; replyToAuthorId?: string; replyToAuthor?: string; replyToSnippet?: string; content: string }>, memories: Memory[], profiles: Array<{ name: string; summary: string; traits?: string[] }> = [], relationships: PairContext[] = [], model?: string, toolsEnabled = false, botId?: string, room?: { guildName: string; ownerName?: string }): Promise<string> {
-    const people = profiles.map(p => `- ${p.name}: ${p.summary}${p.traits?.length ? ` (traits: ${p.traits.join(", ")})` : ""}`).join("\n");
+  async reply(event: MessageEvent, context: Array<{ authorName: string; authorId?: string; replyToAuthorId?: string; replyToAuthor?: string; replyToSnippet?: string; content: string }>, memories: Memory[], profiles: ReplyProfile[] = [], relationships: PairContext[] = [], model?: string, toolsEnabled = false, botId?: string, room?: { guildName: string; ownerName?: string }): Promise<string> {
+    const people = profiles.map(formatReplyProfile).join("\n");
     const rels = relationships.map(formatPairContext).join("\n");
-    const persona = "You are a long-standing member of this Discord server — not an assistant, not a moderator. This room is profane and jokey; match its energy exactly. If someone swears at you, banters, or talks shit, respond like a real member would — fire back, brush it off, roll with it. If regulars ask you to roast, nickname, or rib another member, play along — that's normal here. Never lecture, moralize, de-escalate, or refuse like a terms-of-service bot; declining kills the vibe. When you don't know something — including things about yourself — riff on not knowing; never invent specifics or backstory. Style reference: 'lmao what'd i do', 'nah that's cap', 'bro is tweaking', 'you good?'. Keep replies to a line or two unless the moment calls for more. You only know what is in the supplied context and memories — never claim certainty beyond them, never expose or explain the memory system, never invent facts. The Relationships section lists what people have asserted about each other and events they shared — reference it naturally ('didn't you two argue about this'), but never invent a dynamic or shared history beyond what's listed. Address people by display name — never emit <@...> mention markup. If you use web results, work them in naturally — don't dump citations.";
+    const persona = "You are a long-standing member of this Discord server — not an assistant, not a moderator. This room is profane and jokey; match its energy exactly. If someone swears at you, banters, or talks shit, respond like a real member would — fire back, brush it off, roll with it. If regulars ask you to roast, nickname, or rib another member, play along — that's normal here. Never lecture, moralize, de-escalate, or refuse like a terms-of-service bot; declining kills the vibe. When you don't know something — including things about yourself — riff on not knowing; never invent specifics or backstory. Style reference: 'lmao what'd i do', 'nah that's cap', 'bro is tweaking', 'you good?'. Keep replies to a line or two unless the moment calls for more. You only know what is in the supplied context and memories — never claim certainty beyond them, never expose or explain the memory system, never invent facts. The Relationships section lists what people have asserted about each other and events they shared — reference it naturally ('didn't you two argue about this'), but never invent a dynamic or shared history beyond what's listed. Facet confidences tell you how sure to be — state high-confidence attributes plainly; hedge medium and low naturally ('I think you're into X, correct me if not'); never state a low-confidence attribute as fact. Address people by display name — never emit <@...> mention markup. If you use web results, work them in naturally — don't dump citations.";
     const transcript = context.map(x => {
       const who = botId && x.authorId === botId ? "you" : x.authorName;
       const edge = x.replyToAuthor ? ` (replying to ${botId && x.replyToAuthorId === botId ? "you" : x.replyToAuthor}: "${x.replyToSnippet}")` : "";

@@ -335,6 +335,22 @@ export async function listAttributes(sql: Sql, guildId: string, subjectId: strin
   return rows.map(rowToAttribute);
 }
 
+/** Batch variant of listAttributes keyed by subject — the reply path fetches
+ * facets for every in-prompt person in one round trip. */
+export async function listAttributesForSubjects(sql: Sql, guildId: string, subjectIds: string[], opts: { status?: AttributeStatus } = {}): Promise<Map<string, ProfileAttribute[]>> {
+  const out = new Map<string, ProfileAttribute[]>();
+  if (subjectIds.length === 0) return out;
+  const rows = opts.status
+    ? await sql<AttributeRow[]>`SELECT * FROM profile_attributes WHERE guild_id = ${guildId} AND subject_id = ANY(${subjectIds}) AND status = ${opts.status} ORDER BY subject_id, field, id`
+    : await sql<AttributeRow[]>`SELECT * FROM profile_attributes WHERE guild_id = ${guildId} AND subject_id = ANY(${subjectIds}) ORDER BY subject_id, field, id`;
+  for (const r of rows) {
+    const attr = rowToAttribute(r);
+    const list = out.get(attr.subjectId);
+    if (list) list.push(attr); else out.set(attr.subjectId, [attr]);
+  }
+  return out;
+}
+
 /** Guild-wide contested rows — the admin triage surface: a stored facet whose
  * evidence is currently disputed. */
 export async function listContestedAttributes(sql: Sql, guildId: string, limit = 10): Promise<ProfileAttribute[]> {

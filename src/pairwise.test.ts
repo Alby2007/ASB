@@ -2,7 +2,7 @@ import "dotenv/config";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { makeTestSql, makeStore } from "./test-helpers.js";
-import { formatPairContext } from "./brain.js";
+import { formatPairContext, formatReplyProfile } from "./brain.js";
 import type { MessageEvent, PairContext } from "./types.js";
 
 function msg(content: string, overrides: Partial<MessageEvent> = {}): MessageEvent {
@@ -178,4 +178,42 @@ test("formatPairContext omits absent sections", () => {
   // A claims-only pair still renders (theory of mind without an edge)
   const claimsOnly = formatPairContext({ ...ctx, claimsAboutA: ["plays valorant"] });
   assert.match(claimsOnly, /Bob claimed about Alice: "plays valorant"/);
+});
+
+// ── formatReplyProfile (pure) ─────────────────────────────────────────────────
+
+test("formatReplyProfile renders attributes with confidence buckets and field labels", () => {
+  const line = formatReplyProfile({
+    name: "Alice", summary: "Regular.",
+    attributes: [
+      { field: "location", value: "Leeds", confidence: 0.9 },
+      { field: "interest", value: "horror films", confidence: 0.85 },
+      { field: "interest", value: "tekken", confidence: 0.5 },
+      { field: "trait", value: "competitive", confidence: 0.6 },
+    ],
+  });
+  // Singular field labeled; multi-valued pluralized and confidence-sorted
+  assert.match(line, /- Alice: Regular\. — /);
+  assert.match(line, /location: Leeds \(high\)/);
+  assert.match(line, /interests: horror films \(high\), tekken \(low\)/);
+  assert.match(line, /trait: competitive \(medium\)/);
+  // Fields render alphabetical: interest < location < trait
+  assert.ok(line.indexOf("interests") < line.indexOf("location") && line.indexOf("location") < line.indexOf("trait:"));
+});
+
+test("formatReplyProfile falls back to flat traits when no attributes exist", () => {
+  assert.equal(
+    formatReplyProfile({ name: "Bob", summary: "Lurker.", traits: ["quiet"] }),
+    "- Bob: Lurker. (traits: quiet)"
+  );
+  assert.equal(
+    formatReplyProfile({ name: "Bob", summary: "", attributes: [] }),
+    "- Bob"
+  );
+  // Empty summary + attributes → no dangling colon
+  const attrsOnly = formatReplyProfile({
+    name: "Bob", summary: "",
+    attributes: [{ field: "pronouns", value: "they/them", confidence: 0.95 }],
+  });
+  assert.equal(attrsOnly, "- Bob — pronouns: they/them (high)");
 });

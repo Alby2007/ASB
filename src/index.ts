@@ -458,8 +458,15 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
       ...message.mentions.users.keys(),
       ...findMentionedUsers(event.content, lookups.map).slice(0, 3),
     ]);
-    const profiles = (await profileStore.getProfiles(event.guildId, [...peopleIds]))
-      .map(p => ({ name: p.displayName, summary: p.summary, traits: p.facets.traits }));
+    const profileRows = await profileStore.getProfiles(event.guildId, [...peopleIds]);
+    // Structured attributes (active only — the same boundary /profile uses)
+    // carry field labels + per-facet confidence, so the model can hedge weak
+    // facets instead of stating every trait with equal confidence.
+    const attrMap = await store.attributesForSubjects(event.guildId, profileRows.map(p => p.subjectId), { status: "active" });
+    const profiles = profileRows.map(p => ({
+      name: p.displayName, summary: p.summary, traits: p.facets.traits,
+      attributes: (attrMap.get(p.subjectId) ?? []).map(a => ({ field: a.field, value: a.value, confidence: a.confidence })),
+    }));
     // Pairwise relationship context — what the in-prompt people assert about
     // each other, distinct from either's standalone profile. All unordered
     // pairs among non-bot people, author-involved pairs first, capped so the
