@@ -21,7 +21,7 @@ ASB is configured through environment variables validated at startup by `src/con
 | `GROQ_MODEL` | `openai/gpt-oss-120b` | Model name passed to Groq. `openai/gpt-oss-120b` is the default; `openai/gpt-oss-20b` is faster and cheaper. |
 | `GROQ_BASE_URL` | `https://api.groq.com/openai/v1` | Override the Groq base URL. Useful for proxies or self-hosted endpoints. |
 | `GUILD_ID` | (empty) | If set, restricts the bot to a single Discord server. **Recommended during development** to avoid accidental activity in other servers. Leave empty to enable all servers the bot has joined. |
-| `SPEAK_THRESHOLD` | `0.70` | Minimum `brain.decide()` score required to send a reply. Range 0–1. A score of 0.70 means the bot will normally only speak when directly @mentioned (which scores 0.90). Lowering this value enables more frequent unsolicited replies. |
+| `SPEAK_THRESHOLD` | `0.70` | Minimum `brain.decide()` score required to send a reply. Range 0–1. At 0.70 the bot speaks on direct address (0.90) and on in-conversation engaged messages (0.75 before recency decay). Lowering this value enables more frequent unsolicited replies. |
 | `RAW_MESSAGE_RETENTION_DAYS` | `30` | How many days of raw Discord messages to keep in the `messages` table. Messages older than this are deleted by the daily maintenance job. Evidence quotes in `memory_evidence` are **not** affected by this purge. Range 1–365. |
 | `CANDIDATE_CONFIDENCE_THRESHOLD` | `0.70` | Minimum confidence required to auto-promote a candidate memory to active status (subject to evidence type gates). Range 0–1. |
 | `REPLY_MODEL` | `GROQ_MODEL` | Model used for Discord replies, across all reply paths. Any Groq model id, or `groq/compound*` for Groq's agentic system with built-in web tools. Reasoning models (gpt-oss, qwen3) get `reasoning_effort=low` automatically to cut latency and flatten the register. |
@@ -38,6 +38,8 @@ ASB is configured through environment variables validated at startup by `src/con
 | `VISION_BASE_URL` | `GROQ_BASE_URL` | OpenAI-compatible endpoint for the vision provider (e.g. `https://generativelanguage.googleapis.com/v1beta/openai/` for Gemini). |
 | `IMAGE_MAX_BYTES` | `4000000` | Per-image size cap for `VISION_MODEL` processing; larger attachments are skipped. Keep at or under the provider's per-image limit. |
 | `WAKE_WORD` | `1` | Saying the bot's name — its username, display name, server nickname, or `"asb"` — counts as addressing it (same as an @-mention: reply trigger, always-inspect, tools armed). Word-boundary matched, names under 3 chars ignored. `0` disables if casual name-drops get noisy. |
+| `ENGAGEMENT` | `1` | Conversational engagement: once someone addresses the bot (mention, reply-to-bot, or wake word), their follow-up messages get a mid-tier reply score (+0.70) for `ENGAGEMENT_TTL_MS` without re-mentioning — the bot stays in the thread. Participants expire independently and the TTL refreshes only on addressed messages, so the bot drops out when the conversation moves on even while people keep talking. Explicit dismissals ("shut up &lt;name&gt;", "we're done") drop the speaker immediately. `0` reverts to address-only replies. |
+| `ENGAGEMENT_TTL_MS` | `120000` | How long a participant stays "in conversation" after their last addressed message. Range 10s–1h. Longer = chattier mid-flow but slower to drop out. |
 
 ---
 

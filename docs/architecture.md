@@ -17,7 +17,7 @@ ASB (Artificial Server Member) is a single TypeScript/Node process that connects
 | `src/events.ts` | `EventStore` | Postgres persistence: event CRUD, participants, message/memory attachments |
 | `src/migrations.ts` | `runMigrations`, `getMigrationVersion` | Versioned schema migrations (v1–v12, `LATEST_MIGRATION_VERSION`) with rollback support |
 | `src/confidence.ts` | `calculateInitialConfidence`, `updateConfidence`, `calculateDefaultImportance`, `calculateDefaultExplicitness` | Deterministic numeric formulas; no LLM involvement |
-| `src/perception.ts` | `shouldInspectForMemory`, `detectNamingRequest`, `detectSelfNaming` | Cheap pre-filter: prevents LLM calls for ordinary chat; detects explicit naming requests and self-naming |
+| `src/perception.ts` | `shouldInspectForMemory`, `detectNamingRequest`, `detectSelfNaming`, `detectWakeWord`, `detectDismissal`, `contestCue`, `botMemoryCue`, `toolCues` | Cheap pre-filter: prevents LLM calls for ordinary chat; detects naming requests, self-naming, wake words, and dismissal cues |
 | `src/event-detection.ts` | `EventPipeline` | Heuristic + LLM continuity decisions; nightly maintenance |
 | `src/event-significance.ts` | `calculateSignificance` | Deterministic significance score and tier assignment |
 | `src/entity-resolution.ts` | `buildAliasMap`, `resolveSubject`, `findMentionedUsers` | Maps display names to real user IDs; ambiguous names resolve to `unknown` |
@@ -29,6 +29,7 @@ ASB (Artificial Server Member) is a single TypeScript/Node process that connects
 | `src/lookup-tools.ts` | `ToolCtx`, `executeLookupTool`, `buildPairContext` | Read-only internal lookup tools (person/relationship/memories/event) over the existing stores |
 | `src/reply-format.ts` | `formatReplyProfile`, `formatPairContext` | Pure formatters shared by the reply prompt and tool outputs |
 | `src/vision.ts` | `qualifyingImages`, `formatImageContext` | Pure image-attachment gate (image/*, byte cap, ≤3/message) + observation-framed label |
+| `src/engagement.ts` | `EngagementTracker` | Per-channel conversational sessions: participant set with per-user TTLs — who is talking *with* the bot; refresh on address only, so drift decays out |
 
 ---
 
@@ -82,11 +83,19 @@ Discord MessageCreate
         │
         ▼
   brain.ts: decide()
-  • baseline 0.05 + direct mention +0.85 + question +0.10
+  • baseline 0.05 + direct mention +0.85, else engaged +0.70 + question +0.10
   • "direct mention" = @-mention, reply-to-bot, or wake word — the bot's
     username, display name, server nick, or "asb" said in text (perception.ts
     detectWakeWord, word-boundary matched; WAKE_WORD=0 disables)
-  • recency penalty −0.25 (only if NOT a direct mention)
+  • "engaged" = the author addressed the bot within ENGAGEMENT_TTL_MS (default
+    120s) — engagement.ts tracks per-channel participants; TTL refreshes on
+    addressed messages only, NOT on bot replies, so drifting side-chatter
+    decays out and the bot drops mid-channel-talk (ENGAGEMENT=0 disables)
+  • explicit dismissals ("shut up casper", "we're done" + address) drop the
+    participant immediately after the ack reply (perception.ts detectDismissal)
+  • recency penalty proportional −0.25×(1−elapsed/120s), evaluated only inside
+    the window so it can't invert; direct mentions exempt — engaged messages
+    take it, which paces replies instead of double-firing mid-conversation
   • shouldSpeak = score ≥ SPEAK_THRESHOLD (default 0.70)
         │
         ▼ (only if shouldSpeak && replyEnabled)

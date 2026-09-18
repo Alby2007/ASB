@@ -23,14 +23,22 @@ export class Brain {
     this.client = client ?? new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
   }
 
-  decide(event: MessageEvent, recentBotMessages: number, threshold = 0.7): Decision {
+  decide(event: MessageEvent, elapsedSinceLastSpokeMs: number, engaged: boolean, threshold = 0.7): Decision {
     const reasons: string[] = [];
     let score = 0.05;
     if (event.mentionsBot) { score += 0.85; reasons.push("direct mention"); }
+    else if (engaged) { score += 0.7; reasons.push("in conversation"); }
     if (event.content.endsWith("?")) { score += 0.1; reasons.push("question"); }
-    // The recency penalty suppresses unsolicited chatter — it must never suppress
-    // an explicit mention, which is a direct request for a reply.
-    if (recentBotMessages > 0 && !event.mentionsBot) { score -= 0.25; reasons.push("bot spoke recently"); }
+    // Proportional recency penalty, evaluated only inside the window so the
+    // factor can never go negative and flip into a bonus. It must never
+    // suppress an explicit mention — a direct request for a reply. Engaged
+    // messages DO take it: that's the pacing that stops double-firing mid-convo.
+    const recencyWindowMs = 120_000;
+    const elapsed = Math.max(0, elapsedSinceLastSpokeMs);
+    if (!event.mentionsBot && elapsed < recencyWindowMs) {
+      score -= 0.25 * (1 - elapsed / recencyWindowMs);
+      reasons.push("bot spoke recently");
+    }
     return { shouldSpeak: score >= threshold, score: Math.max(0, Math.min(1, score)), reasons };
   }
 

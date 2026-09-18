@@ -108,3 +108,14 @@ const toolSignals = /https?:\/\/|\?\s*$|\b(?:google|search|look ?up|check (?:thi
 export function toolCues(content: string): boolean {
   return toolSignals.test(content);
 }
+
+// Dismissal cues on a bot-addressed message — "shut up casper", "ok we're done",
+// "fuck off". Gated at the call site on mentionsBot, so these only need to be
+// plausible dismissals, not unambiguous ones; going quiet after being told off
+// is the correct social response even when it was playful.
+const dismissalSignals = /\b(?:shut (?:the fuck )?up|stfu|fuck off|go away|leave (?:me|us|it) alone|nobody asked|stop (?:talking|replying|responding)|be quiet|that'?s enough|enough (?:now|already)|we'?re done here|ok bye|bye for now|gtfo|zip it|shut it)\b/i;
+
+/** Cheap gate: is this addressed message telling the bot to drop out? */
+export function detectDismissal(content: string): boolean {
+  return dismissalSignals.test(content);
+}

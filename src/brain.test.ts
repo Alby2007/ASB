@@ -25,25 +25,48 @@ function msg(content: string, mentionsBot = false): MessageEvent {
 }
 
 test("decide: direct mention speaks even when the bot spoke recently", () => {
-  const decision = brain.decide(msg("@asb what do you think?", true), 1);
+  const decision = brain.decide(msg("@asb what do you think?", true), 30_000, false);
   assert.equal(decision.shouldSpeak, true);
   assert.ok(decision.score >= 0.7, `score was ${decision.score}`);
 });
 
-test("decide: recency penalty still applies to non-mention messages", () => {
-  const fresh = brain.decide(msg("hello?"), 0);
-  const recent = brain.decide(msg("hello?"), 1);
-  assert.ok(recent.score < fresh.score);
+test("decide: recency penalty decays proportionally for non-mention messages", () => {
+  const fresh = brain.decide(msg("hello?"), Infinity, false);
+  const recent = brain.decide(msg("hello?"), 30_000, false);
+  const fading = brain.decide(msg("hello?"), 110_000, false);
+  assert.ok(recent.score < fading.score && fading.score < fresh.score);
   assert.ok(recent.reasons.includes("bot spoke recently"));
 });
 
+test("decide: elapsed beyond the window carries no penalty (guard can never invert)", () => {
+  const beyond = brain.decide(msg("hello?"), 120_000, false);
+  const never = brain.decide(msg("hello?"), Infinity, false);
+  assert.equal(beyond.score, never.score);
+  assert.ok(!beyond.reasons.includes("bot spoke recently"));
+});
+
+test("decide: engaged tier lifts in-conversation messages without mention weight", () => {
+  const engaged = brain.decide(msg("lol nice"), 200_000, true);
+  const stranger = brain.decide(msg("lol nice"), 200_000, false);
+  assert.ok(engaged.score > stranger.score);
+  assert.ok(engaged.reasons.includes("in conversation"));
+  assert.equal(engaged.shouldSpeak, true); // 0.05 + 0.70 = 0.75
+});
+
+test("decide: engaged messages take the recency hit — that's the pacing", () => {
+  const justReplied = brain.decide(msg("lol nice"), 30_000, true);
+  assert.equal(justReplied.shouldSpeak, false); // ~0.56 — waits, doesn't double-fire
+  const question = brain.decide(msg("wait what?"), 60_000, true);
+  assert.equal(question.shouldSpeak, true); // ~0.73 — questions stay quick mid-convo
+});
+
 test("decide: unmentioned chatter stays below the speak threshold", () => {
-  const decision = brain.decide(msg("lol nice"), 0);
+  const decision = brain.decide(msg("lol nice"), Infinity, false);
   assert.equal(decision.shouldSpeak, false);
 });
 
 test("decide: lowering the threshold enables unsolicited replies", () => {
-  const decision = brain.decide(msg("hello?"), 0, 0.1);
+  const decision = brain.decide(msg("hello?"), Infinity, false, 0.1);
   assert.equal(decision.shouldSpeak, true);
 });
 

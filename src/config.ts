@@ -27,6 +27,8 @@ const env = z.object({
   VISION_MODEL: z.string().optional(),
   VISION_API_KEY: z.string().optional(),
   WAKE_WORD: z.string().optional(),
+  ENGAGEMENT: z.string().optional(),
+  ENGAGEMENT_TTL_MS: z.coerce.number().int().min(10_000).max(3_600_000).default(120_000),
   VISION_BASE_URL: z.string().optional(),
   IMAGE_MAX_BYTES: z.coerce.number().int().min(1).default(4_000_000),
 }).parse(process.env);
@@ -64,4 +66,9 @@ export const config = {
   // Saying the bot's name (username, display name, server nick, "asb") counts
   // as addressing it. Kill switch for if casual name-drops get noisy.
   wakeWord: env.WAKE_WORD !== "0",
+  // Conversational engagement: addressed users stay "in conversation" for the
+  // TTL and get a mid-tier reply bonus without re-mentioning. Kill switch and
+  // window size are separate knobs — engagement is what makes the bot chattier.
+  engagement: env.ENGAGEMENT !== "0",
+  engagementTtlMs: env.ENGAGEMENT_TTL_MS,
 };

@@ -5,7 +5,8 @@ import { config } from "./config.js";
 import { sql } from "./db.js";
 import { MemoryStore } from "./database.js";
 import { commandDefinitions, handleMemoryButton, handleMemoryCommand } from "./commands.js";
-import { detectNamingRequest, detectSelfNaming, detectWakeWord, shouldInspectForMemory, toolCues } from "./perception.js";
+import { detectDismissal, detectNamingRequest, detectSelfNaming, detectWakeWord, shouldInspectForMemory, toolCues } from "./perception.js";
+import { EngagementTracker } from "./engagement.js";
 import { runContestCheck } from "./contest.js";
 import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
@@ -27,7 +28,9 @@ const visionClient = config.visionModel &&
     ? new OpenAI({ apiKey: config.visionApiKey, baseURL: config.visionBaseUrl })
     : undefined;
 const pipeline = new EventPipeline();
-const botActivity = new Map<string, number>();
+// Conversational engagement: per-channel participant set with per-user TTLs —
+// who is actively talking *with* the bot, not just when it last spoke.
+const engagement = new EngagementTracker(config.engagementTtlMs);
 
 // MemoryStore.create() runs migrations; EventStore shares the same sql connection.
 let store: MemoryStore;
@@ -496,9 +499,15 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   }
 
   const key = `${event.guildId}:${event.channelId}`;
-  const lastSpoke = botActivity.get(key) ?? 0;
-  const recentBotMessages = Date.now() - lastSpoke < 120_000 ? 1 : 0;
-  const decision = brain.decide(event, recentBotMessages, config.speakThreshold);
+  // An addressed message enrolls the author for the engagement TTL; an explicit
+  // dismissal drops them again immediately (the reply below is the ack, then
+  // they're out — going quiet after being told off is the correct response).
+  if (event.mentionsBot) engagement.noteTrigger(key, event.authorId);
+  if (event.mentionsBot && detectDismissal(event.content)) engagement.dismiss(key, event.authorId);
+  const lastSpokeAt = engagement.lastSpokeAt(key);
+  const elapsedSinceLastSpoke = lastSpokeAt === undefined ? Infinity : Date.now() - lastSpokeAt;
+  const engaged = config.engagement && engagement.isEngaged(key, event.authorId);
+  const decision = brain.decide(event, elapsedSinceLastSpoke, engaged, config.speakThreshold);
   if (!settings.replyEnabled || !decision.shouldSpeak) return;
   try {
     await message.channel.sendTyping();
@@ -559,13 +568,16 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
       resolveName: n => lookups.map.get(n.trim().toLowerCase()),
     };
     // Direct mentions arm the full toolkit (they're nearly every reply at the
-    // default threshold); unsolicited replies still need a toolCues signal.
-    const toolsOn = config.replyTools && (toolCues(event.content) || event.mentionsBot);
+    // default threshold); engaged in-conversation messages get the same — an
+    // in-thread "what do you know about X" deserves tools. Stray unsolicited
+    // replies still need a toolCues signal.
+    const toolsOn = config.replyTools && (toolCues(event.content) || event.mentionsBot || engaged);
     const reply = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, relationships, config.replyModel, toolsOn, client.user!.id, { guildName: message.guild.name, ownerName, botName: message.guild.members.me?.displayName ?? client.user!.username }, toolCtx, imageContext);
     const clean = reply ? scrubMentions(reply, lookups.names) : "";
     if (clean) {
       const sent = await message.reply({ content: clean, allowedMentions: { repliedUser: false } });
-      botActivity.set(key, Date.now()); inc("reply.sent");
+      engagement.noteReply(key); inc("reply.sent");
+      if (engaged && !event.mentionsBot) inc("reply.engaged");
       // Archive the bot's own line so the transcript carries its voice and
       // member→bot reply edges resolve — otherwise reply_to_id dangles.
       await store.recordMessage({

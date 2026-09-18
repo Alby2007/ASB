@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { detectNamingRequest, detectSelfNaming, detectWakeWord, shouldInspectForMemory } from "./perception.js";
+import { detectDismissal, detectNamingRequest, detectSelfNaming, detectWakeWord, shouldInspectForMemory } from "./perception.js";
 import type { MessageEvent } from "./types.js";
 
 function msg(content: string, overrides: Partial<MessageEvent> = {}): MessageEvent {
@@ -81,4 +81,24 @@ test("detectWakeWord respects word boundaries and length minimums", () => {
 test("detectWakeWord escapes regex-special characters in names", () => {
   assert.ok(detectWakeWord("hey a.b.c what's up", ["a.b.c"]));
   assert.equal(detectWakeWord("hey axbxc what's up", ["a.b.c"]), false);      // dot is literal, not wildcard
+});
+
+// ── detectDismissal ───────────────────────────────────────────────────────────
+// Call-site gated on mentionsBot, so hits only need to be plausible dismissals.
+
+test("detectDismissal catches explicit dismissals", () => {
+  assert.ok(detectDismissal("shut up casper"));
+  assert.ok(detectDismissal("ok stfu"));
+  assert.ok(detectDismissal("fuck off bot"));
+  assert.ok(detectDismissal("alright we're done here"));
+  assert.ok(detectDismissal("nobody asked"));
+  assert.ok(detectDismissal("go away"));
+  assert.ok(detectDismissal("stop talking to me"));
+});
+
+test("detectDismissal ignores ordinary conversation", () => {
+  assert.equal(detectDismissal("what do you think?"), false);
+  assert.equal(detectDismissal("lol nice"), false);
+  assert.equal(detectDismissal("can you help me with this"), false);
+  assert.equal(detectDismissal("I haven't had enough coffee"), false); // bare "enough" isn't a cue
 });
