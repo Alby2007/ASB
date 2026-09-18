@@ -47,12 +47,25 @@ function stubCommand(opts: {
   return { interaction: interaction as unknown as ChatInputCommandInteraction, replies };
 }
 
-function stubButton(opts: { customId: string; userId: string }): { interaction: ButtonInteraction; replies: Replies; updates: Replies } {
+function stubButton(opts: { customId: string; userId: string; guildId?: string; admin?: boolean; channelId?: string }): { interaction: ButtonInteraction; replies: Replies; updates: Replies } {
   const replies: Replies = [];
   const updates: Replies = [];
+  // Empty message fetch → the ingest loop breaks immediately and the build
+  // completes on an empty backlog rather than retrying forever on a stub.
+  const channel = { type: 0, name: "general", send: async () => {}, messages: { fetch: async () => new Map() } };
   const interaction = {
     customId: opts.customId,
     user: { id: opts.userId },
+    guildId: opts.guildId ?? "g1",
+    memberPermissions: { has: () => !!opts.admin },
+    guild: {
+      channels: {
+        cache: { get: (id: string) => (id === (opts.channelId ?? "ch-1") ? channel : null) },
+        fetch: async () => channel,
+      },
+    },
+    channel: { send: async () => {} },
+    client: { user: { id: "bot-1" } },
     reply: async (r: (typeof replies)[number]) => { replies.push(r); return r; },
     update: async (r: (typeof updates)[number]) => { updates.push(r); return r; },
   };
@@ -433,3 +446,67 @@ test("/setup modal: rejected key stores nothing; unreachable stores unverified",
 function updates_content(updates: Replies): string {
   return updates.map(u => u.content ?? "").join("\n");
 }
+
+// ── /privacy + /server-build consent gate ────────────────────────────────────
+
+test("/privacy is ephemeral and reflects the caller's consent state", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const anon = stubCommand({ commandName: "privacy", userId: "u-anon" });
+    await handleMemoryCommand(anon.interaction, store, brainFor);
+    assert.equal(anon.replies[0].ephemeral, true, "privacy replies must be ephemeral");
+    const fields = JSON.stringify(anon.replies[0].embeds);
+    assert.match(fields, /not opted in/i);
+    assert.match(fields, /\*\*30 days\*\*|30 days/, "retention should be shown");
+
+    await store.setMemberOptIn("g1", "u-consented", true);
+    const consented = stubCommand({ commandName: "privacy", userId: "u-consented" });
+    await handleMemoryCommand(consented.interaction, store, brainFor);
+    assert.match(JSON.stringify(consented.replies[0].embeds), /opted in/i);
+  } finally { await sql.end(); }
+});
+
+test("/server-build asks for consent instead of starting", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const channel = { id: "ch-1", type: 0, name: "general" };
+    const cmd = stubCommand({ commandName: "server-build", userId: "u-admin", admin: true, options: { channel } });
+    await handleMemoryCommand(cmd.interaction, store, brainFor);
+    assert.equal(cmd.replies[0].ephemeral, true);
+    assert.match(cmd.replies[0].content ?? "", /scans and archives|never consented/i);
+    assert.ok(cmd.replies[0].components?.length, "consent prompt must carry confirm/cancel buttons");
+    assert.doesNotMatch(cmd.replies[0].content ?? "", /build started/i, "the build must not start from the command");
+  } finally { await sql.end(); }
+});
+
+test("serverbuild buttons: wrong user rejected, cancel updates, confirm reaches the runner", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    // Someone else clicking the confirm button is denied.
+    const stranger = stubButton({ customId: "serverbuild:confirm:g1:u-admin:ch-1", userId: "u-stranger", admin: true });
+    await handleMemoryButton(stranger.interaction, store, brainFor);
+    assert.match(stranger.replies[0]?.content ?? "", /not for you/i);
+    assert.equal(stranger.updates.length, 0);
+
+    // Cancel dismisses the prompt without starting anything.
+    const cancel = stubButton({ customId: "serverbuild:cancel:g1:u-admin", userId: "u-admin", admin: true });
+    await handleMemoryButton(cancel.interaction, store, brainFor);
+    assert.match(updates_content(cancel.updates), /cancelled/i);
+
+    // Non-admin (permissions revoked between prompt and click) is denied.
+    const demoted = stubButton({ customId: "serverbuild:confirm:g1:u-admin:ch-1", userId: "u-admin", admin: false });
+    await handleMemoryButton(demoted.interaction, store, brainFor);
+    assert.match(demoted.replies[0]?.content ?? "", /Manage Server/i);
+
+    // A real confirm claims the flag and reaches the runner — the stub channel
+    // fails the build almost immediately, but the "started" update proves the
+    // path; the flag releases in finally once the runner settles.
+    const confirm = stubButton({ customId: "serverbuild:confirm:g1:u-admin:ch-1", userId: "u-admin", admin: true });
+    await handleMemoryButton(confirm.interaction, store, brainFor);
+    assert.match(updates_content(confirm.updates), /Server build started/i);
+    await new Promise(r => setTimeout(r, 20)); // let the failed runner release the flag
+  } finally { await sql.end(); }
+});

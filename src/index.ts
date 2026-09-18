@@ -1,4 +1,4 @@
-import { Client, Events, GatewayIntentBits, Partials, type Message, type OmitPartialGroupDMChannel } from "discord.js";
+import { Client, Events, GatewayIntentBits, Partials, type Guild, type Message, type OmitPartialGroupDMChannel } from "discord.js";
 import OpenAI from "openai";
 import { config } from "./config.js";
 import { sql } from "./db.js";
@@ -19,6 +19,7 @@ import { qualifyingImages, formatImageContext, IMAGE_MAX_PER_MESSAGE, type Attac
 import { withRetry } from "./retry.js";
 import { inc } from "./metrics.js";
 import { logError, redactSecrets, registerSecret, validateLlmKey } from "./secrets.js";
+import { announceIfNeeded, handleGuildDelete } from "./guild-lifecycle.js";
 import { isSafeUrl } from "./tools.js";
 import type { MessageEvent, PairContext } from "./types.js";
 
@@ -109,6 +110,21 @@ client.once(Events.ClientReady, async ready => {
   sweepMissedSignals(24 * 60 * 60_000).catch(error => { inc("sweep.error"); logError("Boot sweep failed", error); }); // wide window on boot to cover downtime
   if (!config.visionModel) console.warn("[vision] VISION_MODEL unset — image attachments will be ignored");
   console.log(`ASM online as ${ready.user.tag}`);
+});
+
+// ── Guild lifecycle (announce / kick-purge) ─────────────────────────────────
+// announceIfNeeded + handleGuildDelete live in guild-lifecycle.ts so they can
+// be unit-tested (this module logs in on import).
+client.on(Events.GuildCreate, guild => {
+  if (!store) return; // fires before init on connect — ClientReady runs first in practice
+  announceIfNeeded(guild, store).catch(error => { inc("guild.announce_error"); logError(`Join announcement failed in ${guild.name}`, error); });
+});
+
+client.on(Events.GuildDelete, guild => {
+  if (!store) return;
+  handleGuildDelete(guild as Guild & { unavailable?: boolean }, store)
+    .then(purged => { if (purged) { inc("guild.purged"); console.log(`Purged all data for removed guild ${guild.id} (${guild.name})`); } })
+    .catch(error => { inc("guild.purge_error"); logError(`Guild purge failed for ${guild.id}`, error); });
 });
 
 async function applyRetention() {
@@ -346,7 +362,7 @@ client.on(Events.InteractionCreate, async interaction => {
   try {
     if (interaction.isChatInputCommand()) await handleMemoryCommand(interaction, store, brainFor, eventStore, profileStore);
     if (interaction.isModalSubmit()) await handleSetupModal(interaction, store, invalidateBrain);
-    if (interaction.isButton()) await handleMemoryButton(interaction, store);
+    if (interaction.isButton()) await handleMemoryButton(interaction, store, brainFor, eventStore);
   } catch (error) {
     inc("handler.interaction_error");
     logError("Interaction handling failed", error);

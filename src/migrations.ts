@@ -432,6 +432,25 @@ const migrations: Migration[] = [
       await sql`DROP TABLE IF EXISTS guild_keys`;
     },
   },
+  {
+    version: 16,
+    name: "v16_consent_posture",
+    // Dormant-by-default: new guilds observe nothing until an admin runs
+    // /memory-resume (the join announcement tells them to). Only new rows are
+    // affected — guilds that already flipped these flags keep their values.
+    // announced_at stamps the disclosure card so re-posts don't spam on
+    // every connect (discord.js fires GuildCreate for cached guilds too).
+    up: async (sql) => {
+      await sql`ALTER TABLE server_settings ALTER COLUMN memory_enabled SET DEFAULT 0`;
+      await sql`ALTER TABLE server_settings ALTER COLUMN reply_enabled SET DEFAULT 0`;
+      await addColumn(sql, "server_settings", "announced_at TIMESTAMPTZ");
+    },
+    down: async (sql) => {
+      await sql`ALTER TABLE server_settings ALTER COLUMN memory_enabled SET DEFAULT 1`;
+      await sql`ALTER TABLE server_settings ALTER COLUMN reply_enabled SET DEFAULT 1`;
+      await sql`ALTER TABLE server_settings DROP COLUMN IF EXISTS announced_at`;
+    },
+  },
 ];
 
 /** Highest known migration version — tests assert against this instead of a
@@ -499,8 +518,8 @@ export async function runMigrations(sql: Sql, targetVersion?: number): Promise<v
   await sql`
     CREATE TABLE IF NOT EXISTS server_settings (
       guild_id          TEXT PRIMARY KEY,
-      memory_enabled    SMALLINT NOT NULL DEFAULT 1,
-      reply_enabled     SMALLINT NOT NULL DEFAULT 1,
+      memory_enabled    SMALLINT NOT NULL DEFAULT 0,
+      reply_enabled     SMALLINT NOT NULL DEFAULT 0,
       proactive_enabled SMALLINT NOT NULL DEFAULT 0,
       raw_retention_days INTEGER NOT NULL DEFAULT 30
     )

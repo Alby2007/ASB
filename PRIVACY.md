@@ -6,6 +6,8 @@ ASB ("the bot") is a Discord bot that participates in servers like a member. Thi
 
 ## What the bot stores
 
+**Dormant until enabled.** When the bot joins a server it posts a disclosure card and records **nothing** — observation starts only after a server admin runs `/memory-resume`. Everything below applies once enabled.
+
 **Raw message archive.** Messages in channels the bot can read are archived to a PostgreSQL database so the bot can reply with context, extract knowledge, and audit where a memory came from. Raw messages are retained for **30 days** by default (the operator may configure 1–365 days) and then permanently deleted.
 
 **Member registry.** Per server, per user: display names/nicknames observed, message count, and first/last activity timestamps. This exists so the bot can tell who a name refers to — it is infrastructure, not a profile.
@@ -14,7 +16,7 @@ ASB ("the bot") is a Discord bot that participates in servers like a member. Thi
 
 **Derived personal data — opt-in only.** Memories about a person, structured profile attributes (pronouns, interests, timezone, etc.), generated profile cards and dossiers, and relationship observations/edges are created **only for members who explicitly opt in** via `/profile-build` or `/opt-in`. Members who never opt in get no derived data.
 
-**Third-party processing.** Message content is sent to a large-language-model API (currently Groq; configurable to any OpenAI-compatible provider) for memory extraction, verification, and reply generation. The operator's API key is used today; a bring-your-own-key model where each server supplies and controls its own key is on the roadmap.
+**Third-party processing.** Message content is sent to a large-language-model API (currently Groq; configurable to any OpenAI-compatible provider) for memory extraction, verification, and reply generation. Servers may supply their own provider key via `/setup` — stored encrypted, never shown after entry.
 
 ## What the bot does not do
 
@@ -30,8 +32,8 @@ ASB ("the bot") is a Discord bot that participates in servers like a member. Thi
 - **`/forget`** removes a single memory.
 - **`/memory-export`** lets you download everything the bot holds about you.
 - Server admins can set a shorter retention window via `/memory-purge` or disable memory/reply features entirely via `/memory-pause`.
-
-_Roadmap:_ purging a server's data when the bot is removed from it, and per-server encryption of stored keys, are planned but not yet implemented. This document describes current behavior.
+- **`/privacy`** shows any member exactly what is stored, the retention window, and their own consent state.
+- **Removing the bot from a server deletes every row it stored there** — raw messages, memories, profiles, keys, and settings — immediately and permanently.
 
 ## Contact
 

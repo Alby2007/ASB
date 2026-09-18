@@ -137,8 +137,9 @@ One row per guild. Controls pause state and retention.
 | `reply_enabled` | INTEGER | 0 = silent; 1 = replies allowed |
 | `proactive_enabled` | INTEGER | 0 = off (default); 1 = server opted in to proactive answers — requires the global `PROACTIVE=1` env flag too |
 | `raw_retention_days` | INTEGER | Rolling window for raw message purge |
+| `announced_at` | TIMESTAMPTZ NULL | Set once the join disclosure card posts — the idempotency marker for `announceIfNeeded` |
 
-Row is created with defaults on first message from a guild. Administrators can override via `/memory-pause`, `/memory-resume`, `/proactive enabled:<bool>`, and the `RAW_MESSAGE_RETENTION_DAYS` env variable.
+Row is created with dormant defaults (`memory_enabled=0`, `reply_enabled=0`) on first sight of a guild — an admin enables observation via `/memory-resume`. Administrators can override via `/memory-pause`, `/memory-resume`, `/proactive enabled:<bool>`, and the `RAW_MESSAGE_RETENTION_DAYS` env variable.
 
 ---
 
@@ -379,3 +380,4 @@ Version tracking for the migration system.
 | 13 | `v13_proactive_enabled` | `proactive_enabled` on `server_settings` — per-server opt-in for proactive speaking, default off |
 | 14 | `v14_member_opted_in` | `opted_in` on `members` — derived data becomes consent-gated: person memories, relationships, attributes, profiles form only for `opted_in=1 AND opted_out=0` |
 | 15 | `v15_guild_keys` | `guild_keys` table — BYOK: per-guild LLM keys encrypted AES-256-GCM, written by `/setup` |
+| 16 | `v16_consent_posture` | `server_settings` defaults flip to dormant (`memory_enabled=0`, `reply_enabled=0`); `announced_at` marks the join disclosure |

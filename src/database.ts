@@ -64,7 +64,7 @@ type MessageRow = {
   author_name: string; content: string; created_at: Date | string;
 };
 
-type SettingsRow = { guild_id: string; memory_enabled: number; reply_enabled: number; proactive_enabled: number; raw_retention_days: number };
+type SettingsRow = { guild_id: string; memory_enabled: number; reply_enabled: number; proactive_enabled: number; raw_retention_days: number; announced_at: Date | string | null };
 
 type MemberRow = {
   guild_id: string; user_id: string; known_names: string[];
@@ -148,17 +148,25 @@ export class MemoryStore {
 
   // settings() runs on every message, so it's cached per guild; setPaused is the
   // only writer and invalidates. The TTL bounds staleness from out-of-band edits.
-  private settingsCache = new Map<string, { value: { guildId: string; memoryEnabled: number; replyEnabled: number; proactiveEnabled: number; rawRetentionDays: number }; at: number }>();
+  private settingsCache = new Map<string, { value: { guildId: string; memoryEnabled: number; replyEnabled: number; proactiveEnabled: number; rawRetentionDays: number; announcedAt: string | null }; at: number }>();
 
-  async settings(guildId: string, defaultRetentionDays = 30): Promise<{ guildId: string; memoryEnabled: number; replyEnabled: number; proactiveEnabled: number; rawRetentionDays: number }> {
+  async settings(guildId: string, defaultRetentionDays = 30): Promise<{ guildId: string; memoryEnabled: number; replyEnabled: number; proactiveEnabled: number; rawRetentionDays: number; announcedAt: string | null }> {
     const cached = this.settingsCache.get(guildId);
     if (cached && Date.now() - cached.at < 60_000) return cached.value;
     await this.ensureSettings(guildId, defaultRetentionDays);
-    const rows = await this.sql<SettingsRow[]>`SELECT guild_id, memory_enabled, reply_enabled, proactive_enabled, raw_retention_days FROM server_settings WHERE guild_id = ${guildId}`;
+    const rows = await this.sql<SettingsRow[]>`SELECT guild_id, memory_enabled, reply_enabled, proactive_enabled, raw_retention_days, announced_at FROM server_settings WHERE guild_id = ${guildId}`;
     const r = rows[0];
-    const value = { guildId: r.guild_id, memoryEnabled: Number(r.memory_enabled), replyEnabled: Number(r.reply_enabled), proactiveEnabled: Number(r.proactive_enabled), rawRetentionDays: Number(r.raw_retention_days) };
+    const value = { guildId: r.guild_id, memoryEnabled: Number(r.memory_enabled), replyEnabled: Number(r.reply_enabled), proactiveEnabled: Number(r.proactive_enabled), rawRetentionDays: Number(r.raw_retention_days), announcedAt: r.announced_at ? ts(r.announced_at) : null };
     this.settingsCache.set(guildId, { value, at: Date.now() });
     return value;
+  }
+
+  /** Stamp the join disclosure as delivered. Returns false when the settings
+   * row doesn't exist — the caller retries on the next GuildCreate. */
+  async markAnnounced(guildId: string): Promise<boolean> {
+    const rows = await this.sql`UPDATE server_settings SET announced_at = now() WHERE guild_id = ${guildId} RETURNING guild_id`;
+    this.settingsCache.delete(guildId);
+    return rows.length > 0;
   }
 
   async setPaused(guildId: string, paused: boolean, defaultRetentionDays = 30): Promise<void> {
@@ -204,6 +212,42 @@ export class MemoryStore {
 
   async deleteGuildKey(guildId: string): Promise<void> {
     await this.sql`DELETE FROM guild_keys WHERE guild_id = ${guildId}`;
+  }
+
+  /** Kick-purge: delete EVERY row belonging to a guild, in FK-dependency
+   * order, in one transaction. Called on GuildDelete (bot kicked/removed) —
+   * "kick the bot, your data goes with it." memory_history, the event junction
+   * tables, and memory_evidence carry no guild_id — they delete through their
+   * parent keys. Junction/history deletes match on EITHER parent's guild so
+   * legacy cross-guild links can't strand an FK. memories.event_id,
+   * memory_evidence.message_id, memories.superseded_by and
+   * profile_attributes.memory_ids are unfenced — no ordering hazard. */
+  async purgeGuild(guildId: string): Promise<void> {
+    await this.sql.begin(async tx => {
+      // Children of memories/events first (no guild_id on these tables).
+      await tx`DELETE FROM memory_history WHERE memory_id IN (SELECT id FROM memories WHERE guild_id = ${guildId})
+        OR evidence_id IN (SELECT id FROM memory_evidence WHERE memory_id IN (SELECT id FROM memories WHERE guild_id = ${guildId}))`;
+      await tx`DELETE FROM event_memories WHERE event_id IN (SELECT id FROM events WHERE guild_id = ${guildId})
+        OR memory_id IN (SELECT id FROM memories WHERE guild_id = ${guildId})`;
+      await tx`DELETE FROM event_participants WHERE event_id IN (SELECT id FROM events WHERE guild_id = ${guildId})`;
+      await tx`DELETE FROM event_messages WHERE event_id IN (SELECT id FROM events WHERE guild_id = ${guildId})`;
+      await tx`DELETE FROM memory_evidence WHERE memory_id IN (SELECT id FROM memories WHERE guild_id = ${guildId})`;
+      // Parents, then every guild-scoped table.
+      await tx`DELETE FROM memories WHERE guild_id = ${guildId}`;
+      await tx`DELETE FROM events WHERE guild_id = ${guildId}`;
+      await tx`DELETE FROM profile_attributes WHERE guild_id = ${guildId}`;
+      await tx`DELETE FROM profiles WHERE guild_id = ${guildId}`;
+      await tx`DELETE FROM relationship_observations WHERE guild_id = ${guildId}`;
+      await tx`DELETE FROM relationships WHERE guild_id = ${guildId}`;
+      await tx`DELETE FROM behavioral_patterns WHERE guild_id = ${guildId}`;
+      await tx`DELETE FROM alias_candidates WHERE guild_id = ${guildId}`;
+      await tx`DELETE FROM unresolved_names WHERE guild_id = ${guildId}`;
+      await tx`DELETE FROM members WHERE guild_id = ${guildId}`;
+      await tx`DELETE FROM messages WHERE guild_id = ${guildId}`;
+      await tx`DELETE FROM guild_keys WHERE guild_id = ${guildId}`;
+      await tx`DELETE FROM server_settings WHERE guild_id = ${guildId}`;
+    });
+    this.settingsCache.delete(guildId);
   }
 
   // ── Messages ───────────────────────────────────────────────────────────────

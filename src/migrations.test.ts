@@ -290,3 +290,34 @@ test("migration v15 creates guild_keys, rolls back cleanly", async () => {
     assert.equal(tables.length, 0, "guild_keys should be dropped on rollback");
   } finally { await sql.end(); }
 });
+
+test("migration v16 flips observe defaults to dormant and adds announced_at", async () => {
+  const sql = makeTestSql();
+  try {
+    await resetSchema(sql);
+    await runMigrations(sql as any);
+    const defaults = await sql<Array<{ column_name: string; column_default: string | null }>>`
+      SELECT column_name, column_default FROM information_schema.columns
+      WHERE table_name = 'server_settings' AND column_name IN ('memory_enabled', 'reply_enabled', 'announced_at')
+    `;
+    const byName = Object.fromEntries(defaults.map(d => [d.column_name, d.column_default]));
+    assert.equal(byName.memory_enabled, "0", "memory_enabled should default to dormant");
+    assert.equal(byName.reply_enabled, "0", "reply_enabled should default to dormant");
+    assert.ok("announced_at" in byName, "announced_at column missing");
+
+    // Existing rows keep their explicit values — only the DEFAULT changed.
+    await sql`INSERT INTO server_settings (guild_id, memory_enabled, reply_enabled) VALUES ('g-explicit', 1, 1)`;
+    const kept = await sql`SELECT memory_enabled, reply_enabled FROM server_settings WHERE guild_id = 'g-explicit'`;
+    assert.equal(Number(kept[0].memory_enabled), 1);
+    assert.equal(Number(kept[0].reply_enabled), 1);
+
+    await runMigrations(sql as any, 15);
+    const rolled = await sql<Array<{ column_name: string; column_default: string | null }>>`
+      SELECT column_name, column_default FROM information_schema.columns
+      WHERE table_name = 'server_settings' AND column_name IN ('memory_enabled', 'announced_at')
+    `;
+    const rb = Object.fromEntries(rolled.map(d => [d.column_name, d.column_default]));
+    assert.equal(rb.memory_enabled, "1", "rollback should restore the observe-by-default default");
+    assert.ok(!("announced_at" in rb), "announced_at should be dropped on rollback");
+  } finally { await sql.end(); }
+});

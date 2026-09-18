@@ -14,6 +14,7 @@ ASB (Artificial Server Member) is a single TypeScript/Node process that connects
 | `src/profile-build.ts` | `runProfileBuild`, `PROFILE_BUILD_COOLDOWN_MS` | Self-service opt-in scan (/profile-build): targeted corpus → extraction → verification → scoped profile build |
 | `src/persist-extraction.ts` | `persistExtraction` | The single consent-gated write path for extraction results — person memories need an opted-in subject; relationships need one opted-in party |
 | `src/brains.ts` | `createBrainResolver` | Per-guild `Brain` resolver (BYOK): guild's encrypted key → env fallback → null (dormant). Cached per guild, invalidated by `/setup` |
+| `src/guild-lifecycle.ts` | `announceIfNeeded`, `handleGuildDelete` | Join disclosure card (idempotent via `announced_at`) + kick-purge — GuildDelete never fires on outage (`unavailable`) |
 | `src/secrets.ts` | `encryptSecret`, `decryptSecret`, `maskKey`, `redactSecrets`, `validateLlmKey` | AES-256-GCM at-rest encryption for guild keys + live key validation against `/models` |
 | `src/brain.ts` | `Brain` | All LLM calls: extract memories, correct, assess continuity, classify events, reply |
 | `src/config.ts` | `config` | Env-variable validation (zod); single exported config object |
@@ -210,6 +211,12 @@ Derived data about a person — `person_*` memories, relationship observations, 
 ## Per-guild LLM keys (BYOK)
 
 Every LLM call resolves through `createBrainResolver` (`src/brains.ts`), not a shared singleton. Resolution order: the guild's `guild_keys` row (AES-256-GCM decrypted via `KEY_ENCRYPTION_SECRET`) → the operator's env key → `null`. A `null` brain means **dormant**: `handleMessage` returns before archiving, maintenance and sweep loops `continue`, commands reply with a `/setup` pointer. `REQUIRE_GUILD_KEYS=1` removes the env fallback for hosted mode — each guild's key pays for its own cognition. The resolver caches one `Brain` per guild; `/setup` (a modal, so keys never touch channel history) is the only writer and invalidates the cache on write. Undecryptable rows (rotated master secret, tampering) degrade to dormant + a metric, never a crash — recovery is re-running `/setup`.
+
+## Guild lifecycle — consent posture
+
+New guilds start **dormant**: `server_settings` defaults are `memory_enabled=0, reply_enabled=0` (v16), so `handleMessage` returns before archiving and nothing is recorded. On every `GuildCreate` — which discord.js also fires for cached guilds on connect — `announceIfNeeded` (`guild-lifecycle.ts`) posts a disclosure card to the system channel (what's stored, retention, member controls, admin activation path) and stamps `server_settings.announced_at` **only after a successful send**, making the card idempotent and retryable. An admin activates with `/memory-resume` (optionally `/setup` first for a guild key); `/privacy` shows any member the guild's storage state and their own consent.
+
+On `GuildDelete`, `handleGuildDelete` runs `store.purgeGuild` — every guild-scoped row in one FK-ordered transaction. `guild.unavailable` (a Discord outage, not a kick) is explicitly never a purge trigger; a kick during an active `/server-build` is absorbed by the build's error path.
 
 ---
 

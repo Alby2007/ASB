@@ -40,6 +40,7 @@ export const commandDefinitions = [
   { name: "dossier", description: "View a member's detailed profile dossier", options: [
     { name: "user", description: "Member to inspect (admins can view anyone)", type: 6, required: false }
   ] },
+  { name: "privacy", description: "See what ASB stores in this server and your consent state" },
   { name: "opt-out", description: "Stop the bot forming memories or a profile about you, and forget what it already holds" },
   { name: "opt-in", description: "Consent to memories and a profile about you — then run /profile-build to scan your history" },
   { name: "profile-build", description: "Opt in and build your profile: scans the archive for your messages and references to you" },
@@ -69,6 +70,26 @@ const NO_KEY_MSG = "This server hasn't configured an LLM key — an admin can se
 export async function handleMemoryCommand(interaction: ChatInputCommandInteraction, store: MemoryStore, brainFor: BrainFor, evStore?: EventStore, profileStore: ProfileStore = new ProfileStore()) {
   if (!interaction.guildId) return;
   const guildId = interaction.guildId;
+  if (interaction.commandName === "privacy") {
+    // Public + always ephemeral: the static explainer, plus the dynamic bits
+    // the caller is entitled to — this guild's retention, whether it's
+    // observing right now, and the caller's own consent state. No admin data.
+    const s = await store.settings(guildId, config.rawMessageRetentionDays);
+    const member = await store.getMember(guildId, interaction.user.id);
+    const consent = member?.optedOut ? "opted out — nothing derived forms about you"
+      : member?.optedIn ? "opted in — derived memories and a profile may form about you"
+      : "not opted in — derived memories and a profile only form if you opt in (`/opt-in` or `/profile-build`)";
+    return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder()
+      .setTitle("What ASB stores in this server")
+      .addFields(
+        { name: "Status", value: s.memoryEnabled ? "**Observing** — messages in this server are being archived and analyzed." : "**Dormant** — ASB is not recording messages here (an admin can enable it with `/memory-resume`)." },
+        { name: "Raw messages", value: `Kept for **${s.rawRetentionDays} days**, then permanently deleted.` },
+        { name: "Derived data", value: "Memories, profiles, and relationship notes form **only for members who opt in** — never automatically." },
+        { name: "Your consent", value: consent },
+        { name: "Processing", value: "Messages are sent to an OpenAI-compatible LLM provider for analysis — the operator's default, or a provider this server configured with `/setup`." },
+        { name: "Controls & guarantees", value: "`/opt-out` deletes your derived data · `/memory-export` downloads everything stored about you · **removing ASB from this server deletes every row it holds here**." },
+      )] });
+  }
   if (interaction.commandName === "memory") {
     const server = interaction.options.getBoolean("server") ?? false;
     const stats = interaction.options.getBoolean("stats") ?? false;
@@ -373,41 +394,21 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
       return interaction.reply({ content: "Only the server owner or an administrator can run a server build.", ephemeral: true });
     }
     if (serverBuildRunning) return interaction.reply({ content: "A server build is already running.", ephemeral: true });
-    // Claim synchronously — the awaits below would otherwise let a second
-    // invocation slip past the check and start a parallel build.
-    serverBuildRunning = true;
-    let buildStarted = false;
-    try {
-      const channelOpt = interaction.options.getChannel("channel");
-      const channel = (channelOpt ?? interaction.guild?.channels.cache.find(c => c.name === config.ingestChannel && c.type === ChannelType.GuildText)) ?? null;
-      if (!channel || channel.type !== ChannelType.GuildText) {
-        return interaction.reply({ content: "Pick a text channel to build from (or set INGEST_CHANNEL and omit the option).", ephemeral: true });
-      }
-      const brain = await brainFor(guildId);
-      if (!brain) return interaction.reply({ content: NO_KEY_MSG, ephemeral: true });
-      await interaction.reply({ content: `Server build started for #${channel.name} — this runs long; results post to this channel when done.`, ephemeral: true });
-      buildStarted = true;
-      runServerIngest(channel as TextChannel, {
-        store, brain, eventStore: evStore ?? new EventStore(),
-        pipeline: new EventPipeline(), botId: interaction.client.user.id,
-      }).then(async s => {
-        const summary = `Server build done for #${(channel as TextChannel).name}: ${s.total.toLocaleString()} messages scanned · ${s.memoriesSaved} memories · ${s.relationshipsRecorded} relationship observations · ${s.eventsCreated} events · ${s.profilesBuilt} profiles built · ${s.llmErrors} LLM errors`;
-        await announce(summary);
-      }).catch(async err => {
-        logError("Server build failed", err);
-        await announce(`Server build for #${(channel as TextChannel).name} failed: ${(err as Error).message.slice(0, 180)}`);
-      }).finally(() => { serverBuildRunning = false; });
-      // Interaction tokens expire at ~15 min and a build can run longer — post
-      // to the invoking channel, with followUp as the short-run fallback.
-      async function announce(text: string) {
-        const ch = interaction.channel;
-        if (ch && "send" in ch) { await (ch.send as (t: string) => Promise<unknown>)(text).catch(() => {}); return; }
-        await interaction.followUp(text).catch(() => {});
-      }
-      return;
-    } finally {
-      if (!buildStarted) serverBuildRunning = false;
+    const channelOpt = interaction.options.getChannel("channel");
+    const channel = (channelOpt ?? interaction.guild?.channels.cache.find(c => c.name === config.ingestChannel && c.type === ChannelType.GuildText)) ?? null;
+    if (!channel || channel.type !== ChannelType.GuildText) {
+      return interaction.reply({ content: "Pick a text channel to build from (or set INGEST_CHANNEL and omit the option).", ephemeral: true });
     }
+    // Consent gate — this scans and archives channel history, including
+    // messages written before the bot arrived by people who never consented
+    // to it. The click-through is the consent artifact; the build itself
+    // only starts from the confirm button (handleMemoryButton).
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`serverbuild:confirm:${guildId}:${interaction.user.id}:${channel.id}`).setLabel("Scan channel history").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(`serverbuild:cancel:${guildId}:${interaction.user.id}`).setLabel("Cancel").setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.reply({ ephemeral: true, components: [row],
+      content: `**This scans and archives #${channel.name} history** — including messages written before the bot arrived, by people who never consented to it. Only continue if the server expects this.` });
   }
   if (interaction.commandName === "setup") {
     if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
@@ -475,17 +476,65 @@ export async function handleSetupModal(
     });
     invalidateBrain(guildId);
     return interaction.editReply(result.ok
-      ? `Key stored (${maskKey(key)}) — this server now runs on its own key. Re-run /setup any time to rotate it.`
-      : `Couldn't reach the provider to verify, but the key (${maskKey(key)}) is stored unverified — it'll be checked on first use.`);
+      ? `Key stored (${maskKey(key)}) — this server now runs on its own key. Re-run /setup any time to rotate it. Run /memory-resume to start observing.`
+      : `Couldn't reach the provider to verify, but the key (${maskKey(key)}) is stored unverified — it'll be checked on first use. Run /memory-resume to start observing.`);
   } catch (error) {
     logError("/setup failed", error);
     return interaction.editReply("Setup failed — nothing was stored. Try again later.");
   }
 }
 
-export async function handleMemoryButton(interaction: ButtonInteraction, store: MemoryStore) {
+export async function handleMemoryButton(interaction: ButtonInteraction, store: MemoryStore, brainFor?: BrainFor, evStore?: EventStore) {
   if (interaction.customId === "forget:cancel") return interaction.update({ content: "No memory was deleted.", components: [] });
-  const [action, guildId, userId, rawId] = interaction.customId.split(":");
+  const parts = interaction.customId.split(":");
+
+  // serverbuild:{confirm|cancel}:{guildId}:{userId}:{channelId?} — the
+  // /server-build consent gate. Same-user and ManageGuild are both re-checked:
+  // the prompt is ephemeral but button clicks are new interactions.
+  if (parts[0] === "serverbuild") {
+    const [, sub, guildId, userId, channelId] = parts;
+    if (interaction.user.id !== userId) return interaction.reply({ content: "That confirmation is not for you.", ephemeral: true });
+    if (sub === "cancel") return interaction.update({ content: "Server build cancelled — no history was scanned.", components: [] });
+    if (sub !== "confirm" || !channelId || interaction.guildId !== guildId) return interaction.reply({ content: "That confirmation is not valid.", ephemeral: true });
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content: "A server build requires the Manage Server permission.", ephemeral: true });
+    if (serverBuildRunning) return interaction.reply({ content: "A server build is already running.", ephemeral: true });
+    if (!brainFor) return interaction.reply({ content: "Server builds aren't available right now.", ephemeral: true });
+    const brain = await brainFor(guildId);
+    if (!brain) return interaction.reply({ content: NO_KEY_MSG, ephemeral: true });
+    const channel = interaction.guild?.channels.cache.get(channelId)
+      ?? await interaction.guild?.channels.fetch(channelId).catch(() => null);
+    if (!channel || channel.type !== ChannelType.GuildText) return interaction.update({ content: "That channel no longer exists — run /server-build again.", components: [] });
+    // Claim synchronously — the awaits below would otherwise let a second
+    // invocation slip past the check and start a parallel build.
+    serverBuildRunning = true;
+    let buildStarted = false;
+    try {
+      await interaction.update({ content: `Server build started for #${(channel as TextChannel).name} — this runs long; results post to this channel when done.`, components: [] });
+      buildStarted = true;
+      runServerIngest(channel as TextChannel, {
+        store, brain, eventStore: evStore ?? new EventStore(),
+        pipeline: new EventPipeline(), botId: interaction.client.user.id,
+      }).then(async s => {
+        const summary = `Server build done for #${(channel as TextChannel).name}: ${s.total.toLocaleString()} messages scanned · ${s.memoriesSaved} memories · ${s.relationshipsRecorded} relationship observations · ${s.eventsCreated} events · ${s.profilesBuilt} profiles built · ${s.llmErrors} LLM errors`;
+        await announce(summary);
+      }).catch(async err => {
+        logError("Server build failed", err);
+        await announce(`Server build for #${(channel as TextChannel).name} failed: ${(err as Error).message.slice(0, 180)}`);
+      }).finally(() => { serverBuildRunning = false; });
+      // Interaction tokens expire at ~15 min and a build can run longer — post
+      // to the invoking channel, with followUp as the short-run fallback.
+      async function announce(text: string) {
+        const ch = interaction.channel;
+        if (ch && "send" in ch) { await (ch.send as (t: string) => Promise<unknown>)(text).catch(() => {}); return; }
+        await interaction.followUp(text).catch(() => {});
+      }
+      return;
+    } finally {
+      if (!buildStarted) serverBuildRunning = false;
+    }
+  }
+
+  const [action, guildId, userId, rawId] = parts;
   if (action !== "forget" || !guildId || !userId || !rawId || interaction.user.id !== userId) return interaction.reply({ content: "That confirmation is not valid for you.", ephemeral: true });
   const memory = await store.getMemory(guildId, Number(rawId));
   if (!memory || memory.subjectId !== userId || (await store.forget(guildId, memory.id)) === 0) return interaction.update({ content: "That memory is no longer available.", components: [] });

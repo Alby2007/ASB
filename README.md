@@ -43,6 +43,7 @@ All replies are ephemeral (private to the invoker) unless noted.
 | `/memory-export` | Download every memory + evidence held about you |
 | `/forget` | Forget one of your memories (confirmation button required) |
 | `/correct` | Replace a memory — supersedes genuinely contradictory active ones |
+| `/privacy` | See what ASB stores in this server, the retention window, and your own consent state |
 | `/opt-out` | Forget everything about you, delete your profile, revoke consent |
 | `/opt-in` | Consent to memories + a profile about you (live activity only) |
 | `/profile-build` | Opt in **and** scan your archive history — messages you wrote, references to you, conversations you're in — to build your structured profile now (once per 24h) |
@@ -61,13 +62,14 @@ All replies are ephemeral (private to the invoker) unless noted.
 | `/memory-pause` / `/memory-resume` | Stop/restart observing and replying — archiving included |
 | `/memory-settings` | Show effective guild settings |
 | `/status` | Uptime, error counters, pipeline health |
-| `/server-build` | Run the server-level historical build on a channel (owner/admin only; archives + lore + events for everyone, derived person data for opted-in members only) |
+| `/server-build` | Backfill a channel's history — asks for an explicit confirm click first, since it archives messages from people who never consented (owner/admin only; archives + lore + events for everyone, derived person data for opted-in members only) |
 | `/setup` | Configure this server's own LLM API key via a secure modal (BYOK — the key is encrypted at rest and pays for this server's cognition; re-run to rotate) |
 
 ---
 
 ## Privacy model
 
+- **Dormant by default.** New servers observe nothing: the bot posts a disclosure card on join and stays paused until an admin runs `/memory-resume`. Removing the bot from a server deletes every row it stored there — keys included.
 - **Derived data is opt-in.** Person memories, relationship observations, attributes, profiles, and dossiers form only for members who consent (`/opt-in`, or `/profile-build` which opts in and backfills). Server lore and events are shared context and don't need per-member consent.
 - **Reads are gated too.** Non-consenting members have nothing to read — profile cards, `/memory` views, relationship pair context, and the model's lookup tools all hide stragglers.
 - **Relationship consent is subject-consent.** An observation persists when at least one party opted in — requiring both would lose almost all graph data.
