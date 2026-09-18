@@ -724,6 +724,29 @@ test("forget on a sole-cited memory flips the attribute to forgotten in the same
   } finally { await sql.end(); }
 });
 
+test("support on an active memory raises the citing attribute's confidence in the same call", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const m = await activeFact(store, "Lives in Leeds");
+    await applyProposals(sql, "g1", "u1", [{ field: "location", value: "Leeds", memoryIds: [m.id] }]);
+    const before = (await listAttributes(sql, "g1", "u1"))[0].confidence;
+
+    // New support evidence: status stays active but confidence rises. The
+    // attribute's derived confidence must follow without a status transition.
+    const reinforced = await store.saveMemory(msg("I still live in Leeds"), {
+      subjectId: "u1", kind: "person_fact", content: "Lives in Leeds",
+      reason: "repeated", evidenceType: "explicit_fact", effect: "support",
+    });
+    assert.equal(reinforced!.status, "active");
+    assert.ok(reinforced!.confidence > m.confidence);
+
+    const after = (await listAttributes(sql, "g1", "u1"))[0];
+    assert.equal(after.status, "active");
+    assert.ok(after.confidence > before, `attribute confidence ${after.confidence} should exceed ${before}`);
+  } finally { await sql.end(); }
+});
+
 test("supersede transfers provenance to the canonical memory and dedupes ids", async () => {
   const sql = makeTestSql();
   try {

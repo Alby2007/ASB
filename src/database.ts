@@ -459,6 +459,7 @@ export class MemoryStore {
         const jokeConfidence = calculateInitialConfidence("sarcasm_or_joke");
         await sql`UPDATE memories SET primary_evidence_type = 'sarcasm_or_joke', confidence = ${jokeConfidence}, updated_at = NOW() WHERE id = ${memoryId}`;
         await sql`UPDATE memory_evidence SET evidence_type = 'sarcasm_or_joke' WHERE memory_id = ${memoryId}`;
+        await recomputeForMemories(sql, mem.guildId, [memoryId]);
         await this._logHistory(sql, memoryId, "flagged_joke", mem.confidence, jokeConfidence, "candidate", "candidate", null, { reason });
         return "flagged";
       }
@@ -898,7 +899,10 @@ export class MemoryStore {
       WHERE id = ${saved.id}
     `;
 
-    if (status !== previousStatus) await recomputeForMemories(sql, event.guildId, [saved.id]);
+    // Recompute when EITHER status or confidence moved — support on an
+    // already-active memory changes no status, but the attribute's derived
+    // confidence must still track the underlying memory's.
+    if (status !== previousStatus || confidence !== previousConfidence) await recomputeForMemories(sql, event.guildId, [saved.id]);
     await this._logHistory(sql, saved.id, action, previousConfidence, confidence, previousStatus, status, evidenceId, { evidenceType, effect, sourceMessageId: event.messageId });
 
     const finalRows = await sql<MemoryRow[]>`SELECT * FROM memories WHERE guild_id = ${event.guildId} AND id = ${saved.id}`;
