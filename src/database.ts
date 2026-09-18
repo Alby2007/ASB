@@ -250,6 +250,22 @@ export class MemoryStore {
     this.settingsCache.delete(guildId);
   }
 
+  /** Guild ids present in lifecycle-owned tables but absent from the given
+   * set — zombies left when an in-flight write (a maintenance tick's
+   * ensureSettings/setMemberOptIn) races a kick-purge and re-inserts a row
+   * after it commits. Only server_settings and members are checked: every
+   * other guild-scoped table is written from in-guild events, which can't
+   * fire after removal. Caller is responsible for passing a populated cache —
+   * an empty set is treated as "cache not ready" and returns nothing. */
+  async guildsNotIn(guildIds: string[]): Promise<string[]> {
+    if (!guildIds.length) return [];
+    const rows = await this.sql<{ guild_id: string }[]>`
+      SELECT guild_id FROM server_settings WHERE NOT (guild_id = ANY(${guildIds}))
+      UNION
+      SELECT guild_id FROM members WHERE NOT (guild_id = ANY(${guildIds}))`;
+    return rows.map(r => r.guild_id);
+  }
+
   // ── Messages ───────────────────────────────────────────────────────────────
 
   async recordMessage(event: MessageEvent, replyToId?: string, trackMember = true): Promise<void> {

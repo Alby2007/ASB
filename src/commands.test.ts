@@ -467,6 +467,31 @@ test("/privacy is ephemeral and reflects the caller's consent state", async () =
   } finally { await sql.end(); }
 });
 
+test("/privacy status reflects the effective posture, not just memory_enabled", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    // Fresh guild: dormant default → "Dormant" regardless of the brain.
+    const dormant = stubCommand({ commandName: "privacy", userId: "u-x" });
+    await handleMemoryCommand(dormant.interaction, store, brainFor);
+    assert.match(JSON.stringify(dormant.replies[0].embeds), /Dormant/);
+
+    // Resumed but no resolvable key — handleMessage would bail at brainFor, so
+    // "Observing" would be a lie; the third state must show instead.
+    await store.setPaused("g1", false); // memory_enabled=1, reply_enabled=1
+    const noKey = stubCommand({ commandName: "privacy", userId: "u-x" });
+    await handleMemoryCommand(noKey.interaction, store, async () => null);
+    const fields = JSON.stringify(noKey.replies[0].embeds);
+    assert.match(fields, /no LLM key configured/i);
+    assert.doesNotMatch(fields, /Observing/);
+
+    // Resumed WITH a key → the full observing message.
+    const live = stubCommand({ commandName: "privacy", userId: "u-x" });
+    await handleMemoryCommand(live.interaction, store, brainFor);
+    assert.match(JSON.stringify(live.replies[0].embeds), /Observing/);
+  } finally { await sql.end(); }
+});
+
 test("/server-build asks for consent instead of starting", async () => {
   const sql = makeTestSql();
   try {

@@ -1,4 +1,4 @@
-import { ChannelType, EmbedBuilder, PermissionFlagsBits, type Guild, type TextChannel } from "discord.js";
+import { ChannelType, EmbedBuilder, PermissionFlagsBits, type Guild, type GuildBasedChannel, type TextChannel } from "discord.js";
 import { config } from "./config.js";
 import type { MemoryStore } from "./database.js";
 
@@ -16,11 +16,14 @@ export async function announceIfNeeded(guild: Guild, store: MemoryStore): Promis
   const s = await store.settings(guild.id, config.rawMessageRetentionDays); // creates the row with dormant defaults
   if (s.announcedAt) return false;
   const me = guild.members.me;
-  const channel = guild.systemChannel
-    ?? guild.channels.cache.find(c =>
-      c.type === ChannelType.GuildText &&
-      (!me || c.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages]))) ?? null;
-  if (!channel || channel.type !== ChannelType.GuildText) {
+  // systemChannel goes through the SAME permission check as the fallback scan —
+  // an unsendable system channel must fall through, or the card retries forever.
+  const sendable = (c: GuildBasedChannel | null | undefined): c is TextChannel =>
+    c?.type === ChannelType.GuildText &&
+    (!me || !!c.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages]));
+  const channel = (sendable(guild.systemChannel) ? guild.systemChannel : null)
+    ?? guild.channels.cache.find(sendable) ?? null;
+  if (!channel) {
     console.warn(`[announce] no sendable channel in ${guild.name} — will retry on next connect`);
     return false;
   }
@@ -35,7 +38,7 @@ export async function announceIfNeeded(guild: Guild, store: MemoryStore): Promis
       { name: "Admins", value: "To activate ASB: run `/setup` to configure an LLM key (or use the operator's), then `/memory-resume`. `/server-build` can additionally backfill history." },
       { name: "Privacy policy", value: "[github.com/Alby2007/asb-docs](https://github.com/Alby2007/asb-docs) — kick the bot and every row it stored here is deleted." },
     );
-  await (channel as TextChannel).send({ embeds: [embed], allowedMentions: { parse: [] } });
+  await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
   return store.markAnnounced(guild.id);
 }
 

@@ -94,7 +94,7 @@ test("purgeGuild removes every row for the guild and leaves other guilds intact"
 
 // ── announceIfNeeded ─────────────────────────────────────────────────────────
 
-function stubGuild(opts: { id?: string; channel?: unknown } = {}) {
+function stubGuild(opts: { id?: string; channel?: unknown; me?: unknown; channels?: unknown[] } = {}) {
   const sent: unknown[] = [];
   const channel = opts.channel === undefined
     ? { type: 0, send: async (m: unknown) => { sent.push(m); } }
@@ -103,8 +103,8 @@ function stubGuild(opts: { id?: string; channel?: unknown } = {}) {
     id: opts.id ?? "g-announce",
     name: "Test Guild",
     systemChannel: channel,
-    members: { me: null },
-    channels: { cache: { find: () => undefined } },
+    members: { me: opts.me ?? null },
+    channels: { cache: { find: (fn: (c: any) => boolean) => (opts.channels ?? []).find(fn) } },
   } as unknown as Guild;
   return { guild, sent };
 }
@@ -139,6 +139,59 @@ test("announceIfNeeded leaves announced_at NULL when no send succeeds", async ()
     const { guild: none } = stubGuild({ id: "g-nochan", channel: null });
     assert.equal(await announceIfNeeded(none, store), false);
     assert.equal((await store.settings("g-nochan")).announcedAt, null);
+  } finally { await sql.end(); }
+});
+
+test("announceIfNeeded skips an unsendable systemChannel and falls back", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const me = {}; // non-null → permissionsFor is consulted on every candidate
+    const deny = { has: () => false };
+    const allow = { has: () => true };
+    let sysSent = 0;
+    const systemChannel = { type: 0, send: async () => { sysSent++; }, permissionsFor: () => deny };
+
+    // Locked-down system channel, no other sendable channel → no send, no stamp.
+    const { guild: locked } = stubGuild({
+      id: "g-locked", channel: systemChannel, me,
+      channels: [systemChannel, { type: 2, permissionsFor: () => allow }, { type: 0, send: async () => {}, permissionsFor: () => deny }],
+    });
+    assert.equal(await announceIfNeeded(locked, store), false);
+    assert.equal(sysSent, 0, "the unsendable system channel must not be sent to");
+    assert.equal((await store.settings("g-locked")).announcedAt, null);
+
+    // Same lockdown but a sendable fallback exists → the card posts there.
+    const fallbackSent: unknown[] = [];
+    const fallback = { type: 0, send: async (m: unknown) => { fallbackSent.push(m); }, permissionsFor: () => allow };
+    const { guild: withFallback } = stubGuild({
+      id: "g-fallback", channel: systemChannel, me,
+      channels: [systemChannel, fallback],
+    });
+    assert.equal(await announceIfNeeded(withFallback, store), true);
+    assert.equal(sysSent, 0, "still never touches the denied system channel");
+    assert.equal(fallbackSent.length, 1, "card should land on the sendable fallback");
+    assert.ok((await store.settings("g-fallback")).announcedAt);
+  } finally { await sql.end(); }
+});
+
+test("guildsNotIn finds zombie rows for guilds absent from the cache", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    await seedGuild(sql, "g-alive");
+    await seedGuild(sql, "g-zombie");
+    // A members-only zombie (settings re-insert raced the purge differently).
+    await sql`INSERT INTO members (guild_id, user_id, known_names, first_seen_at, last_seen_at) VALUES ('g-memonly', 'u9', '{X}', now(), now())`;
+
+    assert.deepEqual((await store.guildsNotIn(["g-alive"])).sort(), ["g-memonly", "g-zombie"]);
+    assert.deepEqual(await store.guildsNotIn(["g-alive", "g-zombie", "g-memonly"]), []);
+    assert.deepEqual(await store.guildsNotIn([]), [], "empty cache = not ready, never sweep");
+
+    // The sweep path: purge each orphan, leaving live guilds intact.
+    for (const id of await store.guildsNotIn(["g-alive"])) await store.purgeGuild(id);
+    assert.deepEqual(await store.guildsNotIn(["g-alive"]), []);
+    assert.ok(await guildRowTotal(sql, "g-alive") > 0);
   } finally { await sql.end(); }
 });
 

@@ -76,13 +76,21 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     // observing right now, and the caller's own consent state. No admin data.
     const s = await store.settings(guildId, config.rawMessageRetentionDays);
     const member = await store.getMember(guildId, interaction.user.id);
+    // memory_enabled alone overstates reality — a guild with no resolvable key
+    // is dormant in practice (handleMessage bails at brainFor before archiving).
+    const brain = await brainFor(guildId);
+    const status = !s.memoryEnabled
+      ? "**Dormant** — ASB is not recording messages here (an admin can enable it with `/memory-resume`)."
+      : brain
+        ? "**Observing** — messages in this server are being archived and analyzed."
+        : "**Enabled but no LLM key configured** — nothing is being recorded (an admin can set one with `/setup`).";
     const consent = member?.optedOut ? "opted out — nothing derived forms about you"
       : member?.optedIn ? "opted in — derived memories and a profile may form about you"
       : "not opted in — derived memories and a profile only form if you opt in (`/opt-in` or `/profile-build`)";
     return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder()
       .setTitle("What ASB stores in this server")
       .addFields(
-        { name: "Status", value: s.memoryEnabled ? "**Observing** — messages in this server are being archived and analyzed." : "**Dormant** — ASB is not recording messages here (an admin can enable it with `/memory-resume`)." },
+        { name: "Status", value: status },
         { name: "Raw messages", value: `Kept for **${s.rawRetentionDays} days**, then permanently deleted.` },
         { name: "Derived data", value: "Memories, profiles, and relationship notes form **only for members who opt in** — never automatically." },
         { name: "Your consent", value: consent },

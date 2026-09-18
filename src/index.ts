@@ -128,6 +128,18 @@ client.on(Events.GuildDelete, guild => {
 });
 
 async function applyRetention() {
+  // Zombie sweep first: an in-flight write can race a kick-purge and re-insert
+  // a server_settings/members row after it commits. Cache is authoritative —
+  // discord.js keeps unavailable (outage) guilds cached, so they're never
+  // swept. guildsNotIn no-ops on an empty cache (treated as "not ready").
+  try {
+    const known = client.guilds.cache.map(g => g.id);
+    for (const orphanId of await store.guildsNotIn(known)) {
+      await store.purgeGuild(orphanId);
+      inc("guild.purged");
+      console.log(`Purged zombie rows for removed guild ${orphanId}`);
+    }
+  } catch (error) { inc("maintenance.error"); logError("Zombie-guild sweep failed", error); }
   for (const guild of client.guilds.cache.values()) {
     // These three calls sit outside the feature-level try/catches below — a DB
     // blip here must skip the guild, not reject the whole interval callback.
