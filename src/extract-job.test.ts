@@ -110,6 +110,55 @@ test("a failing job leaves the row claimable; BudgetExceeded propagates for resc
   } finally { await sql.end(); }
 });
 
+test("a separate vision client is metered against the guild's daily cap", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store, eventStore } = await makeStore(sql);
+    await store.settings("g5");
+    await store.setMemberOptIn("g5", "u1", true);
+    const event = {
+      guildId: "g5", channelId: "c1", messageId: "m-img", authorId: "u1", authorName: "Alice",
+      content: "look at this", createdAt: new Date(), mentionsBot: false,
+      imageAttachments: [{ url: "https://cdn.discordapp.com/x.png", contentType: "image/png", size: 100 }],
+    };
+    await store.recordMessage(event as MessageEvent, undefined, true);
+    await store.setTriageResults([{ id: "m-img", result: "queued" }]);
+
+    // The describe stub invokes the passed client exactly like the real SDK
+    // call inside describeImage — metering lives in the wrapper, so this is
+    // what proves the charge lands on guild_usage.
+    let innerCalls = 0;
+    const visionClient = {
+      responses: { create: async (_p: unknown) => { innerCalls++; return {}; } },
+      chat: { completions: { create: async (_p: unknown) => ({}) } },
+    };
+    const brain: Partial<Brain> = {
+      describeImage: async (_input, _model, client) => { await client!.responses.create({}); return { description: "a dog", category: "photo" }; },
+      extractMemories: async () => ({ memories: [], relationships: [] }),
+    };
+    const deps: ExtractJobDeps = { ...stubDeps(store, eventStore, brain), visionModel: "vm", visionClient: visionClient as never };
+    await runExtractJob(payloadFor(event), deps);
+    assert.equal(innerCalls, 1);
+    assert.equal(await store.usageToday("g5"), 1, "the vision call must charge guild_usage");
+
+    // cap=0 → the metered charge throws BudgetExceeded, which must propagate
+    // to the worker (reschedule) rather than being swallowed as a per-image
+    // skip — otherwise the message extracts without its image context.
+    await store.setDailyCap("g5", 0);
+    const cappedEvent = { ...event, messageId: "m-img2" };
+    await store.recordMessage(cappedEvent as MessageEvent, undefined, true);
+    await store.setTriageResults([{ id: "m-img2", result: "queued" }]);
+    const { BudgetExceeded } = await import("./budget.js");
+    await assert.rejects(
+      runExtractJob(payloadFor(cappedEvent), deps),
+      BudgetExceeded,
+      "a capped vision call must reach the worker for reschedule, not be swallowed",
+    );
+    const marks = await store.getTriageResults(["m-img2"]);
+    assert.equal(marks.get("m-img2"), "queued", "the terminal mark must not be written on reschedule");
+  } finally { await sql.end(); }
+});
+
 test("enqueue → claim → runExtractJob is the end-to-end drain path", async () => {
   const sql = makeTestSql();
   try {

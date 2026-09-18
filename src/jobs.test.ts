@@ -187,3 +187,17 @@ test("guild_usage counter resets across the UTC day boundary", async () => {
     assert.equal(await store.usageToday("g-day"), 1);
   } finally { await sql.end(); }
 });
+
+test("pruneDerivedData drops guild_usage rows older than 30 days, keeps recent", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    await store.chargeLlmCall("g-prune", 5);
+    await sql`INSERT INTO guild_usage (guild_id, day, llm_calls) VALUES ('g-prune', (now() AT TIME ZONE 'UTC')::date - 40, 7)`;
+    const pruned = await store.pruneDerivedData("g-prune");
+    assert.equal(pruned.usage, 1);
+    const rows = await sql`SELECT day::text AS d, llm_calls FROM guild_usage WHERE guild_id = 'g-prune'`;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].llm_calls, 1, "today's counter survives");
+  } finally { await sql.end(); }
+});

@@ -4,7 +4,7 @@ import type { EventStore } from "./events.js";
 import type { EventPipeline } from "./event-detection.js";
 import type { AliasMap } from "./entity-resolution.js";
 import type { MessageEvent } from "./types.js";
-import { BudgetExceeded } from "./budget.js";
+import { BudgetExceeded, meteredClient } from "./budget.js";
 import { detectNamingRequest, detectSelfNaming } from "./perception.js";
 import { formatImageContext } from "./vision.js";
 import { persistExtraction } from "./persist-extraction.js";
@@ -70,14 +70,24 @@ export async function runExtractJob(payload: ExtractJobPayload, deps: ExtractJob
 
   // Image describe re-runs here — the per-message memoization on the live
   // path only ever shared between extraction and the reply for that message.
+  // A separate vision client (VISION_API_KEY/BASE_URL ≠ main creds) is the
+  // operator's spend, not the guild's key — but it still counts against the
+  // guild's daily cap, so it's wrapped in the same meter. When visionClient is
+  // undefined, describeImage falls back to the brain's already-metered client.
   let imageContext: string | undefined;
   if (images.length && deps.visionModel) {
+    const vision = deps.visionClient
+      ? meteredClient(deps.visionClient, { guildId, store: deps.store, getCap: async () => (await deps.store.settings(guildId)).llmDailyCap })
+      : undefined;
     const descs = await Promise.all(images.map(async a => {
       try {
-        const d = await brain.describeImage({ url: a.url, contextText: event.content, maxBytes: deps.imageMaxBytes }, deps.visionModel!, deps.visionClient);
+        const d = await brain.describeImage({ url: a.url, contextText: event.content, maxBytes: deps.imageMaxBytes }, deps.visionModel!, vision);
         inc("vision.described");
         return d.description;
-      } catch (error) { inc("vision.error"); logError("Image describe failed", error); return undefined; }
+      } catch (error) {
+        if (error instanceof BudgetExceeded) throw error; // reschedule — the image must not be extracted silently stripped of its context
+        inc("vision.error"); logError("Image describe failed", error); return undefined;
+      }
     })).then(list => list.filter((d): d is string => !!d));
     imageContext = formatImageContext(descs, event.authorName) || undefined;
   }

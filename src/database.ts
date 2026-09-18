@@ -1580,7 +1580,7 @@ export class MemoryStore {
   // Child tables have no cascade, so they're deleted first. memory_evidence is
   // deliberately not pruned — evidence is retained for inspectability even on
   // forgotten memories, and its size tracks live memory count.
-  async pruneDerivedData(guildId: string, olderThanDays = 90): Promise<{ history: number; names: number; aliases: number; events: number }> {
+  async pruneDerivedData(guildId: string, olderThanDays = 90): Promise<{ history: number; names: number; aliases: number; events: number; usage: number }> {
     const cutoff = new Date(Date.now() - olderThanDays * 86_400_000).toISOString();
     const staleEvents = this.sql`SELECT id FROM events WHERE guild_id = ${guildId} AND tier = 'candidate' AND closed_at IS NOT NULL AND occurred_at < ${cutoff}`;
     const history = await this.sql`
@@ -1593,7 +1593,11 @@ export class MemoryStore {
     await this.sql`DELETE FROM event_messages WHERE event_id IN (${staleEvents})`;
     await this.sql`DELETE FROM event_memories WHERE event_id IN (${staleEvents})`;
     const events = await this.sql`DELETE FROM events WHERE id IN (${staleEvents})`;
-    return { history: history.count, names: names.count, aliases: aliases.count, events: events.count };
+    // guild_usage is operational state, not derived data — 30 days of history
+    // is enough for /status-style review; without this it grows ~365
+    // rows/guild/year forever.
+    const usage = await this.sql`DELETE FROM guild_usage WHERE guild_id = ${guildId} AND day < (now() AT TIME ZONE 'UTC')::date - 30`;
+    return { history: history.count, names: names.count, aliases: aliases.count, events: events.count, usage: usage.count };
   }
 
   // Admin triage view: the last N memories written for the guild across all

@@ -24,7 +24,7 @@ Raw Discord message archive. Purged on a rolling retention window.
 
 **Index:** `messages_context (guild_id, channel_id, created_at DESC)` — used by `recentContext()`.
 
-**Retention:** `deleteRawMessagesOlderThan(guildId, days)` deletes rows older than the configured window. Evidence quotes in `memory_evidence` are kept separately and survive this purge. Separately, `pruneDerivedData(guildId)` caps the append-only tables at 90 days: `memory_history`, `unresolved_names`, `alias_candidates`, and closed candidate-tier `events` (promoted `event` rows are kept). `memory_evidence` is intentionally not pruned.
+**Retention:** `deleteRawMessagesOlderThan(guildId, days)` deletes rows older than the configured window. Evidence quotes in `memory_evidence` are kept separately and survive this purge. Separately, `pruneDerivedData(guildId)` caps the append-only tables at 90 days: `memory_history`, `unresolved_names`, `alias_candidates`, and closed candidate-tier `events` (promoted `event` rows are kept) — plus `guild_usage` rows older than 30 days. `memory_evidence` is intentionally not pruned.
 
 ---
 

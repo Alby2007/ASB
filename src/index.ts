@@ -87,7 +87,11 @@ const proactive = new ProactiveScheduler({
   backoffMinConfidence: 0.85,
 });
 proactive.setFireHandler((key, messageId) => {
-  void fireProactive(key, messageId).catch(error => { inc("proactive.error"); logError("Proactive fire failed", error); });
+  void fireProactive(key, messageId).catch(error => {
+    // A capped guild isn't a fault — the metered client threw before spend.
+    if (error instanceof BudgetExceeded) { inc("budget.proactive_blocked"); return; }
+    inc("proactive.error"); logError("Proactive fire failed", error);
+  });
 });
 
 // MemoryStore.create() runs migrations; EventStore shares the same sql connection.
@@ -168,8 +172,8 @@ async function applyRetention() {
     } catch (error) { inc("maintenance.retention_error"); logError(`Retention/maintenance failed in ${guild.name}`, error); continue; }
     try {
       const pruned = await store.pruneDerivedData(guild.id);
-      if (pruned.history + pruned.names + pruned.aliases + pruned.events) {
-        console.log(`Pruned derived data in ${guild.name}: ${pruned.history} history, ${pruned.names} unresolved names, ${pruned.aliases} alias candidates, ${pruned.events} events`);
+      if (pruned.history + pruned.names + pruned.aliases + pruned.events + pruned.usage) {
+        console.log(`Pruned derived data in ${guild.name}: ${pruned.history} history, ${pruned.names} unresolved names, ${pruned.aliases} alias candidates, ${pruned.events} events, ${pruned.usage} usage rows`);
       }
     } catch (error) { inc("maintenance.prune_error"); logError("Derived-data pruning failed", error); }
     // Dormant guilds (no key) skip every LLM pass — retention/pruning above
@@ -581,14 +585,22 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   }
   // Per-image describe, per-image fault tolerance — a dead URL or a 429 skips
   // that image, never the message's text. Memoized so extraction and the reply
-  // path share one describe pass for the same message.
+  // path share one describe pass for the same message. A separate vision
+  // client is operator spend but still counts against this guild's daily cap —
+  // metered here (undefined → describeImage uses the brain's metered client).
+  const meteredVision = visionClient
+    ? meteredClient(visionClient, { guildId: event.guildId, store, getCap: async () => (await store.settings(event.guildId, config.rawMessageRetentionDays)).llmDailyCap })
+    : undefined;
   const describeImages = (list: Array<AttachmentMeta & { contentType: string }>) =>
     Promise.all(list.map(async a => {
       try {
-        const d = await brain.describeImage({ url: a.url, contextText: event.content, maxBytes: config.imageMaxBytes }, config.visionModel!, visionClient);
+        const d = await brain.describeImage({ url: a.url, contextText: event.content, maxBytes: config.imageMaxBytes }, config.visionModel!, meteredVision);
         inc("vision.described");
         return d.description;
-      } catch (error) { inc("vision.error"); logError("Image describe failed", error); return undefined; }
+      } catch (error) {
+        if (error instanceof BudgetExceeded) throw error; // lands in the reply block's budget notice
+        inc("vision.error"); logError("Image describe failed", error); return undefined;
+      }
     })).then(list => list.filter((d): d is string => !!d));
   let imageDescs: Promise<string[]> | undefined;
   const getImageDescriptions = () => (imageDescs ??= describeImages(images));
