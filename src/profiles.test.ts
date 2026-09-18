@@ -52,6 +52,18 @@ test("re-archiving the same message does not double-count message_count", async 
   } finally { await sql.end(); }
 });
 
+test("recordMessage trackMember=false archives the row without a member entry", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    await store.recordMessage(msg("skyrim rant", { authorId: "bot-1", authorName: "paarthbot" }), undefined, false);
+    assert.equal(await store.getMember("g1", "bot-1"), undefined);
+    // ...but the transcript carries it — references resolve, context shows it.
+    const ctx = await store.recentContext("g1", "c1");
+    assert.equal(ctx.some(x => x.authorId === "bot-1" && x.content === "skyrim rant"), true);
+  } finally { await sql.end(); }
+});
+
 test("recordMessage persists reply_to_id", async () => {
   const sql = makeTestSql();
   try {

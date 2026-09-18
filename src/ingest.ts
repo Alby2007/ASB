@@ -61,10 +61,17 @@ async function archiveAndFilter(msgs: RawMsg[]): Promise<{ toExtract: ExtractIte
   const regexMarked: Array<{ id: string; result: string }> = [];
 
   for (const msg of msgs) {
-    if (msg.author.bot || !msg.content.trim()) continue;
-    total++;
+    if (!msg.content.trim()) continue;
     const event = toEvent(msg);
     const replyToId = msg.reference?.messageId ?? undefined;
+    // Bot chatter is archive-only context (same rule as the live path):
+    // record it for the transcript, mark it so no pipeline ever extracts it.
+    if (msg.author.bot) {
+      await store.recordMessage(event, replyToId, false);
+      await store.setTriageResults([{ id: msg.id, result: "noise" }]);
+      continue;
+    }
+    total++;
     await store.recordMessage(event, replyToId);
     archived++;
     if (shouldInspectForMemory(event) && triaged.get(msg.id) !== "extracted") {

@@ -1,4 +1,5 @@
 import { lookup } from "node:dns/promises";
+import { executeLookupTool, LOOKUP_TOOL_NAMES, type ToolCtx } from "./lookup-tools.js";
 
 // Local tool implementations for gpt-oss-120b tool calling — free alternatives to
 // Groq Compound's billed built-ins. web_search scrapes DuckDuckGo's lite endpoint
@@ -189,10 +190,40 @@ export const replyToolDefs = [
       url: { type: "string", description: "the http(s) URL to fetch" },
     }, required: ["url"], additionalProperties: false },
   } },
+  { type: "function", function: {
+    name: "lookup_person",
+    description: "Look up a server member's profile and attributes by name.",
+    parameters: { type: "object", properties: {
+      name: { type: "string", description: "the member's name as written in chat" },
+    }, required: ["name"], additionalProperties: false },
+  } },
+  { type: "function", function: {
+    name: "lookup_relationship",
+    description: "Look up the recorded dynamic between two members: asserted relationships, recent observations, shared events.",
+    parameters: { type: "object", properties: {
+      person_a: { type: "string", description: "one member's name" },
+      person_b: { type: "string", description: "the other member's name" },
+    }, required: ["person_a", "person_b"], additionalProperties: false },
+  } },
+  { type: "function", function: {
+    name: "search_memories",
+    description: "Search remembered facts. Optionally scope to one member by name.",
+    parameters: { type: "object", properties: {
+      query: { type: "string", description: "text to search memory contents for" },
+      subject: { type: "string", description: "optional member name to scope the search to" },
+    }, required: ["query"], additionalProperties: false },
+  } },
+  { type: "function", function: {
+    name: "lookup_event",
+    description: "Look up a recorded server event by title.",
+    parameters: { type: "object", properties: {
+      title: { type: "string", description: "words from the event title" },
+    }, required: ["title"], additionalProperties: false },
+  } },
 ] as const;
 
 /** Execute one model-requested tool call. Always resolves to a string — errors become tool output. */
-export async function executeTool(name: string, argsJson: string): Promise<string> {
+export async function executeTool(name: string, argsJson: string, ctx?: ToolCtx): Promise<string> {
   try {
     const args = JSON.parse(argsJson || "{}") as Record<string, unknown>;
     if (name === "web_search") {
@@ -202,6 +233,10 @@ export async function executeTool(name: string, argsJson: string): Promise<strin
     if (name === "visit_url") {
       if (typeof args.url !== "string" || !args.url.trim()) return "error: missing url";
       return await visitUrl(args.url.trim());
+    }
+    if (LOOKUP_TOOL_NAMES.has(name)) {
+      if (!ctx) return "error: lookup tools unavailable";
+      return await executeLookupTool(name, args, ctx);
     }
     return `error: unknown tool ${name}`;
   } catch (err) {

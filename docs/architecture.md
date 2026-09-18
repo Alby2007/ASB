@@ -25,6 +25,9 @@ ASB (Artificial Server Member) is a single TypeScript/Node process that connects
 | `src/attributes.ts` | `SINGULAR_FIELDS`, `extractDeterministic`, `applyProposals`, `deriveAttributeStatus`, `recomputeForMemories`, `transferProvenance`, `attributeHash` | Structured profile facets: extraction, the upsert-diff (exact → trgm fold → insert), derived status, and lifecycle cascades |
 | `src/dossier.ts` | `gatherDossierInputs` | Per-section dossier input gathering and hashing — voice, life_situation, temperament, beliefs, relationship_map, reputation, timeline |
 | `src/commands.ts` | `commandDefinitions`, `handleMemoryCommand`, `handleMemoryButton` | Discord slash command schemas and interaction handlers |
+| `src/tools.ts` | `replyToolDefs`, `executeTool` | Never-throw tool dispatcher: SSRF-hardened web fetch + internal lookup routing |
+| `src/lookup-tools.ts` | `ToolCtx`, `executeLookupTool`, `buildPairContext` | Read-only internal lookup tools (person/relationship/memories/event) over the existing stores |
+| `src/reply-format.ts` | `formatReplyProfile`, `formatPairContext` | Pure formatters shared by the reply prompt and tool outputs |
 
 ---
 
@@ -98,9 +101,16 @@ Discord MessageCreate
   • REPLY_MODEL=groq/compound* switches to Groq's agentic system: server-side
     web_search + visit_website tools, executed_tools logged, falls back to
     GROQ_MODEL on failure
-  • REPLY_TOOLS=1 attaches local web_search/visit_url tools (tools.ts — free,
-    in-process, no per-call billing) when the message matches toolCues();
-    model-driven tool_calls loop, ≤3 rounds, falls back to the plain path
+  • REPLY_TOOLS=1 attaches local tools (tools.ts — free, in-process, no
+    per-call billing) on a direct mention or a toolCues() match; model-driven
+    tool_calls loop, ≤3 rounds, falls back to the plain path. Six tools:
+    web_search + visit_url (SSRF-hardened fetch) and four read-only internal
+    lookups — lookup_person, lookup_relationship, search_memories,
+    lookup_event (lookup-tools.ts) — so the model can fetch members, pair
+    dynamics, memories, and events beyond the pre-fetched window. Privacy
+    boundaries inherit from the wrapped store methods (opt-out, contested,
+    literal-only); outputs render via the same reply-format.ts functions as
+    the prompt sections
         │
         ▼
   Discord: message.reply()

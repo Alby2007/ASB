@@ -142,6 +142,16 @@ export class EventStore {
     }));
   }
 
+  /** Title search over promoted events — the lookup_event tool path. */
+  async searchEvents(guildId: string, query: string, limit = 3): Promise<StoredEvent[]> {
+    const rows = await this.sql<EventRow[]>`
+      SELECT id, guild_id, channel_id, title, summary, significance, tier, occurred_at, closed_at, reference_count, created_at, updated_at
+      FROM events WHERE guild_id = ${guildId} AND tier = 'event' AND title ILIKE ${`%${query}%`}
+      ORDER BY significance DESC, occurred_at DESC LIMIT ${limit}
+    `;
+    return Promise.all(rows.map(r => this.hydrate(r)));
+  }
+
   // ── Writes ─────────────────────────────────────────────────────────────────
 
   async createEvent(candidate: Omit<EventCandidate, "messageIds" | "memoryIds">): Promise<StoredEvent> {

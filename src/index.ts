@@ -10,6 +10,7 @@ import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
 import { ProfileStore } from "./profiles.js";
 import { buildAliasMap, demangleMentions, findMentionedUsers, resolveSubject, scrubMentions, type AliasMap } from "./entity-resolution.js";
+import { buildPairContext, type ToolCtx } from "./lookup-tools.js";
 import { withRetry } from "./retry.js";
 import { inc } from "./metrics.js";
 import type { MessageEvent, PairContext } from "./types.js";
@@ -308,7 +309,7 @@ client.on(Events.MessageCreate, message => {
 // mirror of current content.
 client.on(Events.MessageUpdate, (_old, message) => {
   if (!store) return; // before init() completes — a sync TypeError would escape .catch
-  if (!message.guild || message.author?.bot || !message.content?.trim()) return;
+  if (!message.guild || !message.content?.trim()) return;
   if (config.guildId && message.guild.id !== config.guildId) return;
   store.updateMessageContent(message.guild.id, message.id, message.content)
     .catch(error => { inc("handler.message_error"); console.error("Message update handling failed", error); });
@@ -346,7 +347,7 @@ async function guildLookups(guildId: string): Promise<{ map: AliasMap; names: Ma
 }
 
 async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
-  if (!message.guild || message.author.bot || !message.content.trim()) return;
+  if (!message.guild || !message.content.trim()) return;
   if (config.guildId && message.guild.id !== config.guildId) return;
   const event: MessageEvent = {
     guildId: message.guild.id, channelId: message.channel.id, messageId: message.id,
@@ -362,12 +363,25 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   if (!settings.memoryEnabled && !settings.replyEnabled) return;
   // Resolve the reply target first so it can be persisted with the raw message.
   const replyToId = message.reference?.messageId ?? undefined;
-  if (settings.memoryEnabled) await store.recordMessage(event, replyToId);
+  if (settings.memoryEnabled) await store.recordMessage(event, replyToId, !message.author.bot);
+  // Bot chatter is archive-only context: it resolves references and appears in
+  // recentContext, but is never a memory source, never enters the event
+  // pipeline, and never triggers a reply — no bot→bot loops.
+  if (message.author.bot) {
+    if (settings.memoryEnabled) await store.setTriageResults([{ id: event.messageId, result: "noise" }]);
+    return;
+  }
   const savedMemoryIds: number[] = [];
   let replyToContent: string | undefined;
   if (replyToId) {
     const ref = await store.getMessage(replyToId);
     if (ref) replyToContent = `${ref.authorName}: ${ref.content}`;
+    else {
+      // Reply target isn't archived (bot message that predates this, pre-boot
+      // history) — ask Discord for it so the reference still resolves.
+      const live = await message.channel.messages.fetch(replyToId).catch(() => undefined);
+      if (live) replyToContent = `${live.member?.displayName ?? live.author.username}: ${live.content}`;
+    }
   }
   // The alias map is built lazily on first use so ordinary chatter costs no extra queries.
   let aliasMap: Promise<AliasMap> | undefined;
@@ -476,26 +490,9 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     for (let i = 0; i < pairIds.length; i++)
       for (let j = i + 1; j < pairIds.length; j++) pairList.push([pairIds[i], pairIds[j]]);
     pairList.sort((x, y) => Number(y.includes(event.authorId)) - Number(x.includes(event.authorId)));
-    const monthYear = (iso: string) => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString("en-US", { month: "short", year: "numeric" }); };
-    const relationships = (await Promise.all(pairList.slice(0, 6).map(async ([aId, bId]): Promise<PairContext | undefined> => {
-      const [pc, events] = await Promise.all([
-        store.pairwiseContext(event.guildId, aId, bId),
-        eventStore.sharedEvents(event.guildId, aId, bId, 3),
-      ]);
-      if (!pc.ab && !pc.ba && !pc.observations.length && !pc.claimsAboutA.length && !pc.claimsAboutB.length && !events.length) return undefined;
-      const [aName, bName] = await Promise.all([
-        store.displayNameFor(event.guildId, aId), store.displayNameFor(event.guildId, bId),
-      ]);
-      return {
-        aName, bName,
-        aToB: pc.ab ? { summary: pc.ab.summary, valence: pc.ab.valence, observationCount: pc.ab.observationCount } : undefined,
-        bToA: pc.ba ? { summary: pc.ba.summary, valence: pc.ba.valence, observationCount: pc.ba.observationCount } : undefined,
-        reasons: pc.observations.map(o => ({ fromName: o.fromId === aId ? aName : bName, reason: o.reason, at: o.createdAt })),
-        claimsAboutA: pc.claimsAboutA,
-        claimsAboutB: pc.claimsAboutB,
-        sharedEvents: events.map(e => `${e.title} (${monthYear(e.occurredAt)})`),
-      };
-    }))).filter((x): x is PairContext => !!x);
+    const relationships = (await Promise.all(pairList.slice(0, 6).map(([aId, bId]) =>
+      buildPairContext(store, eventStore, event.guildId, aId, bId)
+    ))).filter((x): x is PairContext => !!x);
     // Model-facing text carries names, never raw <@id> markup — real mention
     // tokens in stored content taught the model to greet users with fabricated
     // snowflakes ("Hey <@1549171765056638>!").
@@ -505,7 +502,16 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     // moments ago takes effect immediately, not after the next profile build.
     const authorName = await store.displayNameFor(event.guildId, event.authorId);
     const ownerName = message.guild.ownerId ? await store.displayNameFor(event.guildId, message.guild.ownerId) : undefined;
-    const reply = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, relationships, config.replyModel, config.replyTools && toolCues(event.content), client.user!.id, { guildName: message.guild.name, ownerName });
+    // Lookup tools get the guild's handles + name resolution — the model can
+    // fetch people/pairs/memories/events beyond the pre-fetched window above.
+    const toolCtx: ToolCtx = {
+      guildId: event.guildId, store, eventStore, profileStore,
+      resolveName: n => lookups.map.get(n.trim().toLowerCase()),
+    };
+    // Direct mentions arm the full toolkit (they're nearly every reply at the
+    // default threshold); unsolicited replies still need a toolCues signal.
+    const toolsOn = config.replyTools && (toolCues(event.content) || event.mentionsBot);
+    const reply = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, relationships, config.replyModel, toolsOn, client.user!.id, { guildName: message.guild.name, ownerName }, toolCtx);
     const clean = reply ? scrubMentions(reply, lookups.names) : "";
     if (clean) {
       const sent = await message.reply({ content: clean, allowedMentions: { repliedUser: false } });
@@ -516,7 +522,10 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
         guildId: event.guildId, channelId: event.channelId, messageId: sent.id,
         authorId: client.user!.id, authorName: message.guild.members.me?.displayName ?? client.user!.username,
         content: clean, createdAt: sent.createdAt ?? new Date(), mentionsBot: false,
-      }, event.messageId);
+      }, event.messageId, false);
+      // Same rule as inbound bot chatter: archive for transcript fidelity,
+      // never a memory source — keep it out of the sweep's extraction set.
+      await store.setTriageResults([{ id: sent.id, result: "noise" }]);
     }
   } catch (error) { inc("llm.reply_error"); console.error("Reply generation failed", error); }
 }

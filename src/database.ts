@@ -165,7 +165,7 @@ export class MemoryStore {
 
   // ── Messages ───────────────────────────────────────────────────────────────
 
-  async recordMessage(event: MessageEvent, replyToId?: string): Promise<void> {
+  async recordMessage(event: MessageEvent, replyToId?: string, trackMember = true): Promise<void> {
     // Insert-only dedup: a conflict means the message was already archived
     // (re-ingest), so member stats must not double-count. Name/seen-at merges
     // still run — they're idempotent by construction.
@@ -178,7 +178,9 @@ export class MemoryStore {
       // Pre-existing rows can still gain a reply edge on re-ingest.
       await this.sql`UPDATE messages SET reply_to_id = ${replyToId} WHERE id = ${event.messageId} AND reply_to_id IS NULL`;
     }
-    await this.upsertMember(event.guildId, event.authorId, event.authorName, event.createdAt, inserted.count > 0);
+    // Bot-authored rows are archive-only context — no member registry entry,
+    // so bots never accrue message_count or become profile-eligible.
+    if (trackMember) await this.upsertMember(event.guildId, event.authorId, event.authorName, event.createdAt, inserted.count > 0);
   }
 
   /** Edited message — update the archive row only. Evidence snapshots keep the
@@ -1375,6 +1377,17 @@ export class MemoryStore {
       LIMIT ${limit}
     `;
     return rows.map(r => ({ ...rowToMemory(r), subjectLabel: r.subject_label }));
+  }
+
+  /** Guild-wide active-memory text search — the search_memories lookup tool.
+   * Importance-weighted, bounded; only 'active' rows ever surface. */
+  async searchMemories(guildId: string, query: string, limit = 5): Promise<Array<{ subjectId: string; content: string; confidence: number }>> {
+    const rows = await this.sql<Array<{ subject_id: string; content: string; confidence: number }>>`
+      SELECT subject_id, content, confidence FROM memories
+      WHERE guild_id = ${guildId} AND status = 'active' AND content ILIKE ${`%${query}%`}
+      ORDER BY importance * confidence DESC LIMIT ${limit}
+    `;
+    return rows.map(r => ({ subjectId: r.subject_id, content: r.content, confidence: Number(r.confidence) }));
   }
 
   // ── Episode consolidation ──────────────────────────────────────────────────

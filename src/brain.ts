@@ -2,55 +2,12 @@ import OpenAI from "openai";
 import type { Memory } from "./database.js";
 import { executeTool, replyToolDefs } from "./tools.js";
 import type { AttributeProposal, ContinuityDecision, Decision, DossierSection, ExtractionResult, MemoryCandidate, MessageEvent, PairContext, ProfileSynthesis, ProfileSynthesisInput, StoredEvent, VerificationVerdict } from "./types.js";
+import type { ToolCtx } from "./lookup-tools.js";
+import { formatPairContext, formatReplyProfile, type ReplyProfile } from "./reply-format.js";
 
-function shortDate(iso: string): string {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-}
-
-/** Render one pair's relationship context as a single prompt line. Direction
- * is preserved explicitly — "A says about B" means A is the asserting side.
- * Claims are attributed ("B claimed about A"), never stated as facts. */
-export function formatPairContext(ctx: PairContext): string {
-  const edge = (name: string, e: { summary: string; valence: number | null; observationCount: number }, other: string) =>
-    `${name} says about ${other}: "${e.summary}" (${e.valence != null ? e.valence.toFixed(2) : "no valence"}, ${e.observationCount} obs)`;
-  const parts: string[] = [];
-  if (ctx.aToB) parts.push(edge(ctx.aName, ctx.aToB, ctx.bName));
-  if (ctx.bToA) parts.push(edge(ctx.bName, ctx.bToA, ctx.aName));
-  const reasons = ctx.reasons.map(r => `${r.fromName}: "${r.reason}" (${shortDate(r.at)})`).join("; ");
-  if (reasons) parts.push(`recent: ${reasons}`);
-  if (ctx.claimsAboutA.length) parts.push(`${ctx.bName} claimed about ${ctx.aName}: ${ctx.claimsAboutA.map(c => `"${c}"`).join(", ")}`);
-  if (ctx.claimsAboutB.length) parts.push(`${ctx.aName} claimed about ${ctx.bName}: ${ctx.claimsAboutB.map(c => `"${c}"`).join(", ")}`);
-  if (ctx.sharedEvents.length) parts.push(`shared events: ${ctx.sharedEvents.join(", ")}`);
-  return `- ${ctx.aName} ↔ ${ctx.bName}: ${parts.join(". ")}`;
-}
-
-const ATTR_PLURALS: Record<string, string> = { trait: "traits", interest: "interests", skill: "skills" };
-const confLabel = (c: number) => c >= 0.8 ? "high" : c >= 0.55 ? "medium" : "low";
-
-export type ReplyProfile = {
-  name: string; summary: string; traits?: string[];
-  attributes?: Array<{ field: string; value: string; confidence: number }>;
-};
-
-/** One person's line in the People section. Structured attributes render with
- * field labels + confidence buckets so the model can hedge weak facets;
- * legacy flat traits are the fallback for profiles with no attribute rows. */
-export function formatReplyProfile(p: ReplyProfile): string {
-  const attrs = p.attributes ?? [];
-  const base = `- ${p.name}${p.summary ? `: ${p.summary}` : ""}`;
-  if (!attrs.length) return `${base}${p.traits?.length ? ` (traits: ${p.traits.join(", ")})` : ""}`;
-  const byField = new Map<string, Array<{ value: string; confidence: number }>>();
-  for (const a of attrs) {
-    const list = byField.get(a.field);
-    if (list) list.push(a); else byField.set(a.field, [a]);
-  }
-  const fields = [...byField.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([field, list]) => {
-    const items = [...list].sort((x, y) => y.confidence - x.confidence).map(a => `${a.value} (${confLabel(a.confidence)})`).join(", ");
-    return `${list.length > 1 ? (ATTR_PLURALS[field] ?? field) : field}: ${items}`;
-  });
-  return `${base} — ${fields.join("; ")}`;
-}
+// formatPairContext / formatReplyProfile live in reply-format.ts so the
+// internal lookup tools render people/pairs identically to the prompt sections.
+export { formatPairContext, formatReplyProfile };
 
 // Minimal client seam — anything exposing the two call shapes Brain uses
 // (responses.create + chat.completions.create) can drive it, which is what
@@ -709,7 +666,7 @@ export class Brain {
    * in-process (free — no per-tool billing). Either path's failure falls back
    * to the plain Responses-API call on this.model.
    */
-  async reply(event: MessageEvent, context: Array<{ authorName: string; authorId?: string; replyToAuthorId?: string; replyToAuthor?: string; replyToSnippet?: string; content: string }>, memories: Memory[], profiles: ReplyProfile[] = [], relationships: PairContext[] = [], model?: string, toolsEnabled = false, botId?: string, room?: { guildName: string; ownerName?: string }): Promise<string> {
+  async reply(event: MessageEvent, context: Array<{ authorName: string; authorId?: string; replyToAuthorId?: string; replyToAuthor?: string; replyToSnippet?: string; content: string }>, memories: Memory[], profiles: ReplyProfile[] = [], relationships: PairContext[] = [], model?: string, toolsEnabled = false, botId?: string, room?: { guildName: string; ownerName?: string }, toolCtx?: ToolCtx): Promise<string> {
     const people = profiles.map(formatReplyProfile).join("\n");
     const rels = relationships.map(formatPairContext).join("\n");
     const persona = "You are a long-standing member of this Discord server — not an assistant, not a moderator. This room is profane and jokey; match its energy exactly. If someone swears at you, banters, or talks shit, respond like a real member would — fire back, brush it off, roll with it. If regulars ask you to roast, nickname, or rib another member, play along — that's normal here. Never lecture, moralize, de-escalate, or refuse like a terms-of-service bot; declining kills the vibe. When you don't know something — including things about yourself — riff on not knowing; never invent specifics or backstory. Style reference: 'lmao what'd i do', 'nah that's cap', 'bro is tweaking', 'you good?'. Keep replies to a line or two unless the moment calls for more. You only know what is in the supplied context and memories — never claim certainty beyond them, never expose or explain the memory system, never invent facts. The Relationships section lists what people have asserted about each other and events they shared — reference it naturally ('didn't you two argue about this'), but never invent a dynamic or shared history beyond what's listed. Facet confidences tell you how sure to be — state high-confidence attributes plainly; hedge medium and low naturally ('I think you're into X, correct me if not'); never state a low-confidence attribute as fact. Address people by display name — never emit <@...> mention markup. If you use web results, work them in naturally — don't dump citations.";
@@ -756,7 +713,7 @@ export class Brain {
     if (toolsEnabled) {
       try {
         const messages: OpenAI.ChatCompletionMessageParam[] = [
-          { role: "system", content: `${persona} You have tools: web_search(query) and visit_url(url). Use them only when the conversation needs live information or a linked page — never for ordinary chat.` },
+          { role: "system", content: `${persona} You have tools: web_search(query), visit_url(url), lookup_person(name), lookup_relationship(person_a, person_b), search_memories(query[, subject]), lookup_event(title). Use them only when the conversation needs live information, a linked page, or facts about members/events not already in the supplied People/Relationships sections — never for ordinary chat.` },
           { role: "user", content: situation },
         ];
         for (let round = 0; round < 3; round++) {
@@ -772,7 +729,7 @@ export class Brain {
           messages.push(msg!);
           for (const call of calls) {
             const started = Date.now();
-            const result = await executeTool(call.function.name, call.function.arguments);
+            const result = await executeTool(call.function.name, call.function.arguments, toolCtx);
             console.log(`[reply] tool ${call.function.name}(${call.function.arguments.slice(0, 80)}) → ${result.length} chars in ${Date.now() - started}ms`);
             messages.push({ role: "tool", tool_call_id: call.id, content: result });
           }
