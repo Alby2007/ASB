@@ -556,7 +556,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     // Direct mentions arm the full toolkit (they're nearly every reply at the
     // default threshold); unsolicited replies still need a toolCues signal.
     const toolsOn = config.replyTools && (toolCues(event.content) || event.mentionsBot);
-    const reply = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, relationships, config.replyModel, toolsOn, client.user!.id, { guildName: message.guild.name, ownerName }, toolCtx, imageContext);
+    const reply = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, relationships, config.replyModel, toolsOn, client.user!.id, { guildName: message.guild.name, ownerName, botName: message.guild.members.me?.displayName ?? client.user!.username }, toolCtx, imageContext);
     const clean = reply ? scrubMentions(reply, lookups.names) : "";
     if (clean) {
       const sent = await message.reply({ content: clean, allowedMentions: { repliedUser: false } });
