@@ -65,11 +65,11 @@ export class Brain {
    * the ordinary extraction/reply pipelines; the URL and bytes are never
    * persisted. Callers pass a vision-capable model explicitly (config.visionModel).
    */
-  async describeImage(input: { url: string; contextText?: string }, model: string): Promise<{ description: string; category: "photo" | "screenshot" | "meme" | "art" | "document" | "other" }> {
+  async describeImage(input: { url: string; contextText?: string }, model: string, client?: LlmClient): Promise<{ description: string; category: "photo" | "screenshot" | "meme" | "art" | "document" | "other" }> {
     const contextLine = input.contextText?.trim()
       ? ` The sender's own caption was: "${input.contextText.trim()}" — use it only to disambiguate, not as part of the description.`
       : "";
-    const response = await this.client.chat.completions.create({
+    const response = await (client ?? this.client).chat.completions.create({
       model,
       messages: [{ role: "user", content: [
         { type: "text", text: `Describe this image factually in one or two sentences: what it depicts, any clearly legible text in it, and its apparent purpose in a Discord conversation. Do not guess at the identity of any person shown.${contextLine}` },

@@ -33,7 +33,9 @@ ASB is configured through environment variables validated at startup by `src/con
 | `INGEST_MODEL` | `qwen/qwen3.8-27b` (ingest), `GROQ_MODEL` (sweep) | Model for batch memory extraction. |
 | `INGEST_TRIAGE_MODEL` | `qwen/qwen3.8-27b` (ingest), `GROQ_MODEL` (sweep) | Model for the durability triage pass. |
 | `INGEST_CHANNEL` | `general-chat` | Channel name `npm run ingest` backfills from. |
-| `VISION_MODEL` | (off) | Vision-capable model for image understanding (e.g. `meta-llama/llama-4-scout-17b-16e-instruct` — free tier on the same `GROQ_API_KEY`). **Unset disables image handling entirely** — there is no fallback to `GROQ_MODEL`, since a text-only model could silently drop the image block and store a hallucinated description. When set, image attachments (`image/*` except GIFs, ≤`IMAGE_MAX_BYTES`, ≤3/message) are described once and the text rides the normal extraction/reply pipelines; URLs and bytes are never persisted. |
+| `VISION_MODEL` | (off) | Vision-capable model for image understanding (e.g. `gemini-2.5-flash` on Gemini's free tier). **Unset disables image handling entirely** — there is no fallback to `GROQ_MODEL`, since a text-only model could silently drop the image block and store a hallucinated description. When set, image attachments (`image/*` except GIFs, ≤`IMAGE_MAX_BYTES`, ≤3/message) are described once and the text rides the normal extraction/reply pipelines; URLs and bytes are never persisted. |
+| `VISION_API_KEY` | `GROQ_API_KEY` | API key for the vision provider — set only when `VISION_MODEL` lives off-Groq (e.g. a Gemini AI Studio key). |
+| `VISION_BASE_URL` | `GROQ_BASE_URL` | OpenAI-compatible endpoint for the vision provider (e.g. `https://generativelanguage.googleapis.com/v1beta/openai/` for Gemini). |
 | `IMAGE_MAX_BYTES` | `4000000` | Per-image size cap for `VISION_MODEL` processing; larger attachments are skipped. Keep at or under the provider's per-image limit. |
 
 ---

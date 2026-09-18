@@ -70,6 +70,15 @@ test("describeImage sends an image_url block with strict json_schema", async () 
   assert.deepEqual(capture.chat.response_format.json_schema.schema.required, ["description", "category"]);
 });
 
+test("describeImage uses the override client when a second provider is passed", async () => {
+  const main: { chat?: any } = {};
+  const other: { chat?: any } = {};
+  const brain = new Brain("k", "m", undefined, stubClient(main));
+  await brain.describeImage({ url: "u" }, "vision-model", stubClient(other));
+  assert.ok(other.chat, "override client should receive the call");
+  assert.equal(main.chat, undefined, "main client should not be called");
+});
+
 test("extractMemories carries the observation frame only when imageContext is passed", async () => {
   const capture: { responses?: any } = {};
   const brain = new Brain("k", "m", undefined, stubClient(capture));

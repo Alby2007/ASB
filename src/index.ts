@@ -1,4 +1,5 @@
 import { Client, Events, GatewayIntentBits, type Message, type OmitPartialGroupDMChannel } from "discord.js";
+import OpenAI from "openai";
 import { Brain } from "./brain.js";
 import { config } from "./config.js";
 import { sql } from "./db.js";
@@ -18,6 +19,13 @@ import type { MessageEvent, PairContext } from "./types.js";
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const brain = new Brain(config.groqKey, config.model, config.groqBaseUrl);
+// Vision can live on a different provider than the main key (e.g. Gemini's
+// free tier, since Groq rotated its vision models off) — a second client is
+// built only when the creds actually differ.
+const visionClient = config.visionModel &&
+  (config.visionApiKey !== config.groqKey || config.visionBaseUrl !== config.groqBaseUrl)
+    ? new OpenAI({ apiKey: config.visionApiKey, baseURL: config.visionBaseUrl })
+    : undefined;
 const pipeline = new EventPipeline();
 const botActivity = new Map<string, number>();
 
@@ -400,7 +408,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   const describeImages = (list: Array<AttachmentMeta & { contentType: string }>) =>
     Promise.all(list.map(async a => {
       try {
-        const d = await brain.describeImage({ url: a.url, contextText: event.content }, config.visionModel!);
+        const d = await brain.describeImage({ url: a.url, contextText: event.content }, config.visionModel!, visionClient);
         inc("vision.described");
         return d.description;
       } catch (error) { inc("vision.error"); console.error("Image describe failed", error); return undefined; }

@@ -25,6 +25,8 @@ const env = z.object({
   REPLY_TOOLS: z.string().optional(),
   INGEST_CHANNEL: z.string().optional(),
   VISION_MODEL: z.string().optional(),
+  VISION_API_KEY: z.string().optional(),
+  VISION_BASE_URL: z.string().optional(),
   IMAGE_MAX_BYTES: z.coerce.number().int().min(1).default(4_000_000),
 }).parse(process.env);
 
@@ -52,5 +54,10 @@ export const config = {
   // No fallback: unset means image understanding is OFF. A text-only model
   // could silently drop the image block and store a hallucinated description.
   visionModel: env.VISION_MODEL,
+  // Vision may live on a different provider (Groq rotated its vision models
+  // off) — defaults keep the Groq client so a future Groq vision model needs
+  // only VISION_MODEL.
+  visionApiKey: env.VISION_API_KEY ?? env.GROQ_API_KEY,
+  visionBaseUrl: env.VISION_BASE_URL ?? env.GROQ_BASE_URL,
   imageMaxBytes: env.IMAGE_MAX_BYTES,
 };
