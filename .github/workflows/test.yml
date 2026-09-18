@@ -33,3 +33,20 @@ jobs:
       - run: npm test
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/asb_test
+
+  # Red builds never reach the server — deploy only runs on green pushes to main.
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy
+      cancel-in-progress: false
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.ORACLE_SSH_KEY }}
+      - name: Pull and restart on Oracle
+        run: >-
+          ssh -o StrictHostKeyChecking=accept-new opc@140.238.67.40
+          "cd ~/ASB && git pull --ff-only && pm2 restart asb --update-env"
