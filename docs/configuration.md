@@ -37,6 +37,7 @@ ASB is configured through environment variables validated at startup by `src/con
 | `VISION_API_KEY` | `GROQ_API_KEY` | API key for the vision provider — set only when `VISION_MODEL` lives off-Groq (e.g. a Gemini AI Studio key). |
 | `VISION_BASE_URL` | `GROQ_BASE_URL` | OpenAI-compatible endpoint for the vision provider (e.g. `https://generativelanguage.googleapis.com/v1beta/openai/` for Gemini). |
 | `IMAGE_MAX_BYTES` | `4000000` | Per-image size cap for `VISION_MODEL` processing; larger attachments are skipped. Keep at or under the provider's per-image limit. |
+| `WAKE_WORD` | `1` | Saying the bot's name — its username, display name, server nickname, or `"asb"` — counts as addressing it (same as an @-mention: reply trigger, always-inspect, tools armed). Word-boundary matched, names under 3 chars ignored. `0` disables if casual name-drops get noisy. |
 
 ---
 

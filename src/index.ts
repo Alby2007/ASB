@@ -5,7 +5,7 @@ import { config } from "./config.js";
 import { sql } from "./db.js";
 import { MemoryStore } from "./database.js";
 import { commandDefinitions, handleMemoryButton, handleMemoryCommand } from "./commands.js";
-import { detectNamingRequest, detectSelfNaming, shouldInspectForMemory, toolCues } from "./perception.js";
+import { detectNamingRequest, detectSelfNaming, detectWakeWord, shouldInspectForMemory, toolCues } from "./perception.js";
 import { runContestCheck } from "./contest.js";
 import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
@@ -368,7 +368,12 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     guildId: message.guild.id, channelId: message.channel.id, messageId: message.id,
     authorId: message.author.id, authorName: message.member?.displayName ?? message.author.username,
     content: message.content, createdAt: message.createdAt,
-    mentionsBot: message.mentions.has(client.user!) || message.mentions.repliedUser?.id === client.user!.id,
+    // Wake words ("asb", the bot's username/display name, its server nick)
+    // count as addressing the bot — same flag, same downstream behavior.
+    mentionsBot: message.mentions.has(client.user!) || message.mentions.repliedUser?.id === client.user!.id
+      || (config.wakeWord && detectWakeWord(message.content, [
+        "asb", client.user!.username, client.user!.globalName, message.guild.members.me?.displayName,
+      ])),
     imageAttachments: images.length ? images : undefined,
   };
   const settings = await store.settings(event.guildId, config.rawMessageRetentionDays);

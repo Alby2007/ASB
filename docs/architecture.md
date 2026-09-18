@@ -83,6 +83,9 @@ Discord MessageCreate
         ▼
   brain.ts: decide()
   • baseline 0.05 + direct mention +0.85 + question +0.10
+  • "direct mention" = @-mention, reply-to-bot, or wake word — the bot's
+    username, display name, server nick, or "asb" said in text (perception.ts
+    detectWakeWord, word-boundary matched; WAKE_WORD=0 disables)
   • recency penalty −0.25 (only if NOT a direct mention)
   • shouldSpeak = score ≥ SPEAK_THRESHOLD (default 0.70)
         │

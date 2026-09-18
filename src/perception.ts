@@ -15,6 +15,21 @@ export function shouldInspectForMemory(event: MessageEvent) {
   return event.mentionsBot || durableSignals.test(text);
 }
 
+// Wake words: saying the bot's name counts as addressing it, same as an
+// @-mention. Word-boundary matching keeps "asb" from firing inside "hasbeen";
+// names shorter than 3 chars are rejected so a terse nickname can't become a
+// wake word by accident.
+const WAKE_MIN_LEN = 3;
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+export function detectWakeWord(content: string, names: Array<string | undefined | null>): boolean {
+  return names.some(n => {
+    const name = n?.trim();
+    if (!name || name.length < WAKE_MIN_LEN) return false;
+    return new RegExp(`\\b${escapeRe(name)}\\b`, "i").test(content);
+  });
+}
+
 // ── Provenance guards ─────────────────────────────────────────────────────────
 
 // "I am <Capitalized Name>" where the name is not one of the author's own names is

@@ -26,6 +26,7 @@ const env = z.object({
   INGEST_CHANNEL: z.string().optional(),
   VISION_MODEL: z.string().optional(),
   VISION_API_KEY: z.string().optional(),
+  WAKE_WORD: z.string().optional(),
   VISION_BASE_URL: z.string().optional(),
   IMAGE_MAX_BYTES: z.coerce.number().int().min(1).default(4_000_000),
 }).parse(process.env);
@@ -60,4 +61,7 @@ export const config = {
   visionApiKey: env.VISION_API_KEY ?? env.GROQ_API_KEY,
   visionBaseUrl: env.VISION_BASE_URL ?? env.GROQ_BASE_URL,
   imageMaxBytes: env.IMAGE_MAX_BYTES,
+  // Saying the bot's name (username, display name, server nick, "asb") counts
+  // as addressing it. Kill switch for if casual name-drops get noisy.
+  wakeWord: env.WAKE_WORD !== "0",
 };
