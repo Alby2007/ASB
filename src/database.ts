@@ -65,7 +65,7 @@ type SettingsRow = { guild_id: string; memory_enabled: number; reply_enabled: nu
 type MemberRow = {
   guild_id: string; user_id: string; known_names: string[];
   first_seen_at: Date | string; last_seen_at: Date | string;
-  message_count: number; opted_out: number;
+  message_count: number; opted_out: number; opted_in: number;
 };
 
 type RelationshipRow = {
@@ -85,6 +85,7 @@ function rowToMember(r: MemberRow): Member {
     guildId: r.guild_id, userId: r.user_id, knownNames: r.known_names ?? [],
     firstSeenAt: ts(r.first_seen_at), lastSeenAt: ts(r.last_seen_at),
     messageCount: Number(r.message_count), optedOut: Number(r.opted_out) === 1,
+    optedIn: Number(r.opted_in ?? 0) === 1,
   };
 }
 
@@ -246,11 +247,25 @@ export class MemoryStore {
 
   async setMemberOptOut(guildId: string, userId: string, optedOut: boolean): Promise<void> {
     // Upsert: a member who has never posted has no row yet, and opt-out must
-    // still stick for when they do.
+    // still stick for when they do. Opting out also revokes opt-in — the
+    // opt-out flag always wins.
     await this.sql`
-      INSERT INTO members (guild_id, user_id, known_names, first_seen_at, last_seen_at, message_count, opted_out)
-      VALUES (${guildId}, ${userId}, '{}', NOW(), NOW(), 0, ${optedOut ? 1 : 0})
-      ON CONFLICT (guild_id, user_id) DO UPDATE SET opted_out = ${optedOut ? 1 : 0}
+      INSERT INTO members (guild_id, user_id, known_names, first_seen_at, last_seen_at, message_count, opted_out, opted_in)
+      VALUES (${guildId}, ${userId}, '{}', NOW(), NOW(), 0, ${optedOut ? 1 : 0}, 0)
+      ON CONFLICT (guild_id, user_id) DO UPDATE
+      SET opted_out = ${optedOut ? 1 : 0}, opted_in = CASE WHEN ${optedOut} THEN 0 ELSE members.opted_in END
+    `;
+  }
+
+  async setMemberOptIn(guildId: string, userId: string, optedIn: boolean): Promise<void> {
+    // Upsert like setMemberOptOut — a member can opt in before ever posting.
+    // Opting in never clears opted_out; derived data requires opted_in=1 AND
+    // opted_out=0, so an opted-out member stays protected even if both flags
+    // end up set.
+    await this.sql`
+      INSERT INTO members (guild_id, user_id, known_names, first_seen_at, last_seen_at, message_count, opted_in)
+      VALUES (${guildId}, ${userId}, '{}', NOW(), NOW(), 0, ${optedIn ? 1 : 0})
+      ON CONFLICT (guild_id, user_id) DO UPDATE SET opted_in = ${optedIn ? 1 : 0}
     `;
   }
 
@@ -405,7 +420,7 @@ export class MemoryStore {
   /** Candidate memories with promotable evidence types, joined to their first source message.
    * Carries the author's known names and the messages preceding the source so the
    * verifier can spot pasted/quoted text and jokes that only read literal in isolation. */
-  async listVerifiableCandidates(guildId: string, limit = 200): Promise<Array<{
+  async listVerifiableCandidates(guildId: string, limit = 200, subjectId?: string): Promise<Array<{
     memoryId: number; subjectId: string; kind: Memory["kind"]; content: string;
     evidenceType: string; selfReport: boolean; authorName: string; authorNames: string[];
     sourceMessage: string; contextBefore: Array<{ authorName: string; content: string }>;
@@ -430,6 +445,7 @@ export class MemoryStore {
       LEFT JOIN members mem ON mem.guild_id = m.guild_id AND mem.user_id = e.author_id
       WHERE m.guild_id = ${guildId} AND m.status = 'candidate'
         AND m.primary_evidence_type IN ('explicit_fact', 'clear_preference', 'correction')
+        ${subjectId ? this.sql`AND m.subject_id = ${subjectId}` : this.sql``}
       ORDER BY m.id
       LIMIT ${limit}
     `;
@@ -541,6 +557,15 @@ export class MemoryStore {
     claimsAboutA: string[];   // active memories about aId authored by bId
     claimsAboutB: string[];   // active memories about bId authored by aId
   }> {
+    // Subject-consent: pair context only renders when at least one side opted
+    // in — an edge between two non-consenting members can't be formed now, and
+    // a straggler from before consent enforcement stays hidden.
+    const consentRows = await this.sql<Array<{ user_id: string }>>`
+      SELECT user_id FROM members
+      WHERE guild_id = ${guildId} AND opted_in = 1 AND opted_out = 0
+        AND user_id IN (${aId}, ${bId})
+    `;
+    if (!consentRows.length) return { observations: [], claimsAboutA: [], claimsAboutB: [] };
     const edgeRows = await this.sql<RelationshipRow[]>`
       SELECT id, guild_id, subject_id, other_id, summary, valence, observation_count, last_observed_at, updated_at
       FROM relationships
@@ -753,6 +778,45 @@ export class MemoryStore {
   async hasEvidence(messageId: string): Promise<boolean> {
     const rows = await this.sql<[{ c: number }]>`SELECT COUNT(*)::int as c FROM memory_evidence WHERE message_id = ${messageId}`;
     return rows[0].c > 0;
+  }
+
+  /** The targeted corpus for one member's /profile-build scan: messages they
+   * authored, messages referencing them (mention markup or any known name),
+   * and messages replying to theirs — bounded to the retention window and
+   * capped, newest-first by the cap then chronological for extraction. */
+  async messagesAboutSubject(
+    guildId: string, userId: string, names: string[], since: Date, limit = 1000
+  ): Promise<Array<{ id: string; channelId: string; authorId: string; authorName: string; content: string; createdAt: string; replyToContent?: string }>> {
+    const escapeLike = (s: string) => s.replace(/[\\%_]/g, c => `\\${c}`);
+    const patterns = [
+      ...names.map(n => `%${escapeLike(n)}%`),
+      `%<@${userId}>%`, `%<@!${userId}>%`,
+    ];
+    const rows = await this.sql<Array<{
+      id: string; channel_id: string; author_id: string; author_name: string; content: string;
+      created_at: Date | string; ref_author_name: string | null; ref_content: string | null;
+    }>>`
+      SELECT m.id, m.channel_id, m.author_id, m.author_name, m.content, m.created_at,
+             ref.author_name AS ref_author_name, ref.content AS ref_content
+      FROM messages m
+      LEFT JOIN messages ref ON ref.id = m.reply_to_id AND ref.guild_id = m.guild_id
+      WHERE m.guild_id = ${guildId} AND m.created_at > ${since.toISOString()}
+        AND m.content <> ''
+        AND (m.triage_result IS NULL OR m.triage_result <> 'extracted')
+        AND (
+          m.author_id = ${userId}
+          OR m.content ILIKE ANY(${patterns})
+          OR m.reply_to_id IN (SELECT id FROM messages WHERE guild_id = ${guildId} AND author_id = ${userId})
+        )
+      ORDER BY m.created_at DESC LIMIT ${limit}
+    `;
+    // DESC+LIMIT keeps the newest window; flip back to chronological so the
+    // extraction pass (alias learning, reply context) reads them in order.
+    return rows.reverse().map(r => ({
+      id: r.id, channelId: r.channel_id, authorId: r.author_id, authorName: r.author_name,
+      content: r.content, createdAt: ts(r.created_at),
+      replyToContent: r.ref_author_name ? `${r.ref_author_name}: ${r.ref_content}` : undefined,
+    }));
   }
 
   /** Returns triage_result for each given message id. Missing rows and NULLs are absent from the map. */
@@ -1011,7 +1075,8 @@ export class MemoryStore {
     const rows = await this.sql<MemoryRow[]>`
       SELECT * FROM memories WHERE guild_id = ${guildId}
         AND (status = 'active' OR (status = 'candidate' AND primary_evidence_type IN ('explicit_fact', 'clear_preference', 'correction')))
-        AND (subject_id = ${subjectId} OR subject_id = 'server')
+        AND (subject_id = 'server' OR (subject_id = ${subjectId}
+          AND subject_id IN (SELECT user_id FROM members WHERE guild_id = ${guildId} AND opted_in = 1 AND opted_out = 0)))
       ORDER BY importance * confidence DESC, last_confirmed_at DESC LIMIT ${limit}
     `;
     return rows.map(rowToMemory);
@@ -1392,9 +1457,12 @@ export class MemoryStore {
    * ['server_lore'] so person facts/preferences can never slip through a
    * post-fetch filter bug into an unprompted public answer. */
   async searchMemories(guildId: string, query: string, limit = 5, kinds?: string[]): Promise<Array<{ subjectId: string; content: string; confidence: number }>> {
+    // Person-scoped rows surface only for opted-in subjects — server lore and
+    // episodes attached to 'server' are consent-exempt shared context.
     const rows = await this.sql<Array<{ subject_id: string; content: string; confidence: number }>>`
       SELECT subject_id, content, confidence FROM memories
       WHERE guild_id = ${guildId} AND status = 'active' AND content ILIKE ${`%${query}%`}
+      AND (subject_id = 'server' OR subject_id IN (SELECT user_id FROM members WHERE guild_id = ${guildId} AND opted_in = 1 AND opted_out = 0))
       ${kinds?.length ? this.sql`AND kind = ANY(${kinds})` : this.sql``}
       ORDER BY importance * confidence DESC LIMIT ${limit}
     `;

@@ -244,7 +244,8 @@ Member registry — one row per (guild, user). Built by `recordMessage()` so bot
 | `first_seen_at` | TEXT | ISO-8601 |
 | `last_seen_at` | TEXT | ISO-8601 |
 | `message_count` | INTEGER | Total recorded messages |
-| `opted_out` | INTEGER | 1 = excluded from profile building and new memory/relationship extraction; `/opt-out` also forgets existing memories, hard-deletes relationship observations/edges, and deletes the profile |
+| `opted_out` | INTEGER | 1 = hard revoke: `/opt-out` forgets existing memories, hard-deletes relationship observations/edges, deletes the profile, and clears `opted_in` — opt-out always wins |
+| `opted_in` | INTEGER | 1 = consent for derived data (person memories, relationship observations, attributes, profiles, dossiers). Effective consent = `opted_in=1 AND opted_out=0`. Set by `/opt-in` and `/profile-build` |
 
 ---
 
@@ -358,3 +359,5 @@ Version tracking for the migration system.
 | 10 | `v06_unresolved_names` | `unresolved_names` table — names that failed entity resolution |
 | 11 | `v11_memory_trigram_dedup` | `pg_trgm` extension + `memories_content_trgm` GIN index for near-duplicate memory matching |
 | 12 | `v12_profile_attributes` | `profile_attributes` table + `profiles.attr_hash` — structured provenance-backed facets become the profile source of truth; create-only, no backfill |
+| 13 | `v13_proactive_enabled` | `proactive_enabled` on `server_settings` — per-server opt-in for proactive speaking, default off |
+| 14 | `v14_member_opted_in` | `opted_in` on `members` — derived data becomes consent-gated: person memories, relationships, attributes, profiles form only for `opted_in=1 AND opted_out=0` |

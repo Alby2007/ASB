@@ -45,6 +45,13 @@ export async function buildPairContext(store: MemoryStore, eventStore: EventStor
 
 export const LOOKUP_TOOL_NAMES = new Set(["lookup_person", "lookup_relationship", "search_memories", "lookup_event"]);
 
+/** Derived-data consent: opted in and not opted out. Non-members (including
+ * "unknown" subjects) are not consented — their rows are inert anyway. */
+async function hasConsent(ctx: ToolCtx, userId: string): Promise<boolean> {
+  const m = await ctx.store.getMember(ctx.guildId, userId);
+  return !!m?.optedIn && !m.optedOut;
+}
+
 /** Execute one lookup tool against ctx. Always resolves to a string. */
 export async function executeLookupTool(name: string, args: Record<string, unknown>, ctx: ToolCtx): Promise<string> {
   try {
@@ -53,6 +60,7 @@ export async function executeLookupTool(name: string, args: Record<string, unkno
       if (!person) return "error: missing name";
       const id = ctx.resolveName(person);
       if (!id) return `no member known as "${person}"`;
+      if (!(await hasConsent(ctx, id))) return `"${person}" hasn't opted in to profiles`;
       const [profile, attrs] = await Promise.all([
         ctx.profileStore.getProfile(ctx.guildId, id),
         ctx.store.attributesFor(ctx.guildId, id),
@@ -81,6 +89,7 @@ export async function executeLookupTool(name: string, args: Record<string, unkno
       if (subject) {
         const id = ctx.resolveName(subject);
         if (!id) return `no member known as "${subject}"`;
+        if (!(await hasConsent(ctx, id))) return `"${subject}" hasn't opted in to profiles`;
         const { memories } = await ctx.store.listMemories(ctx.guildId, id, { search: query });
         if (!memories.length) return `no memories matching "${query}" for "${subject}"`;
         const label = await ctx.store.displayNameFor(ctx.guildId, id);

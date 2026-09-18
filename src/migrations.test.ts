@@ -257,3 +257,17 @@ test("migration v12 creates profile_attributes + profiles.attr_hash, rolls back 
     assert.equal(remaining.length, 0, "attr_hash should be dropped on rollback");
   } finally { await sql.end(); }
 });
+
+test("migration v14 adds members.opted_in, rolls back cleanly", async () => {
+  const sql = makeTestSql();
+  try {
+    await resetSchema(sql);
+    await runMigrations(sql as any);
+    const cols = await sql<Array<{ column_name: string }>>`SELECT column_name FROM information_schema.columns WHERE table_name='members'`;
+    assert.ok(cols.some(c => c.column_name === "opted_in"), "members.opted_in missing");
+
+    await runMigrations(sql as any, 13);
+    const remaining = await sql<Array<{ column_name: string }>>`SELECT column_name FROM information_schema.columns WHERE table_name='members' AND column_name='opted_in'`;
+    assert.equal(remaining.length, 0, "opted_in should be dropped on rollback");
+  } finally { await sql.end(); }
+});

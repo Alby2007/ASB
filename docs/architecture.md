@@ -9,13 +9,16 @@ ASB (Artificial Server Member) is a single TypeScript/Node process that connects
 | File | Class / exports | Role |
 |------|----------------|------|
 | `src/index.ts` | — | Discord client, live message loop, daily maintenance scheduler |
-| `src/ingest.ts` | — | Standalone script: bulk-ingest historical channel messages |
+| `src/ingest.ts` | — | CLI wrapper: connects to Discord and calls `runServerIngest` for the configured channel |
+| `src/server-ingest.ts` | `runServerIngest` | The server-level historical build (archive → triage → extract → events → verify → profiles) shared by `npm run ingest` and `/server-build` |
+| `src/profile-build.ts` | `runProfileBuild`, `PROFILE_BUILD_COOLDOWN_MS` | Self-service opt-in scan (/profile-build): targeted corpus → extraction → verification → scoped profile build |
+| `src/persist-extraction.ts` | `persistExtraction` | The single consent-gated write path for extraction results — person memories need an opted-in subject; relationships need one opted-in party |
 | `src/brain.ts` | `Brain` | All LLM calls: extract memories, correct, assess continuity, classify events, reply |
 | `src/config.ts` | `config` | Env-variable validation (zod); single exported config object |
 | `src/types.ts` | `MessageEvent`, `MemoryCandidate`, `StoredEvent`, `Decision`, … | Shared TypeScript types shared across modules |
 | `src/database.ts` | `MemoryStore` | Postgres persistence: memory CRUD, lifecycle, conflict resolution, episode consolidation |
 | `src/events.ts` | `EventStore` | Postgres persistence: event CRUD, participants, message/memory attachments |
-| `src/migrations.ts` | `runMigrations`, `getMigrationVersion` | Versioned schema migrations (v1–v12, `LATEST_MIGRATION_VERSION`) with rollback support |
+| `src/migrations.ts` | `runMigrations`, `getMigrationVersion` | Versioned schema migrations (v1–v14, `LATEST_MIGRATION_VERSION`) with rollback support |
 | `src/confidence.ts` | `calculateInitialConfidence`, `updateConfidence`, `calculateDefaultImportance`, `calculateDefaultExplicitness` | Deterministic numeric formulas; no LLM involvement |
 | `src/perception.ts` | `shouldInspectForMemory`, `detectNamingRequest`, `detectSelfNaming`, `detectWakeWord`, `detectDismissal`, `contestCue`, `botMemoryCue`, `toolCues` | Cheap pre-filter: prevents LLM calls for ordinary chat; detects naming requests, self-naming, wake words, and dismissal cues |
 | `src/event-detection.ts` | `EventPipeline` | Heuristic + LLM continuity decisions; nightly maintenance |
@@ -56,10 +59,15 @@ Discord MessageCreate
   entity-resolution.ts: resolveSubject()                           │
   • subjectName → real user ID via the members alias map           │
   • ambiguous names → "unknown" (correctness over recall)          │
-  • relationship assertions → relationship_observations            │
-    → verdict column (v8) records sincerity; recomputeEdges()      │
-    rebuilds relationships edges from 'literal' verdicts only —    │
-    unverified/joke assertions never surface as edges              │
+        │                                                           │
+        ▼                                                           │
+  persist-extraction.ts: consent gate (shared by live/sweep/       │
+    ingest/profile-build — see "Consent model")                    │
+  • person memories persist only for opted-in subjects             │
+  • relationship observations persist when ≥1 party opted in       │
+    → relationship_observations, verdict column (v8) records       │
+    sincerity; recomputeEdges() rebuilds edges from 'literal'      │
+    verdicts only — unverified/joke assertions never surface       │
         │                                                           │
         ▼                                                           │
   database.ts: saveMemory()                                         │
@@ -187,21 +195,35 @@ proactive message marks it engaged — it never feeds the ignored streak.
 
 ---
 
-## Data flow — bulk ingest (`npm run ingest`)
+## Consent model
 
-`ingest.ts` connects to Discord, fetches the full channel history, sorts messages chronologically (Discord API returns newest-first), and feeds each message through the same `saveMemory` → `EventPipeline.process` path as the live bot. It rate-limits LLM calls to stay under Groq's token limit and skips messages that already have evidence rows (safe to re-run). After processing it calls `EventPipeline.maintainEvents()` to close open windows and score candidates, then `ProfileStore.buildProfiles()` to rebuild per-chatter profile cards.
+Derived data about a person — `person_*` memories, relationship observations, attributes, profiles, dossiers — is **opt-in**. Effective consent is `members.opted_in=1 AND members.opted_out=0`; `/opt-out` clears `opted_in` and always wins. Server lore (`subject_id='server'`), events, the member registry (names/counts — infrastructure, not profile data), and the raw message archive (retention-bounded) are consent-exempt.
+
+- **Write path** — `persist-extraction.ts` is the single gate, shared by the live path, the nightly sweep, `runServerIngest`, and `runProfileBuild`. Person memories persist only for consenting subjects (`unknown`/`server` exempt — unknowns are inert until resolved). Relationship observations use **subject-consent**: they persist when at least one real party opted in.
+- **Read path** — `relevantMemories`, `searchMemories`, `pairwiseContext`, `getProfile(s)`, `buildProfiles`, `lookup_person`, and subject-scoped `search_memories` all filter or refuse non-consenting subjects, so a straggler row from before the purge stays invisible everywhere.
+- **Self-service** — `/profile-build` (24h cooldown) opts the caller in, scans their archive corpus (`messagesAboutSubject`: authored + name-references + replies-to-them), verifies their candidates, recomputes edges, and runs a scoped `buildProfiles`. `/opt-in` consents without the scan.
+- **Purge** — `scripts/purge-nonopted.mjs` (`PURGE_CONFIRM=1`) hard-deletes the pre-consent derived corpus for all non-consenting subjects; `buildProfiles` also deletes straggler profiles on sight.
+- **The bot opts itself in** (per guild, at maintenance) so the room's claims about it remain memorable — the reply persona frames them as community claims, not self-truth.
+
+---
+
+## Data flow — bulk ingest (`npm run ingest` / `/server-build`)
+
+`runServerIngest` (in `server-ingest.ts`) is the server-level historical build, invoked from the `ingest.ts` CLI wrapper or the owner/admin `/server-build` command. It fetches the full channel history, sorts messages chronologically (Discord API returns newest-first), and feeds each message through the same consent-gated extraction → `EventPipeline.process` path as the live bot — archiving and lore/events for everyone, derived person data only for opted-in members. It rate-limits LLM calls to stay under Groq's token limit and skips messages that already have evidence rows (safe to re-run). After processing it calls `EventPipeline.maintainEvents()` to close open windows and score candidates, then `ProfileStore.buildProfiles()` to rebuild profile cards for the opted-in set.
+
+`/profile-build` runs the complementary **per-user** build (`profile-build.ts`): a targeted archive scan for one consenting member.
 
 ---
 
 ## Profiles
 
-`ProfileStore.buildProfiles()` runs during daily maintenance and at the end of ingest. Profiles have three tiers, built in order:
+`ProfileStore.buildProfiles()` runs during daily maintenance, at the end of ingest, and scoped to one member via `/profile-build`. Eligibility requires consent (`opted_in=1 AND opted_out=0`) — non-consenting members are skipped and any straggler profile is deleted on sight. Profiles have three tiers, built in order:
 
 1. **Attributes (source of truth)** — `src/attributes.ts` owns the structured facet set (`profile_attributes` table: eight fields — singular `pronouns`/`timezone`/`location`/`occupation`/`birthday`, multi-valued `trait`/`interest`/`skill`). Deterministic regexes over `person_fact`/`person_preference` memory content run every pass (pure, idempotent — doubles as the lazy backfill for memories that predate the feature). `Brain.extractAttributes()` then proposes fuzzy facets (`trait`/`interest`/`skill`) gated on `source_hash`, a fingerprint of *semantic* inputs only — memories, candidates, patterns, edges, events — so raw activity churn costs zero LLM. Proposals must cite input memory ids with at least one confirmed citation (uncited and candidate-only proposals are dropped); the current attribute vocabulary is passed in so the model reuses labels verbatim or emits an explicit `replaces`. `applyProposals()` upsert-diffs each proposal: exact match on `(field, value_norm)` revives or no-ops → polarity-gated trigram fold at ≥0.6 (0.4–0.6 logs `attr_near_miss`) → insert. Singular fields supersede sibling live rows via `superseded_by`; status is otherwise derived from cited-memory statuses. Memory lifecycle mutations cascade immediately — `forget` strips citations, `supersede`/`mergeDuplicate` transfer them — so a forgotten fact never lingers as a rendered facet.
 2. **Card (prose)** — `Brain.synthesizeProfile()` renders `bio` + `role_in_server` from the *post-diff* active attribute set plus stats/patterns/edges/events, gated on `attr_hash` (attribute rows + that same context). Unchanged render inputs → no re-render; facets assemble deterministically (`traits`/`interests` from active rows, `notableRelationships` from verified edges).
 3. **Dossier** — unchanged: independently-hashed narrative sections (below).
 
-Only `active` attributes render; `contested` surfaces in `/memory-triage`. `/profile` shows each facet's memory citations, `/memory-export` includes the attribute rows, and opted-out members have their profile *and* attribute rows deleted. Profiles surface via `/profile` (self or admin) and are injected into `brain.reply()` for the author, @-mentioned users, and members referenced by name — where each person carries their active attributes with confidence buckets (`formatReplyProfile`), so weak facets render hedged rather than as flat assertions.
+Only `active` attributes render; `contested` surfaces in `/memory-triage`. `/profile` shows each facet's memory citations, `/memory-export` includes the attribute rows, and members without consent (`opted_in=0` or `opted_out=1`) have their profile *and* attribute rows deleted on the next pass. Profiles surface via `/profile` (self or admin) and are injected into `brain.reply()` for the author, @-mentioned users, and members referenced by name — where each person carries their active attributes with confidence buckets (`formatReplyProfile`), so weak facets render hedged rather than as flat assertions.
 
 Members with ≥3 active memories or ≥50 messages additionally get a **dossier** — a set of independently-built sections stored under `facets_json.dossier.sections`, each rebuilt only when its own input hash changes:
 

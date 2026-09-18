@@ -12,7 +12,8 @@ import { runContestCheck } from "./contest.js";
 import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
 import { ProfileStore } from "./profiles.js";
-import { buildAliasMap, demangleMentions, findMentionedUsers, resolveSubject, scrubMentions, type AliasMap } from "./entity-resolution.js";
+import { buildAliasMap, demangleMentions, findMentionedUsers, scrubMentions, type AliasMap } from "./entity-resolution.js";
+import { persistExtraction } from "./persist-extraction.js";
 import { buildPairContext, type ToolCtx } from "./lookup-tools.js";
 import { qualifyingImages, formatImageContext, IMAGE_MAX_PER_MESSAGE, type AttachmentMeta } from "./vision.js";
 import { withRetry } from "./retry.js";
@@ -88,6 +89,9 @@ async function applyRetention() {
     // blip here must skip the guild, not reject the whole interval callback.
     try {
       const settings = await store.settings(guild.id, config.rawMessageRetentionDays);
+      // The bot opts itself in — memories the room forms about it are part of
+      // its persona surface (framed as community claims, not self-truth).
+      await store.setMemberOptIn(guild.id, client.user!.id, true);
       const deleted = await store.deleteRawMessagesOlderThan(guild.id, settings.rawRetentionDays);
       await store.maintain(guild.id, config.candidateConfidenceThreshold);
       if (deleted) console.log(`Retention deleted ${deleted} raw messages in ${guild.name}`);
@@ -257,7 +261,10 @@ async function sweepMissedSignals(windowMs: number) {
       await store.setTriageResults(marks);
       if (!queue.length) continue;
       const members = await store.listMembers(guild.id);
-      const optedOut = new Set(members.filter(m => m.optedOut).map(m => m.userId));
+      // Opt-in consent: derived data persists only for members who asked for it.
+      const optedIn = new Set(members.filter(m => m.optedIn && !m.optedOut).map(m => m.userId));
+      if (client.user) optedIn.add(client.user.id); // the bot is a willing subject
+      const isConsented = (id: string) => id === "unknown" || id === "server" || optedIn.has(id);
       const memberNames = new Map(members.map(m => [m.userId, m.knownNames]));
       const aliases = await buildAliasMap(guild.id, store);
       for (let i = 0; i < queue.length; i += SWEEP_EXTRACT_BATCH) {
@@ -286,23 +293,7 @@ async function sweepMissedSignals(windowMs: number) {
           const results = await withRetry(() => brain.extractMemoriesBatch(batch, config.ingestModel ?? config.model), 3);
           for (const item of batch) {
             const result = results.get(item.event.messageId) ?? { memories: [], relationships: [] };
-            for (const memory of result.memories) {
-              memory.subjectId = resolveSubject(memory, aliases, item.event);
-              if (optedOut.has(memory.subjectId)) continue;
-              if (memory.subjectId === "unknown" && memory.subjectName) {
-                await store.logUnresolvedName(guild.id, memory.subjectName, item.event.messageId);
-              }
-              await store.saveMemory(item.event, memory, config.candidateConfidenceThreshold);
-            }
-            for (const rel of result.relationships) {
-              const subjectId = rel.subjectName ? resolveSubject({ subjectName: rel.subjectName }, aliases, item.event) : item.event.authorId;
-              const otherId = resolveSubject({ subjectName: rel.otherName }, aliases, item.event);
-              if (optedOut.has(subjectId) || optedOut.has(otherId)) continue;
-              if (subjectId === "unknown" && rel.subjectName) await store.logUnresolvedName(guild.id, rel.subjectName, item.event.messageId);
-              if (otherId === "unknown" && rel.otherName) await store.logUnresolvedName(guild.id, rel.otherName, item.event.messageId);
-              if (subjectId === "unknown" || otherId === "unknown") continue;
-              await store.recordRelationship(guild.id, subjectId, otherId, item.event.messageId, rel.nature, rel.valence, rel.reason ?? "");
-            }
+            await persistExtraction(result, item.event, { store, aliases, isConsented });
           }
           // Terminal mark: the batch returned and every item was processed, so
           // these messages never qualify for re-extraction — even the ones that
@@ -536,39 +527,26 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
         : undefined;
       const { memories: candidates, relationships } = await withRetry(() => brain.extractMemories(event, replyToContent, note, imageContext), 3);
       const aliases = (candidates.length || relationships.length) ? await getAliasMap() : new Map<string, string>();
-      // Opted-out members accrue no new derived data: memories or relationship
-      // observations about them are skipped (raw archive is unaffected — that's
-      // covered by message retention, not opt-out).
-      const optOutCache = new Map<string, boolean>();
-      const isOptedOut = async (userId: string) => {
-        if (userId === "unknown" || userId === "server") return false;
-        const cached = optOutCache.get(userId);
+      // Derived data is opt-in: person memories and relationship observations
+      // persist only for consenting members (raw archive is unaffected — that's
+      // covered by message retention, not consent). The bot itself is treated
+      // as consented so the room's claims about it stay memorable.
+      const consentCache = new Map<string, boolean>();
+      const isConsented = async (userId: string) => {
+        if (userId === "unknown" || userId === "server" || userId === client.user!.id) return true;
+        const cached = consentCache.get(userId);
         if (cached !== undefined) return cached;
-        const opted = (await store.getMember(event.guildId, userId))?.optedOut ?? false;
-        optOutCache.set(userId, opted);
-        return opted;
+        const m = await store.getMember(event.guildId, userId);
+        const ok = !!m?.optedIn && !m.optedOut;
+        consentCache.set(userId, ok);
+        return ok;
       };
-      for (const memory of candidates) {
-        memory.subjectId = resolveSubject(memory, aliases, event);
-        if (await isOptedOut(memory.subjectId)) continue;
-        if (memory.subjectId === "unknown" && memory.subjectName) {
-          await store.logUnresolvedName(event.guildId, memory.subjectName, event.messageId);
-        }
-        const saved = await store.saveMemory(event, memory, config.candidateConfidenceThreshold);
-        savedMemoryIds.push(saved.id);
-        inc("memory.saved");
-      }
-      for (const rel of relationships) {
-        const subjectId = rel.subjectName ? resolveSubject({ subjectName: rel.subjectName }, aliases, event) : event.authorId;
-        const otherId = resolveSubject({ subjectName: rel.otherName }, aliases, event);
-        if (await isOptedOut(subjectId) || await isOptedOut(otherId)) continue;
-        if (subjectId === "unknown" && rel.subjectName) await store.logUnresolvedName(event.guildId, rel.subjectName, event.messageId);
-        if (otherId === "unknown" && rel.otherName) await store.logUnresolvedName(event.guildId, rel.otherName, event.messageId);
-        // Edges to "unknown" would smear whoever later claims that slot — the
-        // name is already logged for resolution, so just don't record the edge.
-        if (subjectId === "unknown" || otherId === "unknown") continue;
-        await store.recordRelationship(event.guildId, subjectId, otherId, event.messageId, rel.nature, rel.valence, rel.reason ?? "");
-      }
+      const { savedIds } = await persistExtraction(
+        { memories: candidates, relationships },
+        event,
+        { store, aliases, isConsented, onMemorySaved: () => inc("memory.saved") }
+      );
+      savedMemoryIds.push(...savedIds);
       // Terminal mark: extraction ran to completion, even if it yielded
       // nothing — without this a zero-yield regex message gets one redundant
       // sweep pass before ingest-side marking would catch it.

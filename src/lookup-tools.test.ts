@@ -44,6 +44,7 @@ test("lookup_person renders profile + active attributes only", async () => {
       getProfile: async () => ({ displayName: "Alice", summary: "Regular.", facets: {} }),
     } as unknown as ProfileStore,
     store: {
+      getMember: async () => ({ optedIn: true, optedOut: false }),
       attributesFor: async () => [
         { field: "location", value: "Leeds", confidence: 0.9, status: "active" },
         { field: "interest", value: "stale thing", confidence: 0.9, status: "contested" },
@@ -60,9 +61,20 @@ test("lookup_person: member with neither profile nor attributes", async () => {
   const ctx = stubCtx({
     resolveName: () => "u1",
     profileStore: { getProfile: async () => undefined } as unknown as ProfileStore,
-    store: { attributesFor: async () => [], displayNameFor: async () => "Alice" } as unknown as MemoryStore,
+    store: {
+      getMember: async () => ({ optedIn: true, optedOut: false }),
+      attributesFor: async () => [], displayNameFor: async () => "Alice",
+    } as unknown as MemoryStore,
   });
   assert.match(await executeLookupTool("lookup_person", { name: "alice" }, ctx), /no profile or attributes/);
+});
+
+test("lookup_person refuses members who never opted in", async () => {
+  const ctx = stubCtx({
+    resolveName: () => "u1",
+    store: { getMember: async () => ({ optedIn: false, optedOut: false }) } as unknown as MemoryStore,
+  });
+  assert.match(await executeLookupTool("lookup_person", { name: "alice" }, ctx), /hasn't opted in/);
 });
 
 test("lookup_relationship renders the shared pair context", async () => {
@@ -101,6 +113,7 @@ test("search_memories: guild-wide and subject-scoped paths", async () => {
   const ctx = stubCtx({
     resolveName: n => (n === "alice" ? "u1" : undefined),
     store: {
+      getMember: async () => ({ optedIn: true, optedOut: false }),
       searchMemories: async () => [
         { subjectId: "u1", content: "Lives in Leeds", confidence: 0.9 },
         { subjectId: "u2", content: "Moved near Leeds", confidence: 0.6 },
@@ -155,6 +168,7 @@ test("searchMemories is guild-wide, active-only, importance-ordered", async () =
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
+    for (const id of ["u1", "u2", "u3"]) await store.setMemberOptIn("g1", id, true);
     const a = await store.saveMemory(msg("x", { authorId: "u1" }), { subjectId: "u1", kind: "person_fact", content: "Lives in Leeds", reason: "t", evidenceType: "explicit_fact", effect: "support" });
     const b = await store.saveMemory(msg("y", { authorId: "u2" }), { subjectId: "u2", kind: "person_fact", content: "Visits Leeds markets", reason: "t", evidenceType: "explicit_fact", effect: "support" });
     const c = await store.saveMemory(msg("z", { authorId: "u3" }), { subjectId: "u3", kind: "person_fact", content: "Leeds is rainy", reason: "t", evidenceType: "explicit_fact", effect: "support" });
@@ -167,10 +181,24 @@ test("searchMemories is guild-wide, active-only, importance-ordered", async () =
   } finally { await sql.end(); }
 });
 
+test("searchMemories hides active memories for non-consenting subjects", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    // A straggler row — saved and confirmed before consent was revoked/never given.
+    const m = await store.saveMemory(msg("x", { authorId: "u1" }), { subjectId: "u1", kind: "person_fact", content: "Lives in Leeds", reason: "t", evidenceType: "explicit_fact", effect: "support" });
+    await store.confirm("g1", m.id);
+    assert.equal((await store.searchMemories("g1", "leeds")).length, 0);
+    await store.setMemberOptIn("g1", "u1", true);
+    assert.equal((await store.searchMemories("g1", "leeds")).length, 1);
+  } finally { await sql.end(); }
+});
+
 test("searchMemories kinds filter excludes person facts at the query level", async () => {
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
+    await store.setMemberOptIn("g1", "u2", true);
     const lore = await store.saveMemory(msg("x", { authorId: "u1" }), { subjectId: "server", kind: "server_lore", content: "The Leeds meetup is on Thursday", reason: "t", evidenceType: "explicit_fact", effect: "support" });
     const person = await store.saveMemory(msg("y", { authorId: "u2" }), { subjectId: "u2", kind: "person_fact", content: "Bob's timezone is Leeds GMT+1", reason: "t", evidenceType: "explicit_fact", effect: "support" });
     const pref = await store.saveMemory(msg("z", { authorId: "u2" }), { subjectId: "u2", kind: "person_preference", content: "Bob prefers Leeds pubs", reason: "t", evidenceType: "clear_preference", effect: "support" });
@@ -211,6 +239,8 @@ test("buildPairContext shares the reply-prompt assembly for tools", async () => 
     const { store, eventStore } = await makeStore(sql);
     await store.recordMessage(msg("hi", { authorId: "u1", authorName: "Alice" }));
     await store.recordMessage(msg("hi", { authorId: "u2", authorName: "Bob" }));
+    await store.setMemberOptIn("g1", "u1", true);
+    await store.setMemberOptIn("g1", "u2", true);
     await store.recordRelationship("g1", "u1", "u2", "m1", "antagonizes", -0.5, "mocked them");
     await sql`UPDATE relationship_observations SET verdict = 'literal' WHERE guild_id = 'g1'`;
     await store.recomputeEdges("g1");

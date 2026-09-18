@@ -33,6 +33,7 @@ function stubCommand(opts: {
       getInteger: (name: string, _required?: boolean) => opts.options?.[name] ?? null,
       getString: (name: string, _required?: boolean) => opts.options?.[name] ?? null,
       getUser: (name: string) => opts.options?.[name] ?? null,
+      getChannel: (name: string) => opts.options?.[name] ?? null,
     },
     reply: async (r: (typeof replies)[number]) => { replies.push(r); return r; },
     editReply: async (r: string) => { replies.push({ content: r }); return r; },
@@ -91,6 +92,7 @@ test("/memory about: an admin can view another member's memories", async () => {
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
+    await store.setMemberOptIn("g1", "u-other", true); // derived data requires consent
     const { interaction, replies } = stubCommand({
       commandName: "memory", userId: "u-admin", admin: true,
       options: { about: { id: "u-other", username: "Other" } },
@@ -283,9 +285,46 @@ test("/opt-out forgets memories and deletes the profile; /opt-in re-enables", as
 
     const back = stubCommand({ commandName: "opt-in", userId: "u-user" });
     await handleMemoryCommand(back.interaction, store, brain);
-    assert.equal((await store.getMember("g1", "u-user"))?.optedOut, false);
+    const member = await store.getMember("g1", "u-user");
+    assert.equal(member?.optedOut, false);
+    assert.equal(member?.optedIn, true); // /opt-in now grants derived-data consent
     // Forgotten stays forgotten — opt-in doesn't resurrect.
     assert.equal((await store.getMemory("g1", mem.id))?.status, "forgotten");
+  } finally { await sql.end(); }
+});
+
+test("/memory for a member who never opted in points at /profile-build", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const { interaction, replies } = stubCommand({ commandName: "memory", userId: "u-user" });
+    await handleMemoryCommand(interaction, store, brain);
+    assert.match(replies[0].content ?? "", /profile-build/i);
+  } finally { await sql.end(); }
+});
+
+test("/profile-build opts the member in and reports the scan", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const { interaction, replies } = stubCommand({ commandName: "profile-build", userId: "u-user" });
+    await handleMemoryCommand(interaction, store, brain, undefined, new ProfileStore(sql));
+    assert.equal((await store.getMember("g1", "u-user"))?.optedIn, true);
+    assert.match(replies.at(-1)?.content ?? "", /scanned 0 messages/i);
+  } finally { await sql.end(); }
+});
+
+test("/server-build refuses non-admins and wants a channel from admins", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    const denied = stubCommand({ commandName: "server-build", userId: "u-stranger" });
+    await handleMemoryCommand(denied.interaction, store, brain);
+    assert.match(denied.replies[0].content ?? "", /administrator/i);
+
+    const admin = stubCommand({ commandName: "server-build", userId: "u-admin", admin: true });
+    await handleMemoryCommand(admin.interaction, store, brain);
+    assert.match(admin.replies[0].content ?? "", /pick a text channel/i);
   } finally { await sql.end(); }
 });
 

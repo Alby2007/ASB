@@ -55,11 +55,12 @@ Tests live alongside source files as `*.test.ts`. Run them all with `npm test`.
 | `event.test.ts` | Heuristic scoring signals (reply chain, participant overlap, keyword overlap, recency, back-reference); `calculateSignificance` tier assignment; retroactive promotion threshold |
 | `brain.test.ts` | `decide()` scoring: direct mention overrides recency penalty; recency penalty applies to non-mention messages; unmentioned chatter stays below threshold. Extraction/contest/verification prompt parsing via an injected `LlmClient` stub |
 | `attributes.test.ts` | `normalizeValue`/`attributeHash` canonicalisation; `deriveAttributeStatus` precedence (contested > active > candidate > quarantined); `applyProposals` upsert-diff: exact revive, trgm fold, singular supersession, provenance cascades |
-| `commands.test.ts` | Slash-command authorization matrix: non-admin vs admin cross-member views, opt-out/forget ownership, confirm-button userId binding, admin-gated commands |
+| `commands.test.ts` | Slash-command authorization matrix: non-admin vs admin cross-member views, opt-out/forget ownership, confirm-button userId binding, admin-gated commands, opt-in consent flag, `/profile-build` + `/server-build` |
 | `dedup.test.ts` | Trigram near-duplicate merge: same-claim phrasing reinforces instead of duplicating; distinct content stays separate; episodes never fuzzy-merge |
 | `entity-resolution.test.ts` | `resolveSubject` mention/name/self-resolution; `buildAliasMap` from `known_names`; `findMentionedUsers` matching rules |
 | `perception.test.ts` | Durable-signal pre-filter patterns; bot-addressed bypass; `detectNamingRequest`/`detectSelfNaming` extraction and stopword rejection |
-| `profiles.test.ts` | `recordMessage` member upsert/dedup/`reply_to_id`; `buildProfiles` eligibility gates, attribute pipeline, dossier build |
+| `profiles.test.ts` | `recordMessage` member upsert/dedup/`reply_to_id`; `buildProfiles` consent + eligibility gates, attribute pipeline, dossier build |
+| `persist-extraction.test.ts` | Consent-gated extraction writes: person memories only for opted-in subjects, server lore exempt, relationship subject-consent, opt-out beats opt-in |
 | `tools.test.ts` | `isSafeUrl` SSRF guards; `stripHtml`/`parseDdgLite` parsing; `executeTool` error strings never throw |
 
 ### Adding a test

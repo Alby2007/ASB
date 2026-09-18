@@ -1,8 +1,11 @@
-import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonInteraction, ButtonStyle, ChatInputCommandInteraction, EmbedBuilder, PermissionFlagsBits } from "discord.js";
+import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonInteraction, ButtonStyle, ChannelType, ChatInputCommandInteraction, EmbedBuilder, PermissionFlagsBits, type TextChannel } from "discord.js";
 import type { Brain } from "./brain.js";
 import type { Memory, MemoryStore } from "./database.js";
-import type { EventStore } from "./events.js";
+import { EventStore } from "./events.js";
+import { EventPipeline } from "./event-detection.js";
 import { ProfileStore } from "./profiles.js";
+import { runProfileBuild, PROFILE_BUILD_COOLDOWN_MS } from "./profile-build.js";
+import { runServerIngest } from "./server-ingest.js";
 import { metricsSnapshot } from "./metrics.js";
 import type { MessageEvent } from "./types.js";
 import { config } from "./config.js";
@@ -35,13 +38,22 @@ export const commandDefinitions = [
     { name: "user", description: "Member to inspect (admins can view anyone)", type: 6, required: false }
   ] },
   { name: "opt-out", description: "Stop the bot forming memories or a profile about you, and forget what it already holds" },
-  { name: "opt-in", description: "Re-enable memory and profile building about you" }
+  { name: "opt-in", description: "Consent to memories and a profile about you — then run /profile-build to scan your history" },
+  { name: "profile-build", description: "Opt in and build your profile: scans the archive for your messages and references to you" },
+  { name: "server-build", description: "Admin: run the server-level historical build on a channel", default_member_permissions: PermissionFlagsBits.ManageGuild.toString(), options: [
+    { name: "channel", description: "Text channel to build from (defaults to the configured ingest channel)", type: 7, required: false }
+  ] }
 ];
 
 const confidence = (value: number | undefined) => {
   if (value === undefined) return "Unknown";
   return value >= .8 ? "High" : value >= .55 ? "Medium" : "Low";
 };
+const OPT_IN_HINT_SELF = "You haven't opted in yet — run /profile-build to consent and build your profile.";
+const OPT_IN_HINT_OTHER = "That member hasn't opted in to profiles.";
+/** One server build at a time — the routine is heavy and its archive marks are
+ * not re-entrant across overlapping runs. */
+let serverBuildRunning = false;
 const display = (memory: Memory) => `**#${memory.id} · ${confidence(memory.confidence)} confidence**\n${memory.content}\n*${memory.mentions} confirmation${memory.mentions === 1 ? "" : "s"}; last confirmed ${new Date(memory.lastConfirmedAt).toLocaleDateString()}*`;
 
 export async function handleMemoryCommand(interaction: ChatInputCommandInteraction, store: MemoryStore, brain: Brain, evStore?: EventStore, profileStore: ProfileStore = new ProfileStore()) {
@@ -66,6 +78,14 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     const member = interaction.options.getUser("about");
     if (member && member.id !== interaction.user.id && !interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return interaction.reply({ content: "You can only view your own memories.", ephemeral: true });
     const subjectId = server ? "server" : (member?.id ?? interaction.user.id);
+    // Derived data is opt-in — nothing exists (or should surface) for a member
+    // who never consented.
+    if (!server) {
+      const subjectMember = await store.getMember(guildId, subjectId);
+      if (!subjectMember?.optedIn || subjectMember.optedOut) {
+        return interaction.reply({ content: subjectId === interaction.user.id ? OPT_IN_HINT_SELF : OPT_IN_HINT_OTHER, ephemeral: true });
+      }
+    }
     const candidates = interaction.options.getBoolean("candidates") ?? false;
     const result = await store.listMemories(guildId, subjectId, { search: interaction.options.getString("search") ?? undefined, page: interaction.options.getInteger("page") ?? 1, status: candidates ? "candidate" : undefined });
     const title = candidates ? "Candidate memories awaiting confirmation" : (server ? "What I remember about this server" : `What I remember about ${member?.username ?? interaction.user.username}`);
@@ -82,6 +102,10 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     return interaction.reply({ content: `Forget **#${id}**: "${memory.content}"? This removes the curated memory, but not its raw source message.`, components: [row], ephemeral: true });
   }
   if (interaction.commandName === "correct") {
+    // /correct writes a memory about the caller directly — same consent gate
+    // as every other derived-data path.
+    const caller = await store.getMember(guildId, interaction.user.id);
+    if (!caller?.optedIn || caller.optedOut) return interaction.reply({ content: OPT_IN_HINT_SELF, ephemeral: true });
     await interaction.deferReply({ ephemeral: true });
     try {
       const existing = await store.allActiveMemories(guildId, interaction.user.id);
@@ -184,7 +208,9 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     }
     const subjectId = member?.id ?? interaction.user.id;
     const memberRow = await store.getMember(guildId, subjectId);
-    if (memberRow?.optedOut) return interaction.reply({ content: "This member has opted out of profiles.", ephemeral: true });
+    if (!memberRow?.optedIn || memberRow.optedOut) {
+      return interaction.reply({ content: subjectId === interaction.user.id ? OPT_IN_HINT_SELF : OPT_IN_HINT_OTHER, ephemeral: true });
+    }
     const profile = await profileStore.getProfile(guildId, subjectId);
     if (!profile) return interaction.reply({ content: "No profile has been built for that member yet. Profiles are generated during daily maintenance once enough has been observed.", ephemeral: true });
 
@@ -249,7 +275,9 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     }
     const subjectId = member?.id ?? interaction.user.id;
     const memberRow = await store.getMember(guildId, subjectId);
-    if (memberRow?.optedOut) return interaction.reply({ content: "This member has opted out of profiles.", ephemeral: true });
+    if (!memberRow?.optedIn || memberRow.optedOut) {
+      return interaction.reply({ content: subjectId === interaction.user.id ? OPT_IN_HINT_SELF : OPT_IN_HINT_OTHER, ephemeral: true });
+    }
     const profile = await profileStore.getProfile(guildId, subjectId);
     const dossier = profile?.facets.dossier?.sections;
     if (!profile || !dossier || Object.keys(dossier).length === 0) {
@@ -293,11 +321,64 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     const forgotten = await store.forgetAllFor(guildId, userId);
     const relForgotten = await store.forgetRelationshipsFor(guildId, userId);
     await profileStore.deleteProfile(guildId, userId);
-    return interaction.reply({ content: `Opted out. ${forgotten} memor${forgotten === 1 ? "y" : "ies"} and ${relForgotten} relationship record${relForgotten === 1 ? "" : "s"} about you were forgotten and your profile was deleted — no new memories, relationships, or profile data will be formed about you while you're opted out. Your messages still appear in the raw archive until the server's retention window removes them. Use /opt-in to re-enable.`, ephemeral: true });
+    return interaction.reply({ content: `Opted out. ${forgotten} memor${forgotten === 1 ? "y" : "ies"} and ${relForgotten} relationship record${relForgotten === 1 ? "" : "s"} about you were forgotten and your profile was deleted — no new memories, relationships, or profile data will be formed about you while you're opted out. Your messages still appear in the raw archive until the server's retention window removes them. Use /opt-in and /profile-build to start again.`, ephemeral: true });
   }
   if (interaction.commandName === "opt-in") {
+    await store.setMemberOptIn(guildId, interaction.user.id, true);
     await store.setMemberOptOut(guildId, interaction.user.id, false);
-    return interaction.reply({ content: "Opted back in. Previously forgotten memories stay forgotten, but new memories and your profile can be built again from future activity.", ephemeral: true });
+    return interaction.reply({ content: "Opted in — new memories about you can form from live activity. Run /profile-build to also scan your message history and build your profile now.", ephemeral: true });
+  }
+  if (interaction.commandName === "profile-build") {
+    const userId = interaction.user.id;
+    // Cooldown — a full archive scan is a real LLM spend; one build per day.
+    const existing = await profileStore.getProfile(guildId, userId);
+    if (existing?.updatedAt && Date.now() - new Date(existing.updatedAt).getTime() < PROFILE_BUILD_COOLDOWN_MS) {
+      return interaction.reply({ content: "Your profile was built recently — you can rebuild once every 24 hours.", ephemeral: true });
+    }
+    await interaction.deferReply({ ephemeral: true });
+    await store.setMemberOptIn(guildId, userId, true);
+    await store.setMemberOptOut(guildId, userId, false);
+    try {
+      const stats = await runProfileBuild(guildId, userId, {
+        store, brain, eventStore: evStore ?? new EventStore(), profileStore,
+      });
+      return interaction.editReply(`Opted in and built your profile — scanned ${stats.scanned.toLocaleString()} messages, formed ${stats.memories} memor${stats.memories === 1 ? "y" : "ies"}${stats.relationships ? ` and ${stats.relationships} relationship observation${stats.relationships === 1 ? "" : "s"}` : ""}. Run /profile to see it.`);
+    } catch (err) {
+      console.error("Profile build failed", err);
+      return interaction.editReply("The profile build failed partway through — you're opted in, so live activity keeps shaping it. Try again later for the full scan.");
+    }
+  }
+  if (interaction.commandName === "server-build") {
+    const isOwner = interaction.user.id === interaction.guild?.ownerId;
+    if (!isOwner && !interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      return interaction.reply({ content: "Only the server owner or an administrator can run a server build.", ephemeral: true });
+    }
+    if (serverBuildRunning) return interaction.reply({ content: "A server build is already running.", ephemeral: true });
+    const channelOpt = interaction.options.getChannel("channel");
+    const channel = (channelOpt ?? interaction.guild?.channels.cache.find(c => c.name === config.ingestChannel && c.type === ChannelType.GuildText)) ?? null;
+    if (!channel || channel.type !== ChannelType.GuildText) {
+      return interaction.reply({ content: "Pick a text channel to build from (or set INGEST_CHANNEL and omit the option).", ephemeral: true });
+    }
+    await interaction.reply({ content: `Server build started for #${channel.name} — this runs long; results post to this channel when done.`, ephemeral: true });
+    serverBuildRunning = true;
+    runServerIngest(channel as TextChannel, {
+      store, brain, eventStore: evStore ?? new EventStore(),
+      pipeline: new EventPipeline(), botId: interaction.client.user.id,
+    }).then(async s => {
+      const summary = `Server build done for #${(channel as TextChannel).name}: ${s.total.toLocaleString()} messages scanned · ${s.memoriesSaved} memories · ${s.relationshipsRecorded} relationship observations · ${s.eventsCreated} events · ${s.profilesBuilt} profiles built · ${s.llmErrors} LLM errors`;
+      await announce(summary);
+    }).catch(async err => {
+      console.error("Server build failed", err);
+      await announce(`Server build for #${(channel as TextChannel).name} failed: ${(err as Error).message.slice(0, 180)}`);
+    }).finally(() => { serverBuildRunning = false; });
+    // Interaction tokens expire at ~15 min and a build can run longer — post
+    // to the invoking channel, with followUp as the short-run fallback.
+    async function announce(text: string) {
+      const ch = interaction.channel;
+      if (ch && "send" in ch) { await (ch.send as (t: string) => Promise<unknown>)(text).catch(() => {}); return; }
+      await interaction.followUp(text).catch(() => {});
+    }
+    return;
   }
 }
 

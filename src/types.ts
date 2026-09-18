@@ -59,6 +59,7 @@ export type RelationshipEdge = {
 export type Member = {
   guildId: string; userId: string; knownNames: string[];
   firstSeenAt: string; lastSeenAt: string; messageCount: number; optedOut: boolean;
+  optedIn: boolean;
 };
 
 export type Profile = {

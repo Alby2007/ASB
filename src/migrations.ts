@@ -383,6 +383,19 @@ const migrations: Migration[] = [
       await sql`ALTER TABLE server_settings DROP COLUMN IF EXISTS proactive_enabled`;
     },
   },
+  {
+    version: 14,
+    name: "v14_member_opted_in",
+    // Derived-data consent is opt-in: person memories, relationship
+    // observations, attributes, profiles, and dossiers only form for members
+    // who opted_in AND are not opted_out.
+    up: async (sql) => {
+      await addColumn(sql, "members", "opted_in SMALLINT NOT NULL DEFAULT 0");
+    },
+    down: async (sql) => {
+      await sql`ALTER TABLE members DROP COLUMN IF EXISTS opted_in`;
+    },
+  },
 ];
 
 /** Highest known migration version — tests assert against this instead of a

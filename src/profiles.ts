@@ -78,7 +78,12 @@ export class ProfileStore {
   constructor(private sql: Sql = defaultSql) {}
 
   async getProfile(guildId: string, subjectId: string): Promise<Profile | undefined> {
-    const rows = await this.sql<ProfileRow[]>`SELECT * FROM profiles WHERE guild_id = ${guildId} AND subject_id = ${subjectId}`;
+    // Consent-gated: a straggler profile for a non-opted-in member is invisible
+    // everywhere, not just in /profile — defense in depth under the purge.
+    const rows = await this.sql<ProfileRow[]>`
+      SELECT * FROM profiles WHERE guild_id = ${guildId} AND subject_id = ${subjectId}
+        AND subject_id IN (SELECT user_id FROM members WHERE guild_id = ${guildId} AND opted_in = 1 AND opted_out = 0)
+    `;
     return rows[0] ? rowToProfile(rows[0]) : undefined;
   }
 
@@ -86,6 +91,7 @@ export class ProfileStore {
     if (subjectIds.length === 0) return [];
     const rows = await this.sql<ProfileRow[]>`
       SELECT * FROM profiles WHERE guild_id = ${guildId} AND subject_id = ANY(${subjectIds})
+        AND subject_id IN (SELECT user_id FROM members WHERE guild_id = ${guildId} AND opted_in = 1 AND opted_out = 0)
     `;
     return rows.map(rowToProfile);
   }
@@ -117,8 +123,9 @@ export class ProfileStore {
 
   /**
    * Rebuild profile cards for every eligible member of a guild.
-   * Eligible = ≥1 active memory OR ≥5 recorded messages; opted-out members are
-   * skipped and any existing profile is deleted.
+   * Eligible = opted in AND (≥1 active memory OR ≥5 recorded messages); members
+   * without consent are skipped and any straggler profile is deleted on sight.
+   * `opts.onlyUserId` scopes the pass to one member (used by /profile-build).
    */
   async buildProfiles(
     guildId: string,
@@ -126,7 +133,7 @@ export class ProfileStore {
     memoryStore: MemoryStore,
     eventStore: EventStore,
     model?: string,
-    opts?: { excludeIds?: string[] }
+    opts?: { excludeIds?: string[]; onlyUserId?: string }
   ): Promise<{ built: number; unchanged: number; considered: number }> {
     let built = 0, unchanged = 0, considered = 0;
 
@@ -135,7 +142,8 @@ export class ProfileStore {
     const allPairs = await memoryStore.interactionPairs(guildId, aliasMap, opts?.excludeIds ?? []);
 
     for (const member of await memoryStore.listMembers(guildId)) {
-      if (member.optedOut) {
+      if (opts?.onlyUserId && member.userId !== opts.onlyUserId) continue;
+      if (!member.optedIn || member.optedOut) {
         await this.deleteProfile(guildId, member.userId);
         continue;
       }

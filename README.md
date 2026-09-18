@@ -8,7 +8,7 @@ Everything it remembers is inspectable, correctable, and forgettable by the pers
 
 ## What it does
 
-**Observes** — archives messages to Postgres (respecting per-guild pause and member opt-out), learns name↔user aliases, and tracks who talks to whom.
+**Observes** — archives messages to Postgres (respecting per-guild pause), learns name↔user aliases, and tracks who talks to whom. Derived data about a person requires their explicit opt-in — the raw transcript is retention-bounded infrastructure.
 
 **Remembers** — an LLM extracts durable candidates from messages that pass a cheap pre-filter. Each memory carries an evidence type (`explicit_fact`, `clear_preference`, `reported_by_other`, `sarcasm_or_joke`, …), a deterministic confidence score, provenance (source message, quote, timestamp), and a lifecycle status:
 
@@ -18,7 +18,7 @@ Everything it remembers is inspectable, correctable, and forgettable by the pers
 
 **Handles contradiction** — bot-addressed denials and corrections contest memories rather than silently overwriting them; support vs. contradiction net-score resolves the dispute, with the same evidence-type gate preventing rumors from laundering into facts.
 
-**Builds people** — per-member structured attributes (pronouns, timezone, location, occupation, birthday, traits, interests, skills) with per-facet provenance — every attribute knows exactly which memories cite it, so a forgotten fact never lingers as a rendered facet. On top of that: synthesized profile cards and admin-only deep dossiers (psychological profile, relationships, opinions, communication style, timeline).
+**Builds people (opted-in only)** — per-member structured attributes (pronouns, timezone, location, occupation, birthday, traits, interests, skills) with per-facet provenance — every attribute knows exactly which memories cite it, so a forgotten fact never lingers as a rendered facet. On top of that: synthesized profile cards and admin-only deep dossiers (psychological profile, relationships, opinions, communication style, timeline).
 
 **Maps the social graph** — relationship observations between members are sincerity-verified and rolled up into edges with net valence; interaction pairs feed into dossiers.
 
@@ -43,8 +43,9 @@ All replies are ephemeral (private to the invoker) unless noted.
 | `/memory-export` | Download every memory + evidence held about you |
 | `/forget` | Forget one of your memories (confirmation button required) |
 | `/correct` | Replace a memory — supersedes genuinely contradictory active ones |
-| `/opt-out` | Forget everything about you, delete your profile, stop forming new memories/relationships about you |
-| `/opt-in` | Reverse an opt-out |
+| `/opt-out` | Forget everything about you, delete your profile, revoke consent |
+| `/opt-in` | Consent to memories + a profile about you (live activity only) |
+| `/profile-build` | Opt in **and** scan your archive history — messages you wrote, references to you, conversations you're in — to build your structured profile now (once per 24h) |
 | `/profile` | View your profile card (another member's: admins only) |
 | `/dossier` | Deep dossier — facets, relationships, opinions, style, timeline (another member's: admins only) |
 | `/event` | Inspect the server event a memory is attached to |
@@ -60,16 +61,21 @@ All replies are ephemeral (private to the invoker) unless noted.
 | `/memory-pause` / `/memory-resume` | Stop/restart observing and replying — archiving included |
 | `/memory-settings` | Show effective guild settings |
 | `/status` | Uptime, error counters, pipeline health |
+| `/server-build` | Run the server-level historical build on a channel (owner/admin only; archives + lore + events for everyone, derived person data for opted-in members only) |
 
 ---
 
 ## Privacy model
 
+- **Derived data is opt-in.** Person memories, relationship observations, attributes, profiles, and dossiers form only for members who consent (`/opt-in`, or `/profile-build` which opts in and backfills). Server lore and events are shared context and don't need per-member consent.
+- **Reads are gated too.** Non-consenting members have nothing to read — profile cards, `/memory` views, relationship pair context, and the model's lookup tools all hide stragglers.
+- **Relationship consent is subject-consent.** An observation persists when at least one party opted in — requiring both would lose almost all graph data.
 - **Pause means pause.** `/memory-pause` stops archiving entirely — no raw rows, no member-registry writes — not just extraction.
-- **Opt-out is strong.** No new memories, relationships, or attributes form about an opted-out member; existing derived data is forgotten.
+- **Opt-out is strong.** `/opt-out` revokes consent, forgets memories, deletes relationships and the profile, and blocks all new derived data.
 - **Deletes propagate.** Deleting a Discord message removes its archive row *and* scrubs the verbatim quote/snapshot on any evidence it produced. Edits update the archive (extraction-time snapshots are kept as the historical record).
 - **Retention is bounded.** Raw messages age out on `RAW_MESSAGE_RETENTION_DAYS`; curated evidence outlives the raw archive by design.
 - **Self-service.** Every member can see, export, correct, and forget their own data without admin involvement.
+- **One-shot purge.** `scripts/purge-nonopted.mjs` (`PURGE_CONFIRM=1`) hard-deletes the pre-consent derived corpus for members who never opted in — run once after deploying the consent model.
 
 ---
 
@@ -87,7 +93,7 @@ npm run dev            # or: npm start
 
 Migrations apply automatically on first boot — no manual SQL.
 
-**Backfill history** (optional): `INGEST_CHANNEL=channel-name npm run ingest` sweeps a channel's archive through the same triage → extract → verify pipeline.
+**Backfill history** (optional): `INGEST_CHANNEL=channel-name npm run ingest` runs the server-level historical build — archives + lore + events for everyone, derived person data for opted-in members only. The identical routine is available in-bot as `/server-build` (owner/admin).
 
 ### Key configuration
 

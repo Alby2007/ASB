@@ -159,6 +159,7 @@ test("buildProfiles builds a card and skips the LLM call when inputs are unchang
     const { store, eventStore } = await makeStore(sql);
     const profileStore = new ProfileStore(sql as any);
     for (let i = 0; i < 5; i++) await store.recordMessage(msg(`msg ${i}`, { authorId: "u1", authorName: "Alice" }));
+    await store.setMemberOptIn("g1", "u1", true); // derived data is opt-in
 
     const calls = { profile: 0, section: 0, sections: {} as Record<string, number>, extract: 0 };
     const brain = stubBrain(calls);
@@ -197,6 +198,7 @@ test("buildProfiles skips opted-out members and deletes their existing profile",
     const { store, eventStore } = await makeStore(sql);
     const profileStore = new ProfileStore(sql as any);
     for (let i = 0; i < 5; i++) await store.recordMessage(msg(`msg ${i}`, { authorId: "u1", authorName: "Alice" }));
+    await store.setMemberOptIn("g1", "u1", true);
 
     const brain = stubBrain({ profile: 0, section: 0, sections: {}, extract: 0 });
     await profileStore.buildProfiles("g1", brain, store, eventStore);
@@ -205,6 +207,22 @@ test("buildProfiles skips opted-out members and deletes their existing profile",
     await store.setMemberOptOut("g1", "u1", true);
     const result = await profileStore.buildProfiles("g1", brain, store, eventStore);
     assert.equal(result.built, 0);
+    assert.equal(await profileStore.getProfile("g1", "u1"), undefined);
+  } finally { await sql.end(); }
+});
+
+test("buildProfiles skips members who never opted in — no profile is built", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store, eventStore } = await makeStore(sql);
+    const profileStore = new ProfileStore(sql as any);
+    // Plenty of activity, zero consent — the member stays invisible.
+    for (let i = 0; i < 10; i++) await store.recordMessage(msg(`msg ${i}`, { authorId: "u1", authorName: "Alice" }));
+
+    const brain = stubBrain({ profile: 0, section: 0, sections: {}, extract: 0 });
+    const result = await profileStore.buildProfiles("g1", brain, store, eventStore);
+    assert.equal(result.built, 0);
+    assert.equal(result.considered, 0);
     assert.equal(await profileStore.getProfile("g1", "u1"), undefined);
   } finally { await sql.end(); }
 });
@@ -441,6 +459,7 @@ test("buildProfiles builds the voice section and skips unchanged sections on re-
     const profileStore = new ProfileStore(sql as any);
     // ≥50 messages makes the member dossier-eligible and voice-buildable (≥20 msgs, ≥10 samples)
     for (let i = 0; i < 50; i++) await store.recordMessage(msg(`message number ${i} hello there`, { authorId: "u1", authorName: "Alice" }));
+    await store.setMemberOptIn("g1", "u1", true);
 
     const calls = { profile: 0, section: 0, sections: {} as Record<string, number>, extract: 0 };
     const brain = stubBrain(calls);
@@ -469,6 +488,7 @@ test("dossier items keep only citations to real input memory IDs", async () => {
     const { store, eventStore } = await makeStore(sql);
     const profileStore = new ProfileStore(sql as any);
     await store.recordMessage(msg("hi", { authorId: "u1", authorName: "Alice" }));
+    await store.setMemberOptIn("g1", "u1", true);
     // 3 active person_fact memories → dossier eligible, life_situation buildable
     const ids: number[] = [];
     for (const c of ["Has a cat", "Lives in Texas", "Works nights"]) {

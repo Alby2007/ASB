@@ -20,6 +20,8 @@ test("pairwiseContext keeps edge directions on the correct sides", async () => {
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
+    await store.setMemberOptIn("g1", "u1", true);
+    await store.setMemberOptIn("g1", "u2", true);
     // u1 asserts about u2; u2 asserts about u1 — stored as separate directed edges
     await store.recordRelationship("g1", "u1", "u2", "m1", "antagonizes", -0.5, "mocked her takes");
     await store.recordRelationship("g1", "u2", "u1", "m2", "defends", 0.7, "stood up for them");
@@ -45,6 +47,8 @@ test("pairwiseContext surfaces only literal-verdicted observations", async () =>
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
+    await store.setMemberOptIn("g1", "u1", true);
+    await store.setMemberOptIn("g1", "u2", true);
     await store.recordRelationship("g1", "u1", "u2", "m1", "antagonizes", -0.5, "mocked them");
     await store.recordRelationship("g1", "u1", "u2", "m2", "flirts", 0.4, "ambiguous bit");
     await store.recordRelationship("g1", "u1", "u2", "m3", "dating", 0.9, "joke ship");
@@ -69,6 +73,8 @@ test("pairwiseContext claims are active memories about one side authored by the 
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
+    await store.setMemberOptIn("g1", "u1", true);
+    await store.setMemberOptIn("g1", "u2", true);
     // u2 writes a memory about u1 (evidence author u2)
     const m = await store.saveMemory(msg("Alice is stubborn", { authorId: "u2", authorName: "Bob" }), {
       subjectId: "u1", kind: "person_fact", content: "Is stubborn", reason: "t", evidenceType: "reported_by_other", effect: "support",
@@ -101,6 +107,8 @@ test("opt-out erases pairwise edge and observation data", async () => {
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
+    await store.setMemberOptIn("g1", "u1", true);
+    await store.setMemberOptIn("g1", "u2", true);
     await store.recordRelationship("g1", "u1", "u2", "m1", "close friends", 0.8, "said so");
     await sql`UPDATE relationship_observations SET verdict = 'literal' WHERE guild_id = 'g1'`;
     await store.recomputeEdges("g1");
@@ -216,4 +224,24 @@ test("formatReplyProfile falls back to flat traits when no attributes exist", ()
     attributes: [{ field: "pronouns", value: "they/them", confidence: 0.95 }],
   });
   assert.equal(attrsOnly, "- Bob — pronouns: they/them (high)");
+});
+
+test("pairwiseContext hides pairs where neither side consented", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    await store.recordRelationship("g1", "u1", "u2", "m1", "close friends", 0.8, "said so");
+    await sql`UPDATE relationship_observations SET verdict = 'literal' WHERE guild_id = 'g1'`;
+    await store.recomputeEdges("g1");
+
+    // No opt-ins → the pair is invisible even though the edge exists.
+    let pc = await store.pairwiseContext("g1", "u1", "u2");
+    assert.equal(pc.ab, undefined);
+    assert.equal(pc.observations.length, 0);
+
+    // Subject-consent: one side opting in is enough to surface it.
+    await store.setMemberOptIn("g1", "u2", true);
+    pc = await store.pairwiseContext("g1", "u1", "u2");
+    assert.ok(pc.ab);
+  } finally { await sql.end(); }
 });
