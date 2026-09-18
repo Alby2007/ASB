@@ -31,9 +31,13 @@ export class Brain {
     if (event.content.endsWith("?")) { score += 0.1; reasons.push("question"); }
     // Proportional recency penalty, evaluated only inside the window so the
     // factor can never go negative and flip into a bonus. It must never
-    // suppress an explicit mention — a direct request for a reply. Engaged
-    // messages DO take it: that's the pacing that stops double-firing mid-convo.
-    const recencyWindowMs = 120_000;
+    // suppress an explicit mention — a direct request for a reply. The window
+    // is per-tier: strangers are suppressed for 120s, engaged participants only
+    // 30s — in a live back-and-forth a 120s window means statements need ~96s
+    // of silence to clear the threshold, i.e. the bot never replies mid-flow.
+    // 30s caps the interject rate at ~once per 30s per channel while letting a
+    // real exchange hit nearly every turn.
+    const recencyWindowMs = engaged ? 30_000 : 120_000;
     const elapsed = Math.max(0, elapsedSinceLastSpokeMs);
     if (!event.mentionsBot && elapsed < recencyWindowMs) {
       score -= 0.25 * (1 - elapsed / recencyWindowMs);
