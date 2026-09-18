@@ -25,6 +25,24 @@ test("isSafeUrl blocks non-http schemes and private/local hosts", () => {
   assert.ok(isSafeUrl("http://8.8.8.8/dns-query")); // public IP literal is allowed
 });
 
+test("isSafeUrl blocks IPv4-embedding and tunnel IPv6 forms", () => {
+  // IPv4-mapped — dotted and hex forms both blocked via the ::/16 blanket rule.
+  assert.ok(!isSafeUrl("http://[::ffff:127.0.0.1]/"));
+  assert.ok(!isSafeUrl("http://[::ffff:a9fe:a9fe]/"));   // 169.254.169.254 hex
+  assert.ok(!isSafeUrl("http://[::ffff:169.254.169.254]/")); // metadata, dotted
+  assert.ok(!isSafeUrl("http://[::ffff:0a00:0001]/"));   // 10.0.0.1
+  // NAT64 / 6to4 / Teredo — embed IPv4 inside routable-looking v6 prefixes.
+  assert.ok(!isSafeUrl("http://[64:ff9b::a9fe:a9fe]/"));
+  assert.ok(!isSafeUrl("http://[64:ff9b::169.254.169.254]/"));
+  assert.ok(!isSafeUrl("http://[2002:a9fe:a9fe::]/"));
+  assert.ok(!isSafeUrl("http://[2001:0:4136:e378:8000:63bf:3fff:fdd2]/"));
+  // Deprecated v4-compat ::/96.
+  assert.ok(!isSafeUrl("http://[::7f00:1]/"));
+  assert.ok(!isSafeUrl("http://[::127.0.0.1]/"));
+  // Legit global v6 still passes — Google DNS and a public 2001: prefix.
+  assert.ok(isSafeUrl("http://[2001:4860:4860::8888]/"));
+});
+
 test("stripHtml removes scripts/styles/tags and decodes entities", () => {
   const html = `<p>Hello <b>world</b> &amp; friends</p><script>var x=1;</script><style>.a{}</style><p>Second&nbsp;para &#8212; done</p>`;
   const out = stripHtml(html);

@@ -4,7 +4,7 @@ import type { Memory, MemoryStore } from "./database.js";
 import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
 import { ProfileStore } from "./profiles.js";
-import { encryptSecret, maskKey, validateLlmKey } from "./secrets.js";
+import { encryptSecret, logError, maskKey, validateLlmKey } from "./secrets.js";
 import { isSafeUrl } from "./tools.js";
 import { runProfileBuild, PROFILE_BUILD_COOLDOWN_MS } from "./profile-build.js";
 import { runServerIngest } from "./server-ingest.js";
@@ -57,6 +57,9 @@ const OPT_IN_HINT_OTHER = "That member hasn't opted in to profiles.";
 /** One server build at a time — the routine is heavy and its archive marks are
  * not re-entrant across overlapping runs. */
 let serverBuildRunning = false;
+/** One profile build per member at a time — claimed synchronously before any
+ * await so a double-invoke can't slip past the check and double the LLM spend. */
+const profileBuildsRunning = new Set<string>();
 const display = (memory: Memory) => `**#${memory.id} · ${confidence(memory.confidence)} confidence**\n${memory.content}\n*${memory.mentions} confirmation${memory.mentions === 1 ? "" : "s"}; last confirmed ${new Date(memory.lastConfirmedAt).toLocaleDateString()}*`;
 
 type BrainFor = (guildId: string) => Promise<Brain | null>;
@@ -192,7 +195,7 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     const memory = await store.getMemory(guildId, memId);
     const canInspect = memory && (memory.subjectId === interaction.user.id || interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild));
     if (!canInspect || !memory) return interaction.reply({ content: "I couldn't find a memory you are allowed to inspect with that ID.", ephemeral: true });
-    const events = await evStore.eventsForMemory(memId);
+    const events = await evStore.eventsForMemory(guildId, memId);
     if (events.length === 0) return interaction.reply({ content: `Memory **#${memId}** is not linked to any recorded event.`, ephemeral: true });
     const ev = events[0]; // show the most recent linked event
     const participantList = ev.participants.map(p => `${p.userName} *(${p.role})*`).join(", ") || "Unknown";
@@ -345,17 +348,22 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     }
     const brain = await brainFor(guildId);
     if (!brain) return interaction.reply({ content: NO_KEY_MSG, ephemeral: true });
-    await interaction.deferReply({ ephemeral: true });
-    await store.setMemberOptIn(guildId, userId, true);
-    await store.setMemberOptOut(guildId, userId, false);
+    const pbKey = `${guildId}:${userId}`;
+    if (profileBuildsRunning.has(pbKey)) return interaction.reply({ content: "Your profile build is already running.", ephemeral: true });
+    profileBuildsRunning.add(pbKey);
     try {
+      await interaction.deferReply({ ephemeral: true });
+      await store.setMemberOptIn(guildId, userId, true);
+      await store.setMemberOptOut(guildId, userId, false);
       const stats = await runProfileBuild(guildId, userId, {
         store, brain, eventStore: evStore ?? new EventStore(), profileStore,
       });
-      return interaction.editReply(`Opted in and built your profile — scanned ${stats.scanned.toLocaleString()} messages, formed ${stats.memories} memor${stats.memories === 1 ? "y" : "ies"}${stats.relationships ? ` and ${stats.relationships} relationship observation${stats.relationships === 1 ? "" : "s"}` : ""}. Run /profile to see it.`);
+      return await interaction.editReply(`Opted in and built your profile — scanned ${stats.scanned.toLocaleString()} messages, formed ${stats.memories} memor${stats.memories === 1 ? "y" : "ies"}${stats.relationships ? ` and ${stats.relationships} relationship observation${stats.relationships === 1 ? "" : "s"}` : ""}. Run /profile to see it.`);
     } catch (err) {
-      console.error("Profile build failed", err);
-      return interaction.editReply("The profile build failed partway through — you're opted in, so live activity keeps shaping it. Try again later for the full scan.");
+      logError("Profile build failed", err);
+      return await interaction.editReply("The profile build failed partway through — you're opted in, so live activity keeps shaping it. Try again later for the full scan.").catch(() => {});
+    } finally {
+      profileBuildsRunning.delete(pbKey);
     }
   }
   if (interaction.commandName === "server-build") {
@@ -364,33 +372,41 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
       return interaction.reply({ content: "Only the server owner or an administrator can run a server build.", ephemeral: true });
     }
     if (serverBuildRunning) return interaction.reply({ content: "A server build is already running.", ephemeral: true });
-    const channelOpt = interaction.options.getChannel("channel");
-    const channel = (channelOpt ?? interaction.guild?.channels.cache.find(c => c.name === config.ingestChannel && c.type === ChannelType.GuildText)) ?? null;
-    if (!channel || channel.type !== ChannelType.GuildText) {
-      return interaction.reply({ content: "Pick a text channel to build from (or set INGEST_CHANNEL and omit the option).", ephemeral: true });
-    }
-    const brain = await brainFor(guildId);
-    if (!brain) return interaction.reply({ content: NO_KEY_MSG, ephemeral: true });
-    await interaction.reply({ content: `Server build started for #${channel.name} — this runs long; results post to this channel when done.`, ephemeral: true });
+    // Claim synchronously — the awaits below would otherwise let a second
+    // invocation slip past the check and start a parallel build.
     serverBuildRunning = true;
-    runServerIngest(channel as TextChannel, {
-      store, brain, eventStore: evStore ?? new EventStore(),
-      pipeline: new EventPipeline(), botId: interaction.client.user.id,
-    }).then(async s => {
-      const summary = `Server build done for #${(channel as TextChannel).name}: ${s.total.toLocaleString()} messages scanned · ${s.memoriesSaved} memories · ${s.relationshipsRecorded} relationship observations · ${s.eventsCreated} events · ${s.profilesBuilt} profiles built · ${s.llmErrors} LLM errors`;
-      await announce(summary);
-    }).catch(async err => {
-      console.error("Server build failed", err);
-      await announce(`Server build for #${(channel as TextChannel).name} failed: ${(err as Error).message.slice(0, 180)}`);
-    }).finally(() => { serverBuildRunning = false; });
-    // Interaction tokens expire at ~15 min and a build can run longer — post
-    // to the invoking channel, with followUp as the short-run fallback.
-    async function announce(text: string) {
-      const ch = interaction.channel;
-      if (ch && "send" in ch) { await (ch.send as (t: string) => Promise<unknown>)(text).catch(() => {}); return; }
-      await interaction.followUp(text).catch(() => {});
+    let buildStarted = false;
+    try {
+      const channelOpt = interaction.options.getChannel("channel");
+      const channel = (channelOpt ?? interaction.guild?.channels.cache.find(c => c.name === config.ingestChannel && c.type === ChannelType.GuildText)) ?? null;
+      if (!channel || channel.type !== ChannelType.GuildText) {
+        return interaction.reply({ content: "Pick a text channel to build from (or set INGEST_CHANNEL and omit the option).", ephemeral: true });
+      }
+      const brain = await brainFor(guildId);
+      if (!brain) return interaction.reply({ content: NO_KEY_MSG, ephemeral: true });
+      await interaction.reply({ content: `Server build started for #${channel.name} — this runs long; results post to this channel when done.`, ephemeral: true });
+      buildStarted = true;
+      runServerIngest(channel as TextChannel, {
+        store, brain, eventStore: evStore ?? new EventStore(),
+        pipeline: new EventPipeline(), botId: interaction.client.user.id,
+      }).then(async s => {
+        const summary = `Server build done for #${(channel as TextChannel).name}: ${s.total.toLocaleString()} messages scanned · ${s.memoriesSaved} memories · ${s.relationshipsRecorded} relationship observations · ${s.eventsCreated} events · ${s.profilesBuilt} profiles built · ${s.llmErrors} LLM errors`;
+        await announce(summary);
+      }).catch(async err => {
+        logError("Server build failed", err);
+        await announce(`Server build for #${(channel as TextChannel).name} failed: ${(err as Error).message.slice(0, 180)}`);
+      }).finally(() => { serverBuildRunning = false; });
+      // Interaction tokens expire at ~15 min and a build can run longer — post
+      // to the invoking channel, with followUp as the short-run fallback.
+      async function announce(text: string) {
+        const ch = interaction.channel;
+        if (ch && "send" in ch) { await (ch.send as (t: string) => Promise<unknown>)(text).catch(() => {}); return; }
+        await interaction.followUp(text).catch(() => {});
+      }
+      return;
+    } finally {
+      if (!buildStarted) serverBuildRunning = false;
     }
-    return;
   }
   if (interaction.commandName === "setup") {
     if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
@@ -451,7 +467,7 @@ export async function handleSetupModal(
       ? `Key stored (${maskKey(key)}) — this server now runs on its own key. Re-run /setup any time to rotate it.`
       : `Couldn't reach the provider to verify, but the key (${maskKey(key)}) is stored unverified — it'll be checked on first use.`);
   } catch (error) {
-    console.error("/setup failed", error);
+    logError("/setup failed", error);
     return interaction.editReply("Setup failed — nothing was stored. Try again later.");
   }
 }

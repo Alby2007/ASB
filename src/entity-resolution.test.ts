@@ -87,3 +87,15 @@ test("scrubMentions maps known ids to plain @Name and strips hallucinated ids", 
   assert.equal(scrubMentions("Hey <@1549171765056638>! Glad you're here", names), "Hey! Glad you're here");
   assert.equal(scrubMentions("plain text stays", names), "plain text stays");
 });
+
+test("scrubMentions defuses mass-ping vectors in model output", () => {
+  const names = new Map([["123", "Alice"]]);
+  // @everyone/@here lose the @ so they can't ping even without allowedMentions.
+  assert.equal(scrubMentions("hey @everyone look", names), "hey everyone look");
+  assert.equal(scrubMentions("ping @here now", names), "ping here now");
+  // Role mentions are stripped entirely — the bot has no business pinging roles.
+  assert.equal(scrubMentions("hi <@&987654321> folks", names), "hi folks");
+  assert.equal(scrubMentions("<@&123>", names), "");
+  // Mixed with real mentions — user mentions still render as plain names.
+  assert.equal(scrubMentions("yo <@123> and @everyone", names), "yo @Alice and everyone");
+});

@@ -64,6 +64,22 @@ test("recordMessage trackMember=false archives the row without a member entry", 
   } finally { await sql.end(); }
 });
 
+test("known_names is capped — nickname spam can't grow the alias map unboundedly", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    for (let i = 0; i < 40; i++) {
+      await store.recordMessage(msg(`m-${i}`, { messageId: `m-${i}`, authorId: "u1", authorName: `Name${i}` }));
+    }
+    const member = await store.getMember("g1", "u1");
+    assert.ok(member);
+    assert.equal(member.knownNames.length, 32);
+    // Oldest names are evicted — the cap keeps the most recent 32.
+    assert.equal(member.knownNames[0], "Name8");
+    assert.equal(member.knownNames[31], "Name39");
+  } finally { await sql.end(); }
+});
+
 test("recordMessage persists reply_to_id", async () => {
   const sql = makeTestSql();
   try {

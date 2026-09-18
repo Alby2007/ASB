@@ -1,5 +1,5 @@
 import { Brain } from "./brain.js";
-import { decryptSecret } from "./secrets.js";
+import { decryptSecret, errorText } from "./secrets.js";
 import { inc } from "./metrics.js";
 
 /**
@@ -34,7 +34,7 @@ export function createBrainResolver(opts: {
         brain = new Brain(decryptSecret(row.keyEnc), opts.envModel, row.baseUrl ?? opts.envBaseUrl);
       } catch (error) {
         inc("brain.decrypt_failed");
-        console.warn(`guild_keys decrypt failed for ${guildId} — guild dormant until /setup re-runs`, error);
+        console.warn(`guild_keys decrypt failed for ${guildId} — guild dormant until /setup re-runs`, errorText(error));
       }
     } else if (opts.envKey && !opts.requireGuildKeys) {
       brain = new Brain(opts.envKey, opts.envModel, opts.envBaseUrl);

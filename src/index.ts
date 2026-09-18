@@ -18,7 +18,26 @@ import { buildPairContext, type ToolCtx } from "./lookup-tools.js";
 import { qualifyingImages, formatImageContext, IMAGE_MAX_PER_MESSAGE, type AttachmentMeta } from "./vision.js";
 import { withRetry } from "./retry.js";
 import { inc } from "./metrics.js";
+import { logError, redactSecrets, registerSecret } from "./secrets.js";
+import { isSafeUrl } from "./tools.js";
 import type { MessageEvent, PairContext } from "./types.js";
+
+// Register every credential before any code path can log it — redactSecrets
+// scrubs all registered values plus auth-header-shaped tokens out of logs.
+registerSecret(config.discordToken);
+registerSecret(config.databaseUrl);
+registerSecret(config.keyEncryptionSecret);
+registerSecret(config.groqKey);
+registerSecret(config.visionApiKey);
+
+// Operator-set endpoints still get the SSRF guard — a pasted internal URL
+// would otherwise aim every LLM call (carrying the API key) at the wrong host.
+for (const [name, url] of [["GROQ_BASE_URL", config.groqBaseUrl], ["VISION_BASE_URL", config.visionBaseUrl]] as const) {
+  if (url && !isSafeUrl(url)) {
+    console.error(`${name} fails the URL safety check (private/internal host) — refusing to start`);
+    process.exit(1);
+  }
+}
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMessageReactions],
@@ -58,7 +77,7 @@ const proactive = new ProactiveScheduler({
   backoffMinConfidence: 0.85,
 });
 proactive.setFireHandler((key, messageId) => {
-  void fireProactive(key, messageId).catch(error => { inc("proactive.error"); console.error("Proactive fire failed", error); });
+  void fireProactive(key, messageId).catch(error => { inc("proactive.error"); logError("Proactive fire failed", error); });
 });
 
 // MemoryStore.create() runs migrations; EventStore shares the same sql connection.
@@ -77,15 +96,15 @@ client.once(Events.ClientReady, async ready => {
   // restarts it rather than letting it sit mute.
   try {
     await init();
-  } catch (error) { console.error("Startup init failed", error); process.exit(1); }
+  } catch (error) { logError("Startup init failed", error); process.exit(1); }
   try {
     if (config.guildId) await ready.application.commands.set(commandDefinitions, config.guildId);
     else await ready.application.commands.set(commandDefinitions);
-  } catch (error) { inc("init.commands_error"); console.error("Command registration failed", error); }
+  } catch (error) { inc("init.commands_error"); logError("Command registration failed", error); }
   // Fire-and-forget: both loops must never reject into the event loop — on
   // Node >=15 an unhandled rejection here is fatal to the process.
-  applyRetention().catch(error => { inc("maintenance.error"); console.error("Retention run failed", error); });
-  sweepMissedSignals(24 * 60 * 60_000).catch(error => { inc("sweep.error"); console.error("Boot sweep failed", error); }); // wide window on boot to cover downtime
+  applyRetention().catch(error => { inc("maintenance.error"); logError("Retention run failed", error); });
+  sweepMissedSignals(24 * 60 * 60_000).catch(error => { inc("sweep.error"); logError("Boot sweep failed", error); }); // wide window on boot to cover downtime
   if (!config.visionModel) console.warn("[vision] VISION_MODEL unset — image attachments will be ignored");
   console.log(`ASM online as ${ready.user.tag}`);
 });
@@ -102,13 +121,13 @@ async function applyRetention() {
       const deleted = await store.deleteRawMessagesOlderThan(guild.id, settings.rawRetentionDays);
       await store.maintain(guild.id, config.candidateConfidenceThreshold);
       if (deleted) console.log(`Retention deleted ${deleted} raw messages in ${guild.name}`);
-    } catch (error) { inc("maintenance.retention_error"); console.error(`Retention/maintenance failed in ${guild.name}`, error); continue; }
+    } catch (error) { inc("maintenance.retention_error"); logError(`Retention/maintenance failed in ${guild.name}`, error); continue; }
     try {
       const pruned = await store.pruneDerivedData(guild.id);
       if (pruned.history + pruned.names + pruned.aliases + pruned.events) {
         console.log(`Pruned derived data in ${guild.name}: ${pruned.history} history, ${pruned.names} unresolved names, ${pruned.aliases} alias candidates, ${pruned.events} events`);
       }
-    } catch (error) { inc("maintenance.prune_error"); console.error("Derived-data pruning failed", error); }
+    } catch (error) { inc("maintenance.prune_error"); logError("Derived-data pruning failed", error); }
     // Dormant guilds (no key) skip every LLM pass — retention/pruning above
     // still ran; they're lifecycle ops, not cognition.
     const brain = await brainFor(guild.id);
@@ -119,7 +138,7 @@ async function applyRetention() {
       if (result.closed || result.promoted || result.discarded) {
         console.log(`Events maintained in ${guild.name}: closed=${result.closed} promoted=${result.promoted} discarded=${result.discarded}`);
       }
-    } catch (error) { console.error("Event maintenance failed", error); }
+    } catch (error) { logError("Event maintenance failed", error); }
     // Verify promotable candidate memories against their source messages so edgy
     // jokes don't activate; verified literal self-reports promote. Runs before
     // the profile build so cards and dossiers see final statuses.
@@ -141,7 +160,7 @@ async function applyRetention() {
         }
       }
       if (vPromoted || vFlagged) console.log(`Verified candidates in ${guild.name}: ${vPromoted} promoted, ${vFlagged} flagged as jokes`);
-    } catch (error) { console.error("Verification failed", error); }
+    } catch (error) { logError("Verification failed", error); }
     // Verify unverified relationship observations, then rebuild edges — the
     // relationships table is derived from 'literal'-verdicted observations
     // only, so unverified assertions never surface as edges. Recompute runs
@@ -167,7 +186,7 @@ async function applyRetention() {
       }
       const edgeCount = await store.recomputeEdges(guild.id);
       if (unverified.length) console.log(`Verified ${judged} relationship observations in ${guild.name}; recomputed ${edgeCount} edges`);
-    } catch (error) { console.error("Relationship verification failed", error); }
+    } catch (error) { logError("Relationship verification failed", error); }
     // Semantic dedup — the LLM scans each member's memory list for rephrased
     // duplicates the trigram fast-path can't see ("allergic to peanuts" /
     // "can't eat nuts"). It proposes groups; applyDedupGroups enforces
@@ -197,17 +216,17 @@ async function applyRetention() {
         if (merged || skipped || contradictions) console.log(`Dedup in ${guild.name}: ${merged} merged | ${skipped} groups skipped | ${contradictions} contradictions logged`);
         inc("dedup.merged", merged);
       }
-    } catch (error) { console.error("Dedup pass failed", error); inc("dedup.errors"); }
+    } catch (error) { logError("Dedup pass failed", error); inc("dedup.errors"); }
     // v0.3: rebuild per-chatter profile cards + dossiers (LLM calls only when inputs changed)
     try {
       const profiles = await profileStore.buildProfiles(guild.id, brain, store, eventStore, config.profileModel, { excludeIds: [client.user!.id] });
       if (profiles.built) console.log(`Profiles in ${guild.name}: ${profiles.built} rebuilt, ${profiles.unchanged} unchanged of ${profiles.considered}`);
-    } catch (error) { console.error("Profile build failed", error); }
+    } catch (error) { logError("Profile build failed", error); }
   }
 }
 // Belt-and-braces: every guild body is try/caught, but an interval callback
 // rejection would still be an unhandled (fatal) rejection.
-setInterval(() => applyRetention().catch(error => { inc("maintenance.error"); console.error("Retention run failed", error); }), 24 * 60 * 60 * 1000).unref();
+setInterval(() => applyRetention().catch(error => { inc("maintenance.error"); logError("Retention run failed", error); }), 24 * 60 * 60 * 1000).unref();
 
 const SWEEP_INTERVAL_MS = 15 * 60_000;
 const SWEEP_WINDOW_MS = 2 * 60 * 60_000;
@@ -285,7 +304,7 @@ async function sweepMissedSignals(windowMs: number) {
         const batch = queue.slice(i, i + SWEEP_EXTRACT_BATCH);
         for (const item of batch) {
           if (item.replyToId) {
-            const ref = await store.getMessage(item.replyToId);
+            const ref = await store.getMessage(guild.id, item.replyToId);
             if (ref) item.replyToContent = `${ref.authorName}: ${ref.content}`;
           }
           // Alias learning must not be live-path-only: naming requests archived
@@ -314,10 +333,10 @@ async function sweepMissedSignals(windowMs: number) {
           // legitimately yielded nothing. A throw anywhere above leaves them
           // 'durable'/'regex', which the no-evidence filter retries next pass.
           await store.setTriageResults(batch.map(item => ({ id: item.event.messageId, result: "extracted" })));
-        } catch (error) { inc("sweep.extract_error"); console.error("Sweep extraction failed", error); }
+        } catch (error) { inc("sweep.extract_error"); logError("Sweep extraction failed", error); }
       }
       inc("sweep.runs");
-    } catch (error) { inc("sweep.error"); console.error(`Missed-signal sweep failed in ${guild.name}`, error); }
+    } catch (error) { inc("sweep.error"); logError(`Missed-signal sweep failed in ${guild.name}`, error); }
   }
 }
 
@@ -328,7 +347,7 @@ client.on(Events.InteractionCreate, async interaction => {
     if (interaction.isButton()) await handleMemoryButton(interaction, store);
   } catch (error) {
     inc("handler.interaction_error");
-    console.error("Interaction handling failed", error);
+    logError("Interaction handling failed", error);
     // Best-effort user-facing error; ignore failures (already replied/expired).
     try {
       if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
@@ -341,7 +360,7 @@ client.on(Events.InteractionCreate, async interaction => {
 client.on(Events.MessageCreate, message => {
   // Outer catch lives here, not inline: an unhandled rejection in a listener
   // crashes the process, so every failure mode lands in this log instead.
-  handleMessage(message).catch(error => { inc("handler.message_error"); console.error("Message handling failed", error); });
+  handleMessage(message).catch(error => { inc("handler.message_error"); logError("Message handling failed", error); });
 });
 
 // Edits update the archive row; the extraction-time snapshot in memory_evidence
@@ -352,7 +371,7 @@ client.on(Events.MessageUpdate, (_old, message) => {
   if (!message.guild || !message.content?.trim()) return;
   if (config.guildId && message.guild.id !== config.guildId) return;
   store.updateMessageContent(message.guild.id, message.id, message.content)
-    .catch(error => { inc("handler.message_error"); console.error("Message update handling failed", error); });
+    .catch(error => { inc("handler.message_error"); logError("Message update handling failed", error); });
 });
 
 // Deletes remove the raw row (so the sweep never extracts deleted content)
@@ -364,7 +383,7 @@ client.on(Events.MessageDelete, message => {
   // A deleted question is no longer stranded — drop any pending proactive arm.
   proactive.cancelPending(`${message.guild.id}:${message.channelId}`, message.id);
   store.deleteMessage(message.guild.id, message.id)
-    .catch(error => { inc("handler.message_error"); console.error("Message delete handling failed", error); });
+    .catch(error => { inc("handler.message_error"); logError("Message delete handling failed", error); });
 });
 
 // Reactions are observable signals only — the bot never places them. A
@@ -381,7 +400,7 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
     const key = `${msg.guildId}:${msg.channelId}`;
     if (proactive.isProactiveTarget(msg.id)) proactive.observeEngagement(msg.id);
     else proactive.cancelPending(key, msg.id);
-  } catch (error) { inc("handler.reaction_error"); console.error("Reaction handling failed", error); }
+  } catch (error) { inc("handler.reaction_error"); logError("Reaction handling failed", error); }
 });
 
 // Alias maps are shared per guild rather than built per message — the same map
@@ -443,7 +462,7 @@ async function fireProactive(key: string, messageId: string): Promise<void> {
   if (!proposal) { inc("proactive.gated"); return; }
   const clean = scrubMentions(proposal.answer, names);
   if (!clean) return;
-  const sent = await question.reply({ content: clean, allowedMentions: { repliedUser: false } });
+  const sent = await question.reply({ content: clean, allowedMentions: { parse: [], repliedUser: false } });
   proactive.recordFire(key);
   proactive.noteSent(key, sent.id);
   // Proactive speech counts toward share-of-voice like any other reply — an
@@ -501,7 +520,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   const savedMemoryIds: number[] = [];
   let replyToContent: string | undefined;
   if (replyToId) {
-    const ref = await store.getMessage(replyToId);
+    const ref = await store.getMessage(event.guildId, replyToId);
     if (ref) replyToContent = `${ref.authorName}: ${ref.content}`;
     else {
       // Reply target isn't archived (bot message that predates this, pre-boot
@@ -522,7 +541,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
         const d = await brain.describeImage({ url: a.url, contextText: event.content, maxBytes: config.imageMaxBytes }, config.visionModel!, visionClient);
         inc("vision.described");
         return d.description;
-      } catch (error) { inc("vision.error"); console.error("Image describe failed", error); return undefined; }
+      } catch (error) { inc("vision.error"); logError("Image describe failed", error); return undefined; }
     })).then(list => list.filter((d): d is string => !!d));
   let imageDescs: Promise<string[]> | undefined;
   const getImageDescriptions = () => (imageDescs ??= describeImages(images));
@@ -572,20 +591,20 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
       // nothing — without this a zero-yield regex message gets one redundant
       // sweep pass before ingest-side marking would catch it.
       await store.setTriageResults([{ id: event.messageId, result: "extracted" }]);
-    } catch (error) { inc("llm.extract_error"); console.error("Memory extraction failed", error); }
+    } catch (error) { inc("llm.extract_error"); logError("Memory extraction failed", error); }
   }
   // Contest detection: bot-addressed denials/corrections update the memories they target
   if (settings.memoryEnabled) {
     try {
       await runContestCheck(event, brain, store, client.user!.id, config.contestModel ?? config.model);
-    } catch (error) { inc("contest.error"); console.error("Contest check failed", error); }
+    } catch (error) { inc("contest.error"); logError("Contest check failed", error); }
   }
   // v0.2: event detection pipeline (runs regardless of whether memories were extracted,
   // so back-references and reply chains are tracked even for ordinary messages)
   if (settings.memoryEnabled) {
     try {
       await pipeline.process(event, savedMemoryIds, eventStore, store, brain, replyToId);
-    } catch (error) { inc("pipeline.error"); console.error("Event pipeline failed", error); }
+    } catch (error) { inc("pipeline.error"); logError("Event pipeline failed", error); }
   }
 
   const key = `${event.guildId}:${event.channelId}`;
@@ -699,7 +718,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     const reply = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, relationships, config.replyModel, toolsOn, client.user!.id, { guildName: message.guild.name, ownerName, botName: message.guild.members.me?.displayName ?? client.user!.username }, toolCtx, imageContext);
     const clean = reply ? scrubMentions(reply, lookups.names) : "";
     if (clean) {
-      const sent = await message.reply({ content: clean, allowedMentions: { repliedUser: false } });
+      const sent = await message.reply({ content: clean, allowedMentions: { parse: [], repliedUser: false } });
       engagement.noteReply(key); inc("reply.sent");
       if (engaged && !event.mentionsBot) inc("reply.engaged");
       // Archive the bot's own line so the transcript carries its voice and
@@ -713,7 +732,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
       // never a memory source — keep it out of the sweep's extraction set.
       await store.setTriageResults([{ id: sent.id, result: "noise" }]);
     }
-  } catch (error) { inc("llm.reply_error"); console.error("Reply generation failed", error); }
+  } catch (error) { inc("llm.reply_error"); logError("Reply generation failed", error); }
 }
 
 // Graceful shutdown — close the Discord socket and the pg pool cleanly so

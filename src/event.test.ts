@@ -99,9 +99,9 @@ test("EventStore: attachMessage and attachMemory link records", async () => {
   try {
     const { store, eventStore } = await makeStore(sql);
     const ev = await eventStore.createEvent({ guildId: guild, channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(), participants: [] });
-    await eventStore.attachMessage(ev.id, "msg-001");
+    await eventStore.attachMessage(guild, ev.id, "msg-001");
     const saved = await store.saveMemory(msg("mem-001", "I love Arsenal"), mem("Alice likes Arsenal"));
-    await eventStore.attachMemory(ev.id, saved.id, "generated");
+    await eventStore.attachMemory(guild, ev.id, saved.id, "generated");
     const fresh = (await eventStore.getEvent(guild, ev.id))!;
     assert.ok(fresh.messageIds.includes("msg-001"));
     assert.ok(fresh.memoryIds.includes(saved.id));
@@ -114,7 +114,7 @@ test("EventStore: openEvents returns only unclosed events in the channel", async
     const { eventStore } = await makeStore(sql);
     const ev1 = await eventStore.createEvent({ guildId: guild, channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(), participants: [] });
     await eventStore.createEvent({ guildId: guild, channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(), participants: [] });
-    await eventStore.closeEvent(ev1.id);
+    await eventStore.closeEvent(guild, ev1.id);
     const open = await eventStore.openEvents(guild, channel);
     assert.equal(open.length, 1);
     assert.notEqual(open[0].id, ev1.id);
@@ -126,8 +126,8 @@ test("EventStore: incrementReferenceCount increments correctly", async () => {
   try {
     const { eventStore } = await makeStore(sql);
     const ev = await eventStore.createEvent({ guildId: guild, channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(), participants: [] });
-    assert.equal(await eventStore.incrementReferenceCount(ev.id), 1);
-    assert.equal(await eventStore.incrementReferenceCount(ev.id), 2);
+    assert.equal(await eventStore.incrementReferenceCount(guild, ev.id), 1);
+    assert.equal(await eventStore.incrementReferenceCount(guild, ev.id), 2);
   } finally { await sql.end(); }
 });
 
@@ -136,7 +136,7 @@ test("EventStore: updateSignificance promotes tier to event", async () => {
   try {
     const { eventStore } = await makeStore(sql);
     const ev = await eventStore.createEvent({ guildId: guild, channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(), participants: [] });
-    await eventStore.updateSignificance(ev.id, 0.82, "event", "The Bet", "Tom lost £20 betting on Arsenal.");
+    await eventStore.updateSignificance(guild, ev.id, 0.82, "event", "The Bet", "Tom lost £20 betting on Arsenal.");
     const fresh = (await eventStore.getEvent(guild, ev.id))!;
     assert.equal(fresh.tier, "event");
     assert.equal(fresh.title, "The Bet");
@@ -150,8 +150,8 @@ test("EventStore: eventsForMemory returns linked events", async () => {
     const { store, eventStore } = await makeStore(sql);
     const ev = await eventStore.createEvent({ guildId: guild, channelId: channel, title: "Test", summary: "Test", significance: 0.7, tier: "event", occurredAt: new Date(), participants: [] });
     const saved = await store.saveMemory(msg("m1", "I support Arsenal"), mem("Alice supports Arsenal"));
-    await eventStore.attachMemory(ev.id, saved.id, "generated");
-    const linked = await eventStore.eventsForMemory(saved.id);
+    await eventStore.attachMemory(guild, ev.id, saved.id, "generated");
+    const linked = await eventStore.eventsForMemory(guild, saved.id);
     assert.equal(linked.length, 1);
     assert.equal(linked[0].id, ev.id);
   } finally { await sql.end(); }
@@ -165,7 +165,7 @@ test("pipeline: reply-chain message is attached to open event without LLM", asyn
     const { store, eventStore } = await makeStore(sql);
     const pipeline = new EventPipeline();
     const ev = await eventStore.createEvent({ guildId: guild, channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(Date.now() - 60_000), participants: [] });
-    await eventStore.attachMessage(ev.id, "msg-001");
+    await eventStore.attachMessage(guild, ev.id, "msg-001");
     const saved = await store.saveMemory(msg("msg-002", "I love Arsenal"), mem("Alice likes Arsenal"));
     let llmCalled = false;
     const watchBrain = { assessContinuity: async () => { llmCalled = true; return { action: "new" as const }; }, classifyEvent: stubBrain().classifyEvent } as unknown as Brain;
@@ -231,7 +231,7 @@ test("pipeline: ambiguous continuity sends the event's recent messages to the LL
     const pipeline = new EventPipeline();
     await store.recordMessage(msg("em-1", "Tom just lost £20 on the Arsenal bet"));
     const ev = await eventStore.createEvent({ guildId: guild, channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(Date.now() - 60_000), participants: [{ userId: "user2", userName: "Tom", role: "subject" }] });
-    await eventStore.attachMessage(ev.id, "em-1");
+    await eventStore.attachMessage(guild, ev.id, "em-1");
     const seen: Array<Array<{ id: number; recentMessages: Array<{ authorName: string; content: string }> }>> = [];
     const brain = {
       assessContinuity: async (_e: MessageEvent, events: Array<{ id: number; recentMessages: Array<{ authorName: string; content: string }> }>) => {
@@ -249,7 +249,89 @@ test("pipeline: ambiguous continuity sends the event's recent messages to the LL
   } finally { await sql.end(); }
 });
 
-// ── 7. Pipeline — classifyEvent receives the event's messages ────────────────
+// ── 7. Cross-tenant isolation — LLM-chosen IDs and guild predicates ───────────
+
+test("pipeline: LLM-chosen event ID outside the candidate set degrades to new", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store, eventStore } = await makeStore(sql);
+    const pipeline = new EventPipeline();
+    const ev = await eventStore.createEvent({ guildId: guild, channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(Date.now() - 60_000), participants: [{ userId: "user2", userName: "Tom", role: "subject" }] });
+    const foreign = await eventStore.createEvent({ guildId: "other-guild", channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(), participants: [] });
+    // Brain answers with an event ID never among its candidates (hallucinated serial).
+    const brain = {
+      assessContinuity: async () => ({ action: "attach" as const, eventId: foreign.id }),
+      classifyEvent: stubBrain().classifyEvent,
+    } as unknown as Brain;
+    // Participant + keyword overlap with the open event → ambiguous → LLM path.
+    const m = msg("m-x", "remember when Tom did the Arsenal thing again");
+    const saved = await store.saveMemory(m, mem("Tom did it again"));
+    await pipeline.process(m, [saved.id], eventStore, store, brain);
+    const foreignFresh = (await eventStore.getEvent("other-guild", foreign.id))!;
+    assert.equal(foreignFresh.messageIds.length, 0, "foreign event must not receive the message");
+    assert.equal(foreignFresh.memoryIds.length, 0, "foreign event must not receive the memory");
+    const localFresh = (await eventStore.getEvent(guild, ev.id))!;
+    assert.equal(localFresh.messageIds.length, 0, "candidate event should not attach either — degrades to new");
+  } finally { await sql.end(); }
+});
+
+test("pipeline: bridge decision keeps only candidate IDs", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store, eventStore } = await makeStore(sql);
+    const pipeline = new EventPipeline();
+    const ev1 = await eventStore.createEvent({ guildId: guild, channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(Date.now() - 60_000), participants: [{ userId: "user2", userName: "Tom", role: "subject" }] });
+    const foreign = await eventStore.createEvent({ guildId: "other-guild", channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(), participants: [] });
+    // Bridge spanning a valid candidate and a foreign id → single survivor → attach.
+    const brain = {
+      assessContinuity: async () => ({ action: "bridge" as const, eventIds: [ev1.id, foreign.id] }),
+      classifyEvent: stubBrain().classifyEvent,
+    } as unknown as Brain;
+    const m = msg("m-b", "remember when Tom did the Arsenal thing again");
+    await pipeline.process(m, [], eventStore, store, brain);
+    const foreignFresh = (await eventStore.getEvent("other-guild", foreign.id))!;
+    assert.equal(foreignFresh.referenceCount, 0, "foreign event must not gain a reference");
+    assert.equal(foreignFresh.messageIds.length, 0, "foreign event must not receive the message");
+  } finally { await sql.end(); }
+});
+
+test("EventStore: writes with the wrong guildId are no-ops", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store, eventStore } = await makeStore(sql);
+    const ev = await eventStore.createEvent({ guildId: "other-guild", channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(), participants: [] });
+    const saved = await store.saveMemory(msg("m-g", "I love Arsenal"), mem("Alice likes Arsenal"));
+    await eventStore.attachMessage(guild, ev.id, "m-g");
+    await eventStore.attachMemory(guild, ev.id, saved.id);
+    await eventStore.addParticipant(guild, ev.id, "u9", "Mallory");
+    assert.equal(await eventStore.incrementReferenceCount(guild, ev.id), 0);
+    await eventStore.closeEvent(guild, ev.id);
+    const fresh = (await eventStore.getEvent("other-guild", ev.id))!;
+    assert.equal(fresh.messageIds.length, 0);
+    assert.equal(fresh.memoryIds.length, 0);
+    assert.equal(fresh.participants.length, 0);
+    assert.equal(fresh.referenceCount, 0);
+    assert.equal(fresh.closedAt, null);
+    // memories.event_id must not point at a foreign event either
+    const row = await store.getMemory(guild, saved.id);
+    assert.equal(row?.eventId, null);
+  } finally { await sql.end(); }
+});
+
+test("MemoryStore: messagesByIds and getMessage never cross guilds", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    await store.recordMessage(msg("m-same", "same guild message"));
+    await store.recordMessage({ ...msg("m-foreign", "foreign guild message"), guildId: "other-guild" });
+    const rows = await store.messagesByIds(guild, ["m-same", "m-foreign"]);
+    assert.deepEqual(rows.map(r => r.content), ["same guild message"]);
+    assert.equal(await store.getMessage(guild, "m-foreign"), undefined);
+    assert.ok(await store.getMessage("other-guild", "m-foreign"));
+  } finally { await sql.end(); }
+});
+
+// ── 8. Pipeline — classifyEvent receives the event's messages ────────────────
 
 test("pipeline: maintainEvents passes the event's archived messages to classifyEvent", async () => {
   const sql = makeTestSql();
@@ -259,9 +341,9 @@ test("pipeline: maintainEvents passes the event's archived messages to classifyE
     await store.recordMessage(msg("em-1", "I can't believe Tom bet £20 on Arsenal"));
     await store.recordMessage(msg("em-2", "he lost it in ten minutes"));
     const ev = await eventStore.createEvent({ guildId: guild, channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(Date.now() - 60_000), participants: [] });
-    await eventStore.attachMessage(ev.id, "em-1");
-    await eventStore.attachMessage(ev.id, "em-2");
-    await eventStore.closeEvent(ev.id);
+    await eventStore.attachMessage(guild, ev.id, "em-1");
+    await eventStore.attachMessage(guild, ev.id, "em-2");
+    await eventStore.closeEvent(guild, ev.id);
     const capturedClusters: Array<{ messages: Array<{ authorName: string; content: string }> }> = [];
     const brain = {
       assessContinuity: async () => ({ action: "new" as const }),

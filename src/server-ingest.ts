@@ -10,6 +10,7 @@ import { ProfileStore } from "./profiles.js";
 import { buildAliasMap } from "./entity-resolution.js";
 import { persistExtraction } from "./persist-extraction.js";
 import { sleep, withRetry } from "./retry.js";
+import { logError } from "./secrets.js";
 import type { MessageEvent } from "./types.js";
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -93,7 +94,7 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
         if (!(await store.hasEvidence(msg.id))) {
           let replyToContent: string | undefined;
           if (replyToId) {
-            const ref = await store.getMessage(replyToId);
+            const ref = await store.getMessage(guild.id, replyToId);
             if (ref) replyToContent = `${ref.authorName}: ${ref.content}`;
           }
           toExtract.push({ event, replyToId, replyToContent });
@@ -105,7 +106,7 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
         // mid-run). 'extracted' marks don't reach here — they skip above.
         let replyToContent: string | undefined;
         if (replyToId) {
-          const ref = await store.getMessage(replyToId);
+          const ref = await store.getMessage(guild.id, replyToId);
           if (ref) replyToContent = `${ref.authorName}: ${ref.content}`;
         }
         toExtract.push({ event, replyToId, replyToContent });
@@ -124,7 +125,7 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
       if (after > before) eventsCreated++;
       if (llmUsed) await sleep(EVENT_DELAY_MS);
     } catch (err) {
-      console.error(`  [event pipeline error] msg ${event.messageId}:`, (err as Error).message.slice(0, 100));
+      logError(`  [event pipeline error] msg ${event.messageId}:`, err);
     }
   }
 
@@ -143,7 +144,7 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
     try {
       batch = await channel.messages.fetch(options);
     } catch (err) {
-      console.error("Fetch failed:", (err as Error).message.slice(0, 100));
+      logError("Fetch failed:", err);
       await sleep(5000);
       continue;
     }
@@ -179,7 +180,7 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
           durableFound++;
           // Resolve reply context the same way archiveAndFilter does
           if (item.replyToId) {
-            const ref = await store.getMessage(item.replyToId);
+            const ref = await store.getMessage(guild.id, item.replyToId);
             if (ref) item.replyToContent = `${ref.authorName}: ${ref.content}`;
           }
           toExtract.push(item);
@@ -188,7 +189,7 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
       await store.setTriageResults(marks);
     } catch (err) {
       llmErrors++;
-      console.error(`  [triage error] batch ${i / TRIAGE_BATCH_SIZE + 1}:`, (err as Error).message.slice(0, 120));
+      logError(`  [triage error] batch ${i / TRIAGE_BATCH_SIZE + 1}:`, err);
     }
     const done = Math.min(i + TRIAGE_BATCH_SIZE, toTriage.length);
     if (done % 100 === 0 || done === toTriage.length) {
@@ -248,7 +249,7 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
       await store.setTriageResults(batch.map(item => ({ id: item.event.messageId, result: "extracted" })));
     } catch (err) {
       llmErrors++;
-      console.error(`  [batch extraction error] batch ${batchCalls}:`, (err as Error).message.slice(0, 120));
+      logError(`  [batch extraction error] batch ${batchCalls}:`, err);
       for (const item of batch) savedIdsByMessage.set(item.event.messageId, []);
     }
     const done = Math.min(i + LLM_BATCH_SIZE, toExtract.length);
@@ -300,13 +301,13 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
         }
       } catch (err) {
         llmErrors++;
-        console.error(`  [verify error] batch ${i / TRIAGE_BATCH_SIZE + 1}:`, (err as Error).message.slice(0, 120));
+        logError(`  [verify error] batch ${i / TRIAGE_BATCH_SIZE + 1}:`, err);
       }
       await sleep(TRIAGE_DELAY_MS);
     }
     console.log(`  verification: ${vPromoted} promoted | ${vFlagged} flagged | ${verifiable.length - vPromoted - vFlagged} unchanged`);
   } catch (err) {
-    console.error("Verification failed:", (err as Error).message.slice(0, 120));
+    logError("Verification failed:", err);
   }
 
   // Contest sweep — bot-addressed denials/corrections update the memories they target
@@ -321,12 +322,12 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
         if (r.contests || r.confirms) await sleep(EVENT_DELAY_MS);
       } catch (err) {
         llmErrors++;
-        console.error(`  [contest error] msg ${msg.id}:`, (err as Error).message.slice(0, 120));
+        logError(`  [contest error] msg ${msg.id}:`, err);
       }
     }
     if (contests || confirms) console.log(`  contest sweep: ${contests} contested | ${confirms} confirmed`);
   } catch (err) {
-    console.error("Contest sweep failed:", (err as Error).message.slice(0, 120));
+    logError("Contest sweep failed:", err);
   }
 
   // Rebuild relationship edges from literal-verdicted observations — ingest
@@ -336,7 +337,7 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
     const edgeCount = await store.recomputeEdges(guild.id);
     console.log(`Relationship edges: ${edgeCount}`);
   } catch (err) {
-    console.error("Edge recompute failed:", (err as Error).message.slice(0, 120));
+    logError("Edge recompute failed:", err);
   }
 
   // Semantic dedup — LLM finds rephrased duplicates across each member's memory
@@ -367,7 +368,7 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
     }
   } catch (err) {
     llmErrors++;
-    console.error("Dedup pass failed:", (err as Error).message.slice(0, 120));
+    logError("Dedup pass failed:", err);
   }
 
   // Build per-chatter profile cards — bounded to opted-in members by
@@ -380,7 +381,7 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
     profilesBuilt = profiles.built;
     console.log(`Profiles: ${profiles.built} built | ${profiles.unchanged} unchanged | ${profiles.considered} considered`);
   } catch (err) {
-    console.error("Profile build failed:", (err as Error).message.slice(0, 120));
+    logError("Profile build failed:", err);
   }
 
   return { total, archived, durableFound, batchCalls, memoriesSaved, relationshipsRecorded, eventsCreated, llmErrors, profilesBuilt };

@@ -89,12 +89,12 @@ test("describeImage throws on fetch failure and oversized bodies", async () => {
   const restore = stubFetch(() => new Response("nope", { status: 404 }));
   try {
     const brain = new Brain("k", "m", undefined, stubClient({}));
-    await assert.rejects(brain.describeImage({ url: "u" }, "m"), /image fetch failed/);
+    await assert.rejects(brain.describeImage({ url: "https://cdn.discordapp.com/x.png" }, "m"), /image fetch failed/);
   } finally { restore(); }
   const restore2 = stubFetch(() => new Response(Buffer.alloc(100), { headers: { "content-length": "99999999" } }));
   try {
     const brain = new Brain("k", "m", undefined, stubClient({}));
-    await assert.rejects(brain.describeImage({ url: "u", maxBytes: 1000 }, "m"), /over byte cap/);
+    await assert.rejects(brain.describeImage({ url: "https://cdn.discordapp.com/x.png", maxBytes: 1000 }, "m"), /over byte cap/);
   } finally { restore2(); }
 });
 
@@ -104,7 +104,7 @@ test("describeImage uses the override client when a second provider is passed", 
     const main: { chat?: any } = {};
     const other: { chat?: any } = {};
     const brain = new Brain("k", "m", undefined, stubClient(main));
-    await brain.describeImage({ url: "u" }, "vision-model", stubClient(other));
+    await brain.describeImage({ url: "https://cdn.discordapp.com/x.png" }, "vision-model", stubClient(other));
     assert.ok(other.chat, "override client should receive the call");
     assert.equal(main.chat, undefined, "main client should not be called");
   } finally { restore(); }

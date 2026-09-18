@@ -156,10 +156,15 @@ export function demangleMentions(content: string, names: Map<string, string>): s
  * Neutralize mention markup in model output before posting: known ids become
  * plain `@Name` text (allowedMentions already prevents pings); unknown ids —
  * e.g. hallucinated snowflakes — are stripped with whitespace cleaned up.
+ * Role mentions, @everyone, and @here are defused unconditionally — model
+ * output must never be able to mass-ping even if a caller forgets
+ * allowedMentions.
  */
 export function scrubMentions(text: string, names: Map<string, string>): string {
   return text
     .replace(MENTION_TOKEN, (_m, id) => (names.has(id) ? `@${names.get(id)}` : ""))
+    .replace(/<@&\d+>/g, "")
+    .replace(/@(everyone|here)/g, "$1")
     .replace(/[ \t]{2,}/g, " ")
     .replace(/\s+([,.!?])/g, "$1")
     .trim();

@@ -79,11 +79,11 @@ export class EventStore {
   }
 
   /** All events that a given memory is linked to. */
-  async eventsForMemory(memoryId: number): Promise<StoredEvent[]> {
+  async eventsForMemory(guildId: string, memoryId: number): Promise<StoredEvent[]> {
     const rows = await this.sql<EventRow[]>`
       SELECT e.id, e.guild_id, e.channel_id, e.title, e.summary, e.significance, e.tier,
              e.occurred_at, e.closed_at, e.reference_count, e.created_at, e.updated_at
-      FROM events e JOIN event_memories em ON em.event_id = e.id WHERE em.memory_id = ${memoryId}
+      FROM events e JOIN event_memories em ON em.event_id = e.id WHERE em.memory_id = ${memoryId} AND e.guild_id = ${guildId}
     `;
     return Promise.all(rows.map(r => this.hydrate(r)));
   }
@@ -175,32 +175,52 @@ export class EventStore {
     }) as StoredEvent;
   }
 
-  async attachMessage(eventId: number, messageId: string): Promise<void> {
-    await this.sql`INSERT INTO event_messages (event_id, message_id) VALUES (${eventId}, ${messageId}) ON CONFLICT (event_id, message_id) DO NOTHING`;
-    await this.sql`UPDATE events SET updated_at = NOW() WHERE id = ${eventId}`;
+  // Event IDs are serial and flow in from LLM continuity decisions — every
+  // write below requires guildId and fails closed for foreign or nonexistent
+  // events so an untrusted ID can never mutate another tenant's rows.
+
+  async attachMessage(guildId: string, eventId: number, messageId: string): Promise<void> {
+    await this.sql`
+      INSERT INTO event_messages (event_id, message_id)
+      SELECT ${eventId}, ${messageId}
+      WHERE EXISTS (SELECT 1 FROM events WHERE id = ${eventId} AND guild_id = ${guildId})
+      ON CONFLICT (event_id, message_id) DO NOTHING
+    `;
+    await this.sql`UPDATE events SET updated_at = NOW() WHERE id = ${eventId} AND guild_id = ${guildId}`;
   }
 
-  async attachMemory(eventId: number, memoryId: number, linkType: "generated" | "referenced" | "retroactive" = "generated"): Promise<void> {
-    await this.sql`INSERT INTO event_memories (event_id, memory_id, link_type) VALUES (${eventId}, ${memoryId}, ${linkType}) ON CONFLICT (event_id, memory_id) DO NOTHING`;
-    await this.sql`UPDATE memories SET event_id = ${eventId} WHERE id = ${memoryId} AND event_id IS NULL`;
-    await this.sql`UPDATE events SET updated_at = NOW() WHERE id = ${eventId}`;
+  async attachMemory(guildId: string, eventId: number, memoryId: number, linkType: "generated" | "referenced" | "retroactive" = "generated"): Promise<void> {
+    await this.sql`
+      INSERT INTO event_memories (event_id, memory_id, link_type)
+      SELECT ${eventId}, ${memoryId}, ${linkType}
+      WHERE EXISTS (SELECT 1 FROM events WHERE id = ${eventId} AND guild_id = ${guildId})
+      ON CONFLICT (event_id, memory_id) DO NOTHING
+    `;
+    await this.sql`UPDATE memories SET event_id = ${eventId} WHERE id = ${memoryId} AND guild_id = ${guildId} AND event_id IS NULL
+      AND EXISTS (SELECT 1 FROM events WHERE id = ${eventId} AND guild_id = ${guildId})`;
+    await this.sql`UPDATE events SET updated_at = NOW() WHERE id = ${eventId} AND guild_id = ${guildId}`;
   }
 
-  async addParticipant(eventId: number, userId: string, userName: string, role: ParticipantRole = "participant"): Promise<void> {
-    await this.sql`INSERT INTO event_participants (event_id, user_id, user_name, role) VALUES (${eventId}, ${userId}, ${userName}, ${role}) ON CONFLICT (event_id, user_id) DO NOTHING`;
+  async addParticipant(guildId: string, eventId: number, userId: string, userName: string, role: ParticipantRole = "participant"): Promise<void> {
+    await this.sql`
+      INSERT INTO event_participants (event_id, user_id, user_name, role)
+      SELECT ${eventId}, ${userId}, ${userName}, ${role}
+      WHERE EXISTS (SELECT 1 FROM events WHERE id = ${eventId} AND guild_id = ${guildId})
+      ON CONFLICT (event_id, user_id) DO NOTHING
+    `;
   }
 
-  async closeEvent(eventId: number): Promise<void> {
-    await this.sql`UPDATE events SET closed_at = NOW(), updated_at = NOW() WHERE id = ${eventId} AND closed_at IS NULL`;
+  async closeEvent(guildId: string, eventId: number): Promise<void> {
+    await this.sql`UPDATE events SET closed_at = NOW(), updated_at = NOW() WHERE id = ${eventId} AND guild_id = ${guildId} AND closed_at IS NULL`;
   }
 
-  async updateSignificance(eventId: number, significance: number, tier: EventTier, title: string, summary: string): Promise<void> {
-    await this.sql`UPDATE events SET significance = ${significance}, tier = ${tier}, title = ${title}, summary = ${summary}, updated_at = NOW() WHERE id = ${eventId}`;
+  async updateSignificance(guildId: string, eventId: number, significance: number, tier: EventTier, title: string, summary: string): Promise<void> {
+    await this.sql`UPDATE events SET significance = ${significance}, tier = ${tier}, title = ${title}, summary = ${summary}, updated_at = NOW() WHERE id = ${eventId} AND guild_id = ${guildId}`;
   }
 
-  async incrementReferenceCount(eventId: number): Promise<number> {
-    await this.sql`UPDATE events SET reference_count = reference_count + 1, updated_at = NOW() WHERE id = ${eventId}`;
-    const rows = await this.sql<[{ reference_count: number }]>`SELECT reference_count FROM events WHERE id = ${eventId}`;
+  async incrementReferenceCount(guildId: string, eventId: number): Promise<number> {
+    await this.sql`UPDATE events SET reference_count = reference_count + 1, updated_at = NOW() WHERE id = ${eventId} AND guild_id = ${guildId}`;
+    const rows = await this.sql<[{ reference_count: number }]>`SELECT reference_count FROM events WHERE id = ${eventId} AND guild_id = ${guildId}`;
     return rows[0]?.reference_count ?? 0;
   }
 

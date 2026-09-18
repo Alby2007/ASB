@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege — no job needs more than read access to the repo contents.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -35,18 +39,32 @@ jobs:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/asb_test
 
   # Red builds never reach the server — deploy only runs on green pushes to main.
+  # `environment: production` lets the operator attach required reviewers in
+  # repo settings so a push alone can't ship without approval.
   deploy:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
     runs-on: ubuntu-latest
     concurrency:
       group: deploy
       cancel-in-progress: false
     steps:
-      - uses: webfactory/ssh-agent@v0.9.0
+      # Pinned to the v0.9.0 tag's commit — third-party actions referenced by
+      # mutable tags are a supply-chain risk.
+      - uses: webfactory/ssh-agent@dc588b651fe13675774614f8e6a936a468676387
         with:
           ssh-private-key: ${{ secrets.ORACLE_SSH_KEY }}
+      # Pinned host key instead of accept-new: a MITM on first contact can no
+      # longer substitute their own key. ORACLE_HOST_KEY is the output of
+      # `ssh-keyscan 140.238.67.40` — if it's unset the strict check fails
+      # closed and the deploy cannot run.
+      - name: Trust the deployment host key
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "${{ secrets.ORACLE_HOST_KEY }}" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
       - name: Pull and restart on Oracle
         run: >-
-          ssh -o StrictHostKeyChecking=accept-new opc@140.238.67.40
+          ssh -o StrictHostKeyChecking=yes opc@140.238.67.40
           "cd ~/ASB && git pull --ff-only && pm2 restart asb --update-env"

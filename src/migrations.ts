@@ -15,8 +15,19 @@ async function hasColumn(sql: Sql, table: string, column: string): Promise<boole
   return rows.length > 0;
 }
 
+// sql.unsafe can't be reached with anything but a safe shape: table and column
+// are bare identifiers, the definition is a word/number/quote/paren character
+// class — no semicolons, dashes, slashes, or quotes that could smuggle a second
+// statement. Anything else throws before touching the database.
+const IDENT_RE = /^[a-z][a-z0-9_]*$/;
+const COLUMN_DEF_RE = /^[a-z_][a-z0-9_]*(\s+[A-Za-z0-9_().']+)+$/;
+
 async function addColumn(sql: Sql, table: string, definition: string): Promise<void> {
+  if (!IDENT_RE.test(table)) throw new Error(`migration table name rejected: ${table}`);
   const column = definition.trim().split(/\s+/)[0];
+  if (!COLUMN_DEF_RE.test(definition.trim()) || !IDENT_RE.test(column)) {
+    throw new Error(`migration column definition rejected: ${definition}`);
+  }
   if (!(await hasColumn(sql, table, column))) {
     await sql.unsafe(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
   }

@@ -1,15 +1,15 @@
-import 'dotenv/config';
-import { MemoryStore } from './src/database.ts';
-import { Brain } from './src/brain.ts';
-import { withRetry } from './src/retry.ts';
+import { MemoryStore } from '../src/database.ts';
+import { withRetry } from '../src/retry.ts';
+import { guildBrain, requireGuildId } from './_lib.mjs';
 
+const GUILD_ID = requireGuildId();
 const store = await MemoryStore.create();
-const brain = new Brain(process.env.GROQ_API_KEY, process.env.GROQ_MODEL, process.env.GROQ_BASE_URL ?? 'https://api.groq.com/openai/v1');
+const brain = await guildBrain(store, GUILD_ID);
 const model = process.env.VERIFY_MODEL ?? process.env.INGEST_MODEL ?? 'qwen/qwen3.8-27b';
 const BATCH = 5;
 const DELAY_MS = 2000;
 
-const items = await store.listVerifiableCandidates(process.env.GUILD_ID);
+const items = await store.listVerifiableCandidates(GUILD_ID);
 console.log(`verifying ${items.length} candidates (model: ${model})...`);
 
 let promoted = 0, flagged = 0, unchanged = 0;

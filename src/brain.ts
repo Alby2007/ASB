@@ -1,9 +1,10 @@
 import OpenAI from "openai";
 import type { Memory } from "./database.js";
-import { executeTool, replyToolDefs } from "./tools.js";
+import { executeTool, isSafeUrl, readBodyCapped, replyToolDefs } from "./tools.js";
 import type { AttributeProposal, ContinuityDecision, Decision, DossierSection, ExtractionResult, MemoryCandidate, MessageEvent, PairContext, ProfileSynthesis, ProfileSynthesisInput, StoredEvent, VerificationVerdict } from "./types.js";
 import type { ToolCtx } from "./lookup-tools.js";
 import { formatPairContext, formatReplyProfile, type ReplyProfile } from "./reply-format.js";
+import { redactSecrets, registerSecret } from "./secrets.js";
 
 // formatPairContext / formatReplyProfile live in reply-format.ts so the
 // internal lookup tools render people/pairs identically to the prompt sections.
@@ -20,6 +21,7 @@ export interface LlmClient {
 export class Brain {
   private client: LlmClient;
   constructor(apiKey: string, private model: string, baseURL?: string, client?: LlmClient) {
+    registerSecret(apiKey); // scrubbed out of all error logs from here on
     this.client = client ?? new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
   }
 
@@ -60,6 +62,7 @@ export class Brain {
     const imgContext = imageContext ? `\n\n${imageContext}. This is your own observation of an attachment the author posted, not the author's words — prefer direct_observation or uncertain_inference over explicit_fact, and do not attribute depicted people to named individuals without textual naming.` : "";
     const response = await this.client.responses.create({
       model: this.model,
+      max_output_tokens: 2048, // extraction output is bounded — cap spend on injected verbosity
       input: `Extract only durable, useful memories from this Discord message. Do not infer sensitive traits, diagnoses, private information, or insults. A single casual message rarely merits memory. Classify the language as evidenceType and its relation to the proposed memory as effect, but do not decide lifecycle transitions. Provide language interpretation only; confidence, importance, and explicitness will be calculated deterministically by the database.\n\nsubjectId rules: use the Author ID below when the memory is about the message author. If the memory is about a different person mentioned in the message, use their Discord user ID if it appears in the message as a mention (<@ID>). If the subject cannot be resolved to a Discord user ID, use "unknown". Never use descriptive labels or slugs.\nsubjectName: the subject's name exactly as written in the message (empty string if none).\n\nQuoted text: if the message's first-person text describes someone other than the author — e.g. "I am <other person's name>", a pasted bio or profile card, or clearly copied/generated text — do not attribute it to the author. Attribute it to the named person via subjectName, or skip it entirely if it reads as pasted content rather than a genuine statement.\n\nAlso emit relationship assertions when the message describes a durable interpersonal dynamic between two people (friendship, conflict, dating, rivalry). For each: subjectName (empty string = the message author), otherName, nature (e.g. "close friends", "antagonizes", "dating"), valence from -1 (hostile) to +1 (close), and a short reason.\n\nAuthor ID: ${event.authorId}\nMessage: ${event.content}${replyContext}${noteContext}${imgContext}`,
       text: { format: { type: "json_schema", name: "memory_candidates", strict: true, schema: {
         type: "object", properties: {
@@ -87,14 +90,18 @@ export class Brain {
     // Fetch the attachment ourselves — providers differ on whether image_url
     // dereferences remote URLs (Gemini's compat endpoint doesn't), while every
     // OpenAI-compat API accepts data: URIs. Bytes live only for this call and
-    // are never persisted.
+    // are never persisted. The URL comes from Discord attachment metadata but
+    // still goes through the SSRF guard, and readBody enforces the byte cap
+    // while streaming — a lying Content-Length can't exhaust memory.
+    if (!isSafeUrl(input.url)) throw new Error("image url not allowed");
     const resp = await fetch(input.url, { signal: AbortSignal.timeout(10_000) });
     if (!resp.ok) throw new Error(`image fetch failed: ${resp.status}`);
     const declared = Number(resp.headers.get("content-length") ?? 0);
     if (declared > maxBytes) throw new Error(`image over byte cap: ${declared}`);
     const mime = resp.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
-    const buf = Buffer.from(await resp.arrayBuffer());
-    if (buf.length > maxBytes) throw new Error(`image over byte cap: ${buf.length}`);
+    // Streamed cap — enforces maxBytes as bytes arrive, so a lying or absent
+    // Content-Length can't pull the whole body into memory.
+    const buf = await readBodyCapped(resp, maxBytes);
     const dataUri = `data:${mime};base64,${buf.toString("base64")}`;
     const contextLine = input.contextText?.trim()
       ? ` The sender's own caption was: "${input.contextText.trim()}" — use it only to disambiguate, not as part of the description.`
@@ -795,7 +802,7 @@ BOUNDARIES
         }
         return (msg?.content ?? "").trim().slice(0, 1800);
       } catch (err) {
-        console.warn(`[reply] ${useModel} failed, falling back to ${this.model}:`, (err as Error).message.slice(0, 120));
+        console.warn(`[reply] ${useModel} failed, falling back to ${this.model}:`, redactSecrets((err as Error).message.slice(0, 120)));
       }
     }
 
@@ -829,7 +836,7 @@ BOUNDARIES
         const res = await this.client.chat.completions.create({ model: useModel, messages, temperature: 0.9, ...(lowReasoning ? { reasoning_effort: "low" as const } : {}) });
         return (res.choices[0]?.message?.content ?? "").trim().slice(0, 1800);
       } catch (err) {
-        console.warn(`[reply] tool path failed, falling back to plain reply:`, (err as Error).message.slice(0, 120));
+        console.warn(`[reply] tool path failed, falling back to plain reply:`, redactSecrets((err as Error).message.slice(0, 120)));
       }
     }
 

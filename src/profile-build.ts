@@ -7,6 +7,7 @@ import { buildAliasMap } from "./entity-resolution.js";
 import { persistExtraction } from "./persist-extraction.js";
 import { detectNamingRequest, detectSelfNaming } from "./perception.js";
 import { sleep, withRetry } from "./retry.js";
+import { logError } from "./secrets.js";
 import type { MessageEvent } from "./types.js";
 
 export const PROFILE_BUILD_COOLDOWN_MS = 24 * 60 * 60 * 1000;
@@ -101,13 +102,13 @@ export async function runProfileBuild(
       }
       if (i + VERIFY_BATCH < verifiable.length) await sleep(VERIFY_DELAY_MS);
     }
-  } catch (error) { console.error("Profile-build verification failed", error); }
+  } catch (error) { logError("Profile-build verification failed", error); }
 
-  try { await store.recomputeEdges(guildId); } catch (error) { console.error("Profile-build edge recompute failed", error); }
+  try { await store.recomputeEdges(guildId); } catch (error) { logError("Profile-build edge recompute failed", error); }
 
   try {
     await withRetry(() => profileStore.buildProfiles(guildId, brain, store, eventStore, config.profileModel ?? config.model, { onlyUserId: userId }), 3);
-  } catch (error) { console.error("Profile-build profile pass failed", error); }
+  } catch (error) { logError("Profile-build profile pass failed", error); }
 
   return { scanned: rows.length, memories, relationships };
 }

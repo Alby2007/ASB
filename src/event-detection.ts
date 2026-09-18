@@ -3,6 +3,7 @@ import type { EventStore } from "./events.js";
 import type { MemoryStore } from "./database.js";
 import type { ContinuityDecision, MessageEvent, StoredEvent } from "./types.js";
 import { calculateSignificance } from "./event-significance.js";
+import { logError } from "./secrets.js";
 
 // ── Heuristic pre-filter constants ────────────────────────────────────────────
 
@@ -80,6 +81,28 @@ function scoreOpenEvents(
     .sort((a, b) => b.score - a.score);
 }
 
+/**
+ * Constrain an LLM continuity decision to the candidate events it was actually
+ * shown. The model's output is untrusted: a hallucinated or prompt-injected
+ * event ID must never reach the event tables. Invalid attach/reference IDs
+ * degrade to "new"; bridge keeps only valid IDs (single survivor → attach).
+ */
+function constrainDecision(decision: ContinuityDecision, validIds: Set<number>): ContinuityDecision {
+  switch (decision.action) {
+    case "attach":
+    case "reference":
+      return validIds.has(decision.eventId) ? decision : { action: "new" };
+    case "bridge": {
+      const kept = decision.eventIds.filter(id => validIds.has(id));
+      if (kept.length === 0) return { action: "new" };
+      if (kept.length === 1) return { action: "attach", eventId: kept[0] };
+      return { action: "bridge", eventIds: kept };
+    }
+    default:
+      return { action: "new" };
+  }
+}
+
 // ── EventPipeline ─────────────────────────────────────────────────────────────
 
 export class EventPipeline {
@@ -107,12 +130,12 @@ export class EventPipeline {
     const { decision, llmCalled } = await this.decideContinuity(message, openEvents, memoryStore, brain, replyToMessageId);
 
     if (decision.action === "attach") {
-      await eventStore.attachMessage(decision.eventId, message.messageId);
-      await eventStore.addParticipant(decision.eventId, message.authorId, message.authorName);
-      for (const id of savedMemoryIds) await eventStore.attachMemory(decision.eventId, id, "generated");
+      await eventStore.attachMessage(message.guildId, decision.eventId, message.messageId);
+      await eventStore.addParticipant(message.guildId, decision.eventId, message.authorId, message.authorName);
+      for (const id of savedMemoryIds) await eventStore.attachMemory(message.guildId, decision.eventId, id, "generated");
     } else if (decision.action === "reference") {
-      await eventStore.incrementReferenceCount(decision.eventId);
-      for (const id of savedMemoryIds) await eventStore.attachMemory(decision.eventId, id, "referenced");
+      await eventStore.incrementReferenceCount(message.guildId, decision.eventId);
+      for (const id of savedMemoryIds) await eventStore.attachMemory(message.guildId, decision.eventId, id, "referenced");
       // Re-score the referenced event if its reference count has reached a promotion threshold
       const promoted = await this.maybeRetroactivelyPromote(decision.eventId, message.guildId, eventStore, memoryStore, brain);
       return llmCalled || promoted;
@@ -120,12 +143,12 @@ export class EventPipeline {
       // Attach to the first event and record the link on the second
       const [primary, ...rest] = decision.eventIds;
       if (primary != null) {
-        await eventStore.attachMessage(primary, message.messageId);
-        await eventStore.addParticipant(primary, message.authorId, message.authorName);
-        for (const id of savedMemoryIds) await eventStore.attachMemory(primary, id, "generated");
+        await eventStore.attachMessage(message.guildId, primary, message.messageId);
+        await eventStore.addParticipant(message.guildId, primary, message.authorId, message.authorName);
+        for (const id of savedMemoryIds) await eventStore.attachMemory(message.guildId, primary, id, "generated");
       }
       for (const bridgedId of rest) {
-        await eventStore.incrementReferenceCount(bridgedId);
+        await eventStore.incrementReferenceCount(message.guildId, bridgedId);
       }
     } else {
       // "new" — only create a candidate event window if the message produced at least one memory
@@ -141,8 +164,8 @@ export class EventPipeline {
           occurredAt: message.createdAt,
           participants: [{ userId: message.authorId, userName: message.authorName, role: "participant" }],
         });
-        await eventStore.attachMessage(ev.id, message.messageId);
-        for (const id of savedMemoryIds) await eventStore.attachMemory(ev.id, id, "generated");
+        await eventStore.attachMessage(message.guildId, ev.id, message.messageId);
+        for (const id of savedMemoryIds) await eventStore.attachMemory(message.guildId, ev.id, id, "generated");
       }
     }
     return llmCalled;
@@ -177,7 +200,7 @@ export class EventPipeline {
     const candidates = scores.slice(0, MAX_LLM_CANDIDATES);
     const llmEvents = await Promise.all(candidates.map(async s => {
       const ev = openEvents.find(e => e.id === s.eventId)!;
-      const recentMessages = (await memoryStore.messagesByIds(ev.messageIds.slice(-LLM_CONTEXT_MESSAGES)))
+      const recentMessages = (await memoryStore.messagesByIds(message.guildId, ev.messageIds.slice(-LLM_CONTEXT_MESSAGES)))
         .map(m => ({ authorName: m.authorName, content: m.content }));
       return {
         id: ev.id,
@@ -186,7 +209,8 @@ export class EventPipeline {
         recentMessages,
       };
     }));
-    return { decision: await brain.assessContinuity(message, llmEvents), llmCalled: true };
+    const raw = await brain.assessContinuity(message, llmEvents);
+    return { decision: constrainDecision(raw, new Set(candidates.map(s => s.eventId))), llmCalled: true };
   }
 
   // ── Retroactive promotion ─────────────────────────────────────────────────
@@ -220,9 +244,9 @@ export class EventPipeline {
     });
 
     if (tier === "event") {
-      await eventStore.updateSignificance(eventId, score, "event", classification.title, classification.summary);
+      await eventStore.updateSignificance(guildId, eventId, score, "event", classification.title, classification.summary);
     } else if (tier === "candidate" && ev.tier !== "candidate") {
-      await eventStore.updateSignificance(eventId, score, "candidate", classification.title, classification.summary);
+      await eventStore.updateSignificance(guildId, eventId, score, "candidate", classification.title, classification.summary);
     }
     // "discard" tier — don't downgrade an event that has accumulated references
     return true;
@@ -258,7 +282,7 @@ export class EventPipeline {
       try {
         classification = await brain.classifyEvent(cluster);
       } catch (err) {
-        console.error(`  [classifyEvent error] event ${ev.id}:`, (err as Error).message.slice(0, 120));
+        logError(`  [classifyEvent error] event ${ev.id}:`, err);
         continue;
       }
       const { score, tier } = calculateSignificance({
@@ -270,12 +294,12 @@ export class EventPipeline {
         futureRelevant: classification.futureRelevant,
       });
       if (tier === "event") {
-        await eventStore.updateSignificance(ev.id, score, "event", classification.title, classification.summary);
+        await eventStore.updateSignificance(guildId, ev.id, score, "event", classification.title, classification.summary);
         promoted++;
       } else if (tier === "discard") {
         // Discard: close the record with significance 0 and leave tier as candidate
         // (we never hard-delete — "discard" just means we don't surface it)
-        await eventStore.updateSignificance(ev.id, score, "candidate", ev.title, ev.summary);
+        await eventStore.updateSignificance(guildId, ev.id, score, "candidate", ev.title, ev.summary);
         discarded++;
       }
     }
@@ -297,7 +321,7 @@ async function buildCluster(
   // Read back the raw messages that belong to this event. If the archive has
   // been purged by retention this returns fewer (or zero) messages — the LLM
   // classification still runs on whatever remains.
-  const context = await memoryStore.messagesByIds(ev.messageIds);
+  const context = await memoryStore.messagesByIds(ev.guildId, ev.messageIds);
 
   return {
     messages: context,

@@ -1,28 +1,27 @@
-import 'dotenv/config';
 import postgres from 'postgres';
-import { MemoryStore } from './src/database.ts';
-import { Brain } from './src/brain.ts';
-import { runContestCheck } from './src/contest.ts';
-import { botMemoryCue, contestCue } from './src/perception.ts';
+import { MemoryStore } from '../src/database.ts';
+import { runContestCheck } from '../src/contest.ts';
+import { botMemoryCue, contestCue } from '../src/perception.ts';
+import { guildBrain, botIdFromToken, requireGuildId } from './_lib.mjs';
 
 // Retroactive contest sweep over the archived messages: finds bot-addressed
 // denial/correction messages and applies them as evidence on the author's
 // memories. The bot's own messages aren't archived, so the trigger is the
 // <@BOT_ID> mention in the human's message.
 
+const GUILD_ID = requireGuildId();
 const sql = postgres(process.env.DATABASE_URL, { max: 1, onnotice: () => {} });
 const store = await MemoryStore.create();
-const brain = new Brain(process.env.GROQ_API_KEY, process.env.GROQ_MODEL, process.env.GROQ_BASE_URL ?? 'https://api.groq.com/openai/v1');
+const brain = await guildBrain(store, GUILD_ID);
 const model = process.env.CONTEST_MODEL ?? process.env.VERIFY_MODEL ?? process.env.INGEST_MODEL ?? 'qwen/qwen3.8-27b';
 
-// Bot user id is embedded in the token's first segment
-const botId = Buffer.from(process.env.DISCORD_TOKEN.split('.')[0], 'base64').toString();
+const botId = botIdFromToken();
 console.log(`bot id: ${botId}`);
 
 const rows = await sql`
   SELECT id, guild_id, channel_id, author_id, author_name, content, created_at
   FROM messages
-  WHERE guild_id = ${process.env.GUILD_ID}
+  WHERE guild_id = ${GUILD_ID}
   ORDER BY created_at
 `;
 

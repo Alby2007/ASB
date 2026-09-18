@@ -1,4 +1,10 @@
+import { lookup as dnsLookupCb } from "node:dns";
 import { lookup } from "node:dns/promises";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
+import type { IncomingMessage } from "node:http";
+import type { LookupFunction } from "node:net";
+import type { Readable } from "node:stream";
 import { executeLookupTool, LOOKUP_TOOL_NAMES, type ToolCtx } from "./lookup-tools.js";
 
 // Local tool implementations for gpt-oss-120b tool calling — free alternatives to
@@ -41,8 +47,13 @@ function isPrivateIpv6(host: string): boolean {
   const h = host.replace(/^\[|\]$/g, "").toLowerCase();
   if (!h.includes(":")) return false;
   return h === "::1" || h === "::"
-    || h.startsWith("fe80") || h.startsWith("fc") || h.startsWith("fd")
-    || h.startsWith("ff") || h.startsWith("::ffff:");
+    || h.startsWith("::")                    // ::/16: v4-mapped ::ffff:, v4-compat ::/96 — nothing public lives here
+    || /^fe[89ab]/.test(h)                   // fe80::/10 link-local
+    || h.startsWith("fc") || h.startsWith("fd") // ULA
+    || h.startsWith("ff")                    // multicast
+    || h.startsWith("64:ff9b:")              // NAT64 — embeds an IPv4
+    || h.startsWith("2002:")                 // 6to4 — embeds an IPv4
+    || h.startsWith("2001:0:") || h.startsWith("2001:0000:"); // Teredo — embeds an IPv4
 }
 
 export function isPrivateAddress(host: string): boolean {
@@ -69,6 +80,85 @@ async function resolvesToPrivateAddress(host: string): Promise<boolean> {
   } catch {
     return true; // can't resolve → treat as unsafe
   }
+}
+
+// ── Connect-time-validated HTTP ───────────────────────────────────────────────
+// A check-then-fetch pair resolves DNS twice — attacker-controlled DNS can
+// answer public for the check and private for the connect (rebinding/TOCTOU).
+// safeLookup runs INSIDE the socket connect path, so the same answer that is
+// validated is the one connected to — the TOCTOU window closes entirely.
+
+const safeLookup: LookupFunction = ((hostname: string, options: { all?: boolean } & Record<string, unknown>, callback: (err: NodeJS.ErrnoException | null, address?: unknown, family?: number) => void) => {
+  dnsLookupCb(hostname, { ...options, all: true }, (err, addrs) => {
+    if (err) return callback(err);
+    if (!addrs?.length || addrs.some(a => isPrivateAddress(a.address))) {
+      return callback(new Error(`blocked: ${hostname} resolves to a private address`));
+    }
+    if (options?.all) return callback(null, addrs);
+    callback(null, addrs[0].address, addrs[0].family);
+  });
+}) as LookupFunction;
+
+/** Byte-capped read of a fetch() Response body — counts bytes as they stream
+ * so a lying/absent Content-Length can't exhaust memory. */
+export async function readBodyCapped(res: Response, maxBytes: number): Promise<Buffer> {
+  if (!res.body) {
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > maxBytes) throw new Error(`body over ${maxBytes} bytes`);
+    return buf;
+  }
+  const reader = res.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) { await reader.cancel(); throw new Error(`body over ${maxBytes} bytes`); }
+      chunks.push(Buffer.from(value));
+    }
+  } finally { reader.releaseLock(); }
+  return Buffer.concat(chunks);
+}
+
+export type SafeResponse = {
+  status: number;
+  headers: IncomingMessage["headers"];
+  /** Read the body with a hard byte cap — destroys the socket the moment the
+   * cap is exceeded, so a lying/absent Content-Length can't exhaust memory. */
+  readBody: (maxBytes: number) => Promise<Buffer>;
+};
+
+/** http/https GET with connect-time DNS validation. Only http(s) URLs are
+ * accepted; the caller still runs isSafeUrl for hostname/scheme policy. */
+export async function safeRequest(rawUrl: string, timeoutMs = FETCH_TIMEOUT_MS): Promise<SafeResponse> {
+  const url = new URL(rawUrl);
+  const request = url.protocol === "https:" ? httpsRequest : httpRequest;
+  return new Promise((resolve, reject) => {
+    const req = request(url, {
+      headers: { "user-agent": UA },
+      lookup: safeLookup,
+      timeout: timeoutMs,
+    }, (res) => resolve({
+      status: res.statusCode ?? 0,
+      headers: res.headers,
+      readBody: (maxBytes) => new Promise<Buffer>((res2, rej2) => {
+        const chunks: Buffer[] = [];
+        let total = 0;
+        res.on("data", (c: Buffer) => {
+          total += c.length;
+          if (total > maxBytes) { res.destroy(); rej2(new Error(`body over ${maxBytes} bytes`)); return; }
+          chunks.push(c);
+        });
+        res.on("end", () => res2(Buffer.concat(chunks)));
+        res.on("error", rej2);
+      }),
+    }));
+    req.on("timeout", () => req.destroy(new Error(`timeout after ${timeoutMs}ms`)));
+    req.on("error", reject);
+    req.end();
+  });
 }
 
 // ── HTML → text ───────────────────────────────────────────────────────────────
@@ -148,29 +238,33 @@ export async function visitUrl(rawUrl: string): Promise<string> {
     for (let hop = 0; hop <= 3; hop++) {
       if (!isSafeUrl(url)) return "error: url not allowed";
       const host = new URL(url).hostname;
+      // Fast-path DNS check first; safeRequest's lookup re-validates at connect
+      // time, which is the authoritative gate against rebinding.
       if (await resolvesToPrivateAddress(host)) return "error: url resolves to a private address";
-      const res = await fetch(url, {
-        headers: { "user-agent": UA }, redirect: "manual",
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-      });
+      const res = await safeRequest(url);
       if (res.status >= 300 && res.status < 400) {
-        const next = res.headers.get("location");
+        const next = headerValue(res.headers["location"]);
         if (!next) return `error: redirect with no location (HTTP ${res.status})`;
         url = new URL(next, url).toString();
         continue;
       }
-      if (!res.ok) return `error: HTTP ${res.status}`;
-      const type = res.headers.get("content-type") ?? "";
+      if (res.status < 200 || res.status >= 300) return `error: HTTP ${res.status}`;
+      const type = headerValue(res.headers["content-type"]) ?? "";
       if (type && !/text\/|application\/(json|ld\+json)/.test(type)) return `error: unsupported content type ${type.split(";")[0]}`;
-      const size = Number(res.headers.get("content-length") ?? 0);
+      const size = Number(headerValue(res.headers["content-length"]) ?? 0);
       if (size > 1_000_000) return "error: page too large";
-      const body = type.includes("text/html") ? stripHtml(await res.text()) : (await res.text()).slice(0, 1_000_000);
+      const raw = (await res.readBody(1_000_000)).toString("utf8");
+      const body = type.includes("text/html") ? stripHtml(raw) : raw;
       return body.slice(0, MAX_PAGE_CHARS) || "error: empty page";
     }
     return "error: too many redirects";
   } catch (err) {
     return `error: ${(err as Error).message.slice(0, 120)}`;
   }
+}
+
+function headerValue(v: string | string[] | undefined): string | undefined {
+  return Array.isArray(v) ? v[0] : v;
 }
 
 // ── Dispatcher ────────────────────────────────────────────────────────────────

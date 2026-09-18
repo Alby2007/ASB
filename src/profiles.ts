@@ -8,6 +8,7 @@ import type { Dossier, DossierSection, Profile, ProfileSynthesis, ProfileSynthes
 import { gatherDossierInputs, type DossierInput } from "./dossier.js";
 import { buildAliasMap } from "./entity-resolution.js";
 import { applyProposals, attributeHash, extractDeterministic, listAttributes } from "./attributes.js";
+import { logError } from "./secrets.js";
 
 // ── Row types returned by Postgres ────────────────────────────────────────────
 
@@ -209,7 +210,7 @@ export class ProfileStore {
       // A DB error here must fail this member's pass, not the guild's build.
       if (detProposals.length) {
         try { await applyProposals(this.sql, guildId, member.userId, detProposals); }
-        catch (error) { console.error(`Attribute upsert failed for ${member.userId}`, error); }
+        catch (error) { logError(`Attribute upsert failed for ${member.userId}`, error); }
       }
 
       // LLM extraction is gated: memory-fingerprint change, or the member has

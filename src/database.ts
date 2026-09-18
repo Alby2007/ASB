@@ -5,6 +5,10 @@ import { findMentionedUsers } from "./entity-resolution.js";
 import { calculateInitialConfidence, updateConfidence, calculateDefaultImportance, calculateDefaultExplicitness } from "./confidence.js";
 import { contentPolarity, listAttributes, listAttributesForSubjects, listContestedAttributes, recomputeForMemories, transferProvenance } from "./attributes.js";
 
+/** Cap on members.known_names — unbounded growth would inflate the alias map
+ * and every per-message regex built from it. Oldest names are evicted. */
+const MAX_KNOWN_NAMES = 32;
+
 export type Memory = Omit<MemoryCandidate, "confidence" | "importance" | "explicitness"> & {
   // DB columns are NOT NULL, so these are always present on a persisted Memory.
   confidence: number;
@@ -251,7 +255,12 @@ export class MemoryStore {
       INSERT INTO members (guild_id, user_id, known_names, first_seen_at, last_seen_at, message_count)
       VALUES (${guildId}, ${userId}, ${[displayName]}, ${at.toISOString()}, ${at.toISOString()}, ${inc})
       ON CONFLICT (guild_id, user_id) DO UPDATE SET
-        known_names   = CASE WHEN ${displayName} = ANY(members.known_names) THEN members.known_names ELSE array_append(members.known_names, ${displayName}) END,
+        known_names   = CASE
+          WHEN ${displayName} = ANY(members.known_names) THEN members.known_names
+          WHEN cardinality(members.known_names) >= ${MAX_KNOWN_NAMES}
+            THEN array_append(members.known_names[2:cardinality(members.known_names)], ${displayName})
+          ELSE array_append(members.known_names, ${displayName})
+        END,
         first_seen_at = LEAST(members.first_seen_at, EXCLUDED.first_seen_at),
         last_seen_at  = GREATEST(members.last_seen_at, EXCLUDED.last_seen_at),
         message_count = members.message_count + ${inc}
@@ -315,7 +324,11 @@ export class MemoryStore {
       `;
       if (inserted.length === 0) return false;
       await sql`
-        UPDATE members SET known_names = array_append(known_names, ${clean})
+        UPDATE members SET known_names = CASE
+          WHEN cardinality(known_names) >= ${MAX_KNOWN_NAMES}
+            THEN array_append(known_names[2:cardinality(known_names)], ${clean})
+          ELSE array_append(known_names, ${clean})
+        END
         WHERE guild_id = ${guildId} AND user_id = ${userId}
           AND NOT (LOWER(${clean}) = ANY(SELECT LOWER(x) FROM unnest(known_names) x))
       `;
@@ -799,8 +812,8 @@ export class MemoryStore {
     });
   }
 
-  async getMessage(messageId: string): Promise<{ id: string; guildId: string; channelId: string; authorId: string; authorName: string; content: string; createdAt: string } | undefined> {
-    const rows = await this.sql<MessageRow[]>`SELECT id, guild_id, channel_id, author_id, author_name, content, created_at FROM messages WHERE id = ${messageId}`;
+  async getMessage(guildId: string, messageId: string): Promise<{ id: string; guildId: string; channelId: string; authorId: string; authorName: string; content: string; createdAt: string } | undefined> {
+    const rows = await this.sql<MessageRow[]>`SELECT id, guild_id, channel_id, author_id, author_name, content, created_at FROM messages WHERE guild_id = ${guildId} AND id = ${messageId}`;
     if (!rows[0]) return undefined;
     const r = rows[0];
     return { id: r.id, guildId: r.guild_id, channelId: r.channel_id, authorId: r.author_id, authorName: r.author_name, content: r.content, createdAt: ts(r.created_at) };
@@ -1427,10 +1440,10 @@ export class MemoryStore {
     }));
   }
 
-  async messagesByIds(messageIds: string[]): Promise<Array<{ authorName: string; content: string; createdAt: string }>> {
+  async messagesByIds(guildId: string, messageIds: string[]): Promise<Array<{ authorName: string; content: string; createdAt: string }>> {
     if (messageIds.length === 0) return [];
     const rows = await this.sql<MessageRow[]>`
-      SELECT author_name, content, created_at FROM messages WHERE id = ANY(${messageIds}) ORDER BY created_at ASC
+      SELECT author_name, content, created_at FROM messages WHERE guild_id = ${guildId} AND id = ANY(${messageIds}) ORDER BY created_at ASC
     `;
     return rows.map(r => ({ authorName: r.author_name, content: r.content, createdAt: ts(r.created_at) }));
   }

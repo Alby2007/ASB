@@ -2,7 +2,7 @@ import "dotenv/config";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { config } from "./config.js";
-import { decryptSecret, encryptSecret, maskKey, redactSecrets, validateLlmKey } from "./secrets.js";
+import { decryptSecret, encryptSecret, errorText, maskKey, redactSecrets, registerSecret, validateLlmKey } from "./secrets.js";
 
 // config is parsed at import; masterKey() reads it lazily per call so tests
 // can point it at a fixture passphrase.
@@ -50,6 +50,30 @@ test("redactSecrets scrubs key occurrences from log text", () => {
   assert.equal(redactSecrets(log, ["gsk_live_abc123"]), "Request failed: Authorization: Bearer *** at https://api.groq.com");
   // Short/undefined secrets are skipped — scrubbing "ab" would mangle prose.
   assert.equal(redactSecrets("abc", ["ab", undefined]), "abc");
+});
+
+test("redactSecrets strips registered secrets without an explicit list", () => {
+  registerSecret("gsk_registered_secret_12345");
+  assert.equal(redactSecrets("call failed for gsk_registered_secret_12345"), "call failed for ***");
+});
+
+test("redactSecrets strips auth-header-shaped tokens it never registered", () => {
+  // SDK error objects serialize request config — the bearer token inside must
+  // be scrubbed even when the exact secret isn't in the registry.
+  assert.match(redactSecrets(`"headers":{"authorization":"Bearer sk-live-token-xyz"}`), /Bearer \*\*\*/);
+  assert.match(redactSecrets(`api_key=gsk_live_abcdefghijk`), /api_key=\*\*\*/);
+});
+
+test("errorText serializes an SDK-style error and scrubs its request config", () => {
+  registerSecret("gsk_the_real_key_99999");
+  const sdkErr = Object.assign(new Error("401 Unauthorized"), {
+    status: 401,
+    config: { headers: { authorization: "Bearer gsk_the_real_key_99999" }, baseURL: "https://api.groq.com/openai/v1" },
+  });
+  const out = errorText(sdkErr);
+  assert.ok(!out.includes("gsk_the_real_key_99999"), `leaked key in: ${out}`);
+  assert.match(out, /401 Unauthorized/);            // message survives
+  assert.match(out, /api\.groq\.com/);              // non-secret context survives
 });
 
 // ── validateLlmKey ────────────────────────────────────────────────────────────
