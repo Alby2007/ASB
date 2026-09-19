@@ -16,6 +16,8 @@ ASB (Artificial Server Member) is a single TypeScript/Node process that connects
 | `src/brains.ts` | `createBrainResolver` | Per-guild `Brain` resolver (BYOK): guild's encrypted key → env fallback → null (dormant). Cached per guild, invalidated by `/setup` |
 | `src/guild-lifecycle.ts` | `announceIfNeeded`, `handleGuildDelete` | Join disclosure card (idempotent via `announced_at`) + kick-purge — GuildDelete never fires on outage (`unavailable`) |
 | `src/jobs.ts` | `enqueue`, `claimNext`, `startWorker` | Postgres job queue for deferrable cognition — `SKIP LOCKED` claims with a 10-min visibility lease, per-guild serial + global cap 8, backoff retry, 5-attempt dead-letter, `NOTIFY`/`LISTEN` wake + 3s poll |
+| `src/speech-gate.ts` | `evaluateSpeechTurn` | The per-message speak/silence decision extracted from handleMessage — enroll → aim-check → dismissal → share-of-voice → decide(); drives the transcript-replay tests |
+| `src/reply-throttle.ts` | `ReplyThrottle` | Per-user reply budget (token bucket) — bounds the drain one user can cause against the guild's daily LLM cap |
 | `src/extract-job.ts` | `runExtractJob` | The deferred extract pipeline — alias-learn → describe → extract → consent-gated persist → `extracted` mark → contest → event pipeline (extracted from index.ts so it's unit-testable) |
 | `src/budget.ts` | `meteredClient`, `BudgetExceeded` | Per-guild daily LLM budget — wraps every `responses.create`/`chat.completions.create` with an atomic `guild_usage` charge against `llm_daily_cap` |
 | `src/secrets.ts` | `encryptSecret`, `decryptSecret`, `maskKey`, `redactSecrets`, `validateLlmKey` | AES-256-GCM at-rest encryption for guild keys + live key validation against `/models` |
@@ -89,7 +91,12 @@ Discord MessageCreate
     speaking there is no floor to dominate; direct mentions exempt from both
   • shouldSpeak = score ≥ SPEAK_THRESHOLD (default 0.70)
         │
-        ▼ (only if shouldSpeak && replyEnabled)
+        ▼ (only if shouldSpeak && replyEnabled && per-user budget has tokens)
+  reply-throttle.ts: token bucket per guild:user — a burst is free
+  (REPLY_BURST=4), then ~1 per REPLY_REFILL_MS (30s); bounds the drain one
+  person spamming mentions/follow-ups can cause against the guild's daily LLM
+  cap. Suppression is silent — a notice would spend the budget it protects.
+        ▼
   brain.ts: reply()
   • recent channel context (<@id> tokens demangled to @names) + relevant
     memories: active plus candidates with promotable primary evidence types
@@ -168,13 +175,17 @@ else (banter, corrections, volunteering personal facts) is out of scope.
 message ends in "?" && bot chose silence (!shouldSpeak)
         │
         ▼
-  proactive.ts: arm(key, messageId) — debounced per-channel timer
-  • any human follow-up message cancels (room isn't silent)
+  proactive.ts: arm(key, messageId) — enqueues a 'proactive-fire' job whose
+  run_after IS the debounce timer (PROACTIVE_DELAY_MS, ~75s): armed questions
+  survive restarts and past-due rows claim immediately on boot
+  • any human follow-up message cancels the pending entry (room isn't silent)
   • a reaction ON the question cancels (room engaged with it)
   • deleting the question cancels; a newer arm replaces the old
-        │ ~75s idle (PROACTIVE_DELAY_MS)
+  • the job row can't be cancelled — it fires later and release() no-ops on
+    it; the in-memory pending map is the "still armed" truth, the row the clock
+        │ run_after reaches now
         ▼
-  fireProactive() re-verifies at send time
+  worker claim → release(key, messageId) → fireProactive() re-verifies at send time
   • PROACTIVE=1 global AND server_settings.proactive_enabled — double opt-in,
     either switch alone kills it (v13 migration, default off)
   • re-fetch the question: deleted → gone, edited → re-check "?"

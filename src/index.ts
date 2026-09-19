@@ -5,8 +5,10 @@ import { sql } from "./db.js";
 import { MemoryStore } from "./database.js";
 import { createBrainResolver, guardedLlmFetch } from "./brains.js";
 import { commandDefinitions, handleMemoryButton, handleMemoryCommand, handleSetupModal } from "./commands.js";
-import { detectDismissal, detectWakeWord, looksLikeSchemaLeak, questionKeywords, roomAddressCue, shouldInspectForMemory, toolCues } from "./perception.js";
+import { detectWakeWord, looksLikeSchemaLeak, questionKeywords, shouldInspectForMemory, toolCues } from "./perception.js";
 import { ConversationTracker } from "./conversation.js";
+import { evaluateSpeechTurn } from "./speech-gate.js";
+import { ReplyThrottle } from "./reply-throttle.js";
 import { ProactiveScheduler } from "./proactive.js";
 import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
@@ -75,10 +77,14 @@ const pipeline = new EventPipeline();
 // Opens on addressed messages, closes when the last participant leaves —
 // TTL expiry, regex dismissal, or the model's end_conversation signal.
 const convo = new ConversationTracker(config.engagementTtlMs);
-// Stranded-question trigger: a question arms a debounced timer; any follow-up
-// (message or reaction) cancels it — the point is waiting to see if a human
-// answers first. In-memory like ConversationTracker — restart resets the daily
-// cap and backoff state gracefully.
+// Per-user reply budget — bounds the worst-case drain a single user can cause
+// against the guild's daily LLM cap (a burst is free, then ~1/refill sustained).
+const replyThrottle = new ReplyThrottle({ capacity: config.replyBurst, refillMs: config.replyRefillMs });
+// Stranded-question trigger: a question arms a durable 'proactive-fire' job —
+// the row's run_after IS the debounce timer, so a restart doesn't drop armed
+// questions. Any follow-up (message or reaction) cancels the pending entry;
+// the job still fires but release() no-ops on it. Cap/backoff/sent state stays
+// in-memory like ConversationTracker — restart resets it gracefully.
 const proactive = new ProactiveScheduler({
   delayMs: config.proactiveDelayMs,
   dailyCap: config.proactiveDailyCap,
@@ -86,13 +92,11 @@ const proactive = new ProactiveScheduler({
   backoffMs: config.proactiveBackoffMs,
   baseMinConfidence: 0.6,
   backoffMinConfidence: 0.85,
-});
-proactive.setFireHandler((key, messageId) => {
-  void fireProactive(key, messageId).catch(error => {
-    // A capped guild isn't a fault — the metered client threw before spend.
-    if (error instanceof BudgetExceeded) { inc("budget.proactive_blocked"); return; }
-    inc("proactive.error"); logError("Proactive fire failed", error);
-  });
+  schedule: (key, messageId, runAfter) => {
+    const [guildId, channelId] = key.split(":");
+    void enqueue(sql, guildId, "proactive-fire", { channelId, messageId }, runAfter)
+      .catch(error => { inc("jobs.enqueue_error"); logError("Proactive arm enqueue failed", error); });
+  },
 });
 
 // MemoryStore.create() runs migrations; EventStore shares the same sql connection.
@@ -105,11 +109,39 @@ async function init() {
   store = await MemoryStore.create();
   eventStore = new EventStore();
   profileStore = new ProfileStore();
+  // Armed questions survive restarts as 'proactive-fire' rows — repopulate
+  // the pending map so release() dedup keeps working. A row already past
+  // run_after claims on the next poll and fires normally.
+  for (const row of await sql<Array<{ guild_id: string; payload: { channelId?: string; messageId?: string } }>>`
+    SELECT guild_id, payload FROM jobs WHERE type = 'proactive-fire' AND attempts < 5
+  `) {
+    if (row.payload.channelId && row.payload.messageId) {
+      proactive.restore(`${row.guild_id}:${row.payload.channelId}`, row.payload.messageId, Date.now());
+    }
+  }
   // Deferrable cognition runs here — extract jobs claimed per-guild-serial,
   // global cap 8. LISTEN 'jobs' for wake hints, 3s poll as the baseline.
   worker = startWorker({
     sql,
     handle: job => {
+      if (job.type === "proactive-fire") {
+        const p = job.payload as { channelId?: string; messageId?: string };
+        if (!p?.channelId || !p.messageId) {
+          return Promise.reject(new FatalJobError("malformed proactive-fire payload"));
+        }
+        const key = `${job.guild_id}:${p.channelId}`;
+        // The pending map is the truth for "still armed" — a cancelled or
+        // superseded arm completes as a no-op, deleting the row.
+        if (!proactive.release(key, p.messageId)) { inc("proactive.arm_stale"); return Promise.resolve(); }
+        return fireProactive(key, p.messageId).catch(error => {
+          // A capped guild isn't a fault — and parking a 75-second-old
+          // question to UTC midnight is nonsense, so BudgetExceeded completes
+          // the job rather than rescheduling it.
+          if (error instanceof BudgetExceeded) { inc("budget.proactive_blocked"); return; }
+          inc("proactive.error");
+          throw error;
+        });
+      }
       // Unknown types are a code bug, not a transient fault — dead-letter
       // immediately rather than retrying something that can never succeed.
       if (job.type !== "extract") {
@@ -648,42 +680,13 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   if (replyToId) proactive.observeEngagement(replyToId);
   // This human message counts toward share-of-voice before scoring — it
   // dilutes the bot's floor share for the decide() below.
-  convo.noteMessage(key, false, event.authorId);
-  // An addressed message enrolls the author — opening the conversation if it
-  // wasn't already (first participant in → opened).
-  // ENGAGEMENT=0 = address-only mode: no conversation state is enrolled at
-  // all, so every message scores as stranger and the opened metric stays
-  // honest rather than claiming opens that can never be entered.
-  if (config.engagement && event.mentionsBot && convo.addressed(key, event.authorId)) inc("convo.opened");
-  let engaged = config.engagement && convo.isParticipant(key, event.authorId);
-  // Engaged ≠ every message is at the bot: a message aimed at the room ("did
-  // anyone see that"), replying to another human, or @-mentioning someone else
-  // doesn't earn the in-conversation bonus — participation itself is untouched.
-  if (engaged && !event.mentionsBot) {
-    const botId = client.user!.id;
-    if (roomAddressCue(event.content)
-      || (message.mentions.repliedUser !== null && message.mentions.repliedUser.id !== botId)
-      || message.mentions.users.some(u => u.id !== botId)) {
-      engaged = false;
-    }
-  }
-  // Dismissals are the deterministic override — they fire addressed ("shut up
-  // asb") or mid-conversation ("shush") regardless of what the model thinks.
-  // An unaddressed dismissal clears participation → silence, the clean
-  // drop-out; an addressed one still gets its ack reply, then drops out.
-  if ((event.mentionsBot || engaged) && detectDismissal(event.content)) {
-    convo.leave(key, event.authorId);
-    inc("convo.leave.dismissal");
-    engaged = false;
-  }
-  const lastSpokeAt = convo.lastSpokeAt(key);
-  const elapsedSinceLastSpoke = lastSpokeAt === undefined ? Infinity : Date.now() - lastSpokeAt;
-  // The share-of-voice penalty exists to keep the bot off a shared floor —
-  // it only applies when someone OUTSIDE the conversation spoke recently. A
-  // 1:1 ping-pong is structurally ~50% bot forever; with no bystanders there
-  // is no floor to dominate, so share is gated to zero.
-  const share = convo.bystanderVoices(key) > 0 ? convo.botShare(key) : 0;
-  const decision = brain.decide(event, elapsedSinceLastSpoke, engaged, share, config.speakThreshold);
+  const verdict = evaluateSpeechTurn({
+    event, botId: client.user!.id,
+    repliedToOtherUser: message.mentions.repliedUser !== null && message.mentions.repliedUser.id !== client.user!.id,
+    mentionsOtherUsers: message.mentions.users.some(u => u.id !== client.user!.id),
+  }, convo, (e, ms, eng, share) => brain.decide(e, ms, eng, share, config.speakThreshold), { engagement: config.engagement });
+  const decision = verdict.decision;
+  const engaged = verdict.engaged;
   if (!settings.replyEnabled || !decision.shouldSpeak) {
     // The bot stayed silent on a question — arm the stranded-question timer.
     // A question it already answered never reaches here, so it can't be
@@ -695,6 +698,10 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     }
     return;
   }
+  // Per-user reply budget — spamming mentions or rapid follow-ups can't drain
+  // the guild's daily cap for everyone else. Silence, not a notice: a "slow
+  // down" reply spends the very budget it protects.
+  if (!replyThrottle.consume(event.guildId, event.authorId)) { inc("reply.cooldown"); return; }
   try {
     await message.channel.sendTyping();
     // Inject profile cards for the author, @-mentioned users, and name-referenced members.

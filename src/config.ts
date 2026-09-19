@@ -24,6 +24,11 @@ const env = z.object({
   REPLY_MODEL: z.string().optional(),
   REPLY_TOOLS: z.string().optional(),
   REPLY_EXIT: z.string().optional(),
+  // Per-user reply budget: a troll spamming mentions or rapid follow-ups
+  // drains the guild's daily LLM cap for everyone else. Burst allows natural
+  // ping-pong, refill bounds the sustained drain (~1/refill per user).
+  REPLY_BURST: z.coerce.number().int().min(1).max(50).default(4),
+  REPLY_REFILL_MS: z.coerce.number().int().min(5_000).max(600_000).default(30_000),
   INGEST_CHANNEL: z.string().optional(),
   VISION_MODEL: z.string().optional(),
   VISION_API_KEY: z.string().optional(),
@@ -93,6 +98,8 @@ export const config = {
   proactiveDailyCap: env.PROACTIVE_DAILY_CAP,
   proactiveResponseWindowMs: env.PROACTIVE_RESPONSE_WINDOW_MS,
   proactiveBackoffMs: env.PROACTIVE_BACKOFF_MS,
+  replyBurst: env.REPLY_BURST,
+  replyRefillMs: env.REPLY_REFILL_MS,
   // BYOK: AES-256-GCM master passphrase (SHA-256-derived in secrets.ts) and the
   // hosted-mode flag that turns off the env-key fallback for keyless guilds.
   keyEncryptionSecret: env.KEY_ENCRYPTION_SECRET,

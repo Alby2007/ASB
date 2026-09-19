@@ -2,8 +2,7 @@ import assert from "node:assert/strict";
 import { ProactiveScheduler } from "./proactive.js";
 
 let now = 1_000_000;
-const fired: string[] = [];
-const timers = new Map<() => void, number>();
+const scheduled: Array<{ key: string; messageId: string; runAfter: Date }> = [];
 
 const scheduler = new ProactiveScheduler({
   delayMs: 90_000,
@@ -12,44 +11,50 @@ const scheduler = new ProactiveScheduler({
   backoffMs: 21_600_000,
   baseMinConfidence: 0.6,
   backoffMinConfidence: 0.85,
-  onFire: (key, messageId) => fired.push(`${key}:${messageId}`),
-  setTimeoutFn: (fn, _ms) => { timers.set(fn, now); return fn as unknown as ReturnType<typeof setTimeout>; },
-  clearTimeoutFn: (t) => { timers.delete(t as unknown as () => void); },
+  schedule: (key, messageId, runAfter) => scheduled.push({ key, messageId, runAfter }),
   now: () => now,
 });
 
 const KEY = "g:c";
-function runTimers() { for (const fn of [...timers.keys()]) { timers.delete(fn); fn(); } }
 function advance(ms: number) { now += ms; }
 
-// ── arm → fire after delay ────────────────────────────────────────────────────
+// ── arm → schedules a durable fire at now + delayMs ──────────────────────────
 scheduler.arm(KEY, "m1");
 assert.equal(scheduler.isPendingQuestion(KEY, "m1"), true);
-runTimers();
-assert.deepEqual(fired, [`${KEY}:m1`]);
+assert.deepEqual(scheduled.map(s => [s.key, s.messageId]), [[KEY, "m1"]]);
+assert.equal(scheduled[0]!.runAfter.getTime(), now + 90_000, "run_after IS the debounce timer");
+// The job firing releases the armed entry.
+assert.equal(scheduler.release(KEY, "m1"), true);
 assert.equal(scheduler.isPendingQuestion(KEY, "m1"), false);
+assert.equal(scheduler.release(KEY, "m1"), false, "already released — a replayed job no-ops");
 
-// ── any follow-up cancels (message path passes no id) ────────────────────────
+// ── any follow-up cancels; the armed job fires later and no-ops ──────────────
 scheduler.arm(KEY, "m2");
 assert.equal(scheduler.cancelPending(KEY), true); // a follow-up message arrived
-runTimers();
-assert.deepEqual(fired, [`${KEY}:m1`]); // nothing new fired
+assert.equal(scheduler.release(KEY, "m2"), false, "cancelled arm must not release");
 
 // a reaction on a DIFFERENT message doesn't cancel the pending question
 scheduler.arm(KEY, "m3");
 assert.equal(scheduler.cancelPending(KEY, "other-msg"), false);
 assert.equal(scheduler.isPendingQuestion(KEY, "m3"), true);
 assert.equal(scheduler.cancelPending(KEY, "m3"), true); // reaction on the question itself
+assert.equal(scheduler.release(KEY, "m3"), false);
 
-// cancelPending with the question's own id (reaction case)
-scheduler.arm(KEY, "m4");
-assert.equal(scheduler.cancelPending(KEY, "m4"), true);
-
-// ── a newer arm replaces the old pending question ────────────────────────────
+// ── a newer arm replaces the old pending question; the stale job no-ops ──────
 scheduler.arm(KEY, "m5");
-scheduler.arm(KEY, "m6"); // replaces m5 — its timer is cleared
-runTimers();
-assert.deepEqual(fired, [`${KEY}:m1`, `${KEY}:m6`]);
+scheduler.arm(KEY, "m6"); // replaces m5
+assert.equal(scheduler.release(KEY, "m5"), false, "stale job for replaced question must not fire");
+assert.equal(scheduler.release(KEY, "m6"), true);
+
+// ── restore: a 'proactive-fire' row that survived a restart is armed again ───
+scheduler.restore("g:c2", "m9", now);
+assert.equal(scheduler.isPendingQuestion("g:c2", "m9"), true);
+assert.equal(scheduler.release("g:c2", "m9"), true, "restored arm fires normally");
+// a newer arm already in the map wins over a stale row
+scheduler.arm("g:c3", "fresh");
+scheduler.restore("g:c3", "stale-row", now);
+assert.equal(scheduler.isPendingQuestion("g:c3", "fresh"), true);
+assert.equal(scheduler.release("g:c3", "stale-row"), false);
 
 // ── daily cap: plant more qualifying fires than the cap ──────────────────────
 const capped = new ProactiveScheduler({
