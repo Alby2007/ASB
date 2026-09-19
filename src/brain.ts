@@ -5,6 +5,7 @@ import type { AttributeProposal, ContinuityDecision, Decision, DossierSection, E
 import type { ToolCtx } from "./lookup-tools.js";
 import { formatPairContext, formatReplyProfile, type ReplyProfile } from "./reply-format.js";
 import { redactSecrets, registerSecret } from "./secrets.js";
+import { inc } from "./metrics.js";
 
 // formatPairContext / formatReplyProfile live in reply-format.ts so the
 // internal lookup tools render people/pairs identically to the prompt sections.
@@ -30,12 +31,35 @@ const REPLY_JSON_SCHEMA = {
   additionalProperties: false,
 } as const;
 
+// Salvage ladder for structured-path output. A model that emits draft text,
+// think blocks, or schema-ish-but-invalid JSON must not have its internals
+// posted verbatim — each rung extracts the actual answer, and the floor is
+// empty text (the caller's `if (clean)` skips the send: silence over leak).
 function parseReplyResult(raw: string | null | undefined, structured: boolean): ReplyResult {
-  if (structured) {
-    try {
-      const r = JSON.parse(raw ?? "{}") as { text?: string; end_conversation?: boolean };
-      return { text: (r.text ?? "").trim().slice(0, 1800), endConversation: r.end_conversation === true };
-    } catch { /* unstructured output — fall through to the plain-text read */ }
+  if (structured && raw) {
+    const cleaned = raw
+      .replace(/<think>[\s\S]*?<\/think>/gi, "")  // complete think blocks
+      .replace(/<think>[\s\S]*$/i, "");            // unclosed think tail
+    for (const candidate of [raw, cleaned]) {
+      try {
+        const r = JSON.parse(candidate) as { text?: string; end_conversation?: boolean };
+        if (typeof r.text === "string")
+          return { text: r.text.trim().slice(0, 1800), endConversation: r.end_conversation === true };
+      } catch { /* try next */ }
+    }
+    // Quoted-field salvage: model emitted schema-ish text without valid JSON.
+    const m = cleaned.match(/"text"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    if (m) {
+      try {
+        return { text: (JSON.parse(`"${m[1]}"`) as string).trim().slice(0, 1800), endConversation: /end_conversation"?\s*:\s*true/.test(cleaned) };
+      } catch { /* invalid escapes — keep climbing */ }
+    }
+    // Post-think tail: the observed failure shape is draft + marker + </think>
+    // + final answer, where the draft lacks a <think> open tag to strip.
+    const tail = raw.split(/<\/think>/i).pop()?.trim();
+    if (tail && tail !== raw.trim()) return { text: tail.slice(0, 1800), endConversation: false };
+    inc("reply.parse_failed");
+    return { text: "", endConversation: false };
   }
   return { text: (raw ?? "").trim().slice(0, 1800), endConversation: false };
 }

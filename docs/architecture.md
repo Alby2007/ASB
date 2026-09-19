@@ -38,7 +38,7 @@ ASB (Artificial Server Member) is a single TypeScript/Node process that connects
 | `src/lookup-tools.ts` | `ToolCtx`, `executeLookupTool`, `buildPairContext` | Read-only internal lookup tools (person/relationship/memories/event) over the existing stores |
 | `src/reply-format.ts` | `formatReplyProfile`, `formatPairContext` | Pure formatters shared by the reply prompt and tool outputs |
 | `src/vision.ts` | `qualifyingImages`, `formatImageContext` | Pure image-attachment gate (image/*, byte cap, ≤3/message) + observation-framed label |
-| `src/conversation.ts` | `ConversationTracker` | Per-channel conversation objects: opens on addressed messages, closes when the last participant leaves (TTL expiry, regex dismissal, or the model's `end_conversation`); share-of-voice pacing is channel-level and survives close |
+| `src/conversation.ts` | `ConversationTracker` | Per-channel conversation objects: opens on addressed messages, closes when the last participant leaves (TTL expiry, regex dismissal, or the model's `end_conversation`); share-of-voice pacing is channel-level and survives close, and `bystanderVoices` distinguishes a shared floor from a 1:1 ping-pong |
 
 ---
 
@@ -81,9 +81,12 @@ Discord MessageCreate
   • pacing is per-tier: strangers get proportional recency decay
     −0.25×(1−elapsed/120s), evaluated only inside the window so it can't
     invert; engaged participants instead get share-of-voice — −0.25 when the
-    bot is ≥~1/3 of the last 10 channel messages (members don't count seconds
-    since they last spoke, they don't dominate the floor — a time window made
-    the bot go silent exactly mid-flow); direct mentions exempt from both
+    bot is ≥~1/3 of the last 10 channel messages AND a non-participant voice
+    is in that window (members don't count seconds since they last spoke,
+    they don't dominate the floor — a time window made the bot go silent
+    exactly mid-flow). The bystander gate keeps a 1:1 ping-pong safe: bot
+    share is structurally ~50% there, but with nobody outside the convo
+    speaking there is no floor to dominate; direct mentions exempt from both
   • shouldSpeak = score ≥ SPEAK_THRESHOLD (default 0.70)
         │
         ▼ (only if shouldSpeak && replyEnabled)
@@ -105,6 +108,12 @@ Discord MessageCreate
     response_format can't combine — safe, wrap-ups rarely carry toolCues.
     index.ts sends text, then honors the flag with convo.leave (REPLY_EXIT=0
     disables; regex dismissal overrides regardless)
+  • structured output that fails to parse runs a salvage ladder — strip think
+    blocks and re-parse → quoted "text" field → post-</think> tail → empty
+    (silence over leak, counted as reply.parse_failed). Independently,
+    looksLikeSchemaLeak() is the hard send-boundary guard: any reply still
+    containing end_conversation, think tags, or a "text" field is dropped
+    (reply.schema_leak) — model internals never reach the channel
   • temperature 0.9, max 1800 chars
   • REPLY_MODEL overrides the reply model on every path (default GROQ_MODEL);
     gpt-oss/qwen models get reasoning_effort=low to keep casual chat fast

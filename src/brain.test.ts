@@ -172,11 +172,45 @@ test("reply: parses {text, end_conversation} via strict json_schema on the plain
   assert.deepEqual(calls.responses[0].text.format.schema.required, ["text", "end_conversation"]);
 });
 
-test("reply: unparseable output degrades to plain text with endConversation=false", async () => {
+test("reply: unparseable structured output goes silent rather than leaking internals", async () => {
+  // The salvage ladder's floor is empty text — a structured-path response that
+  // can't be salvaged is suppressed (the caller's `if (clean)` skips the send)
+  // because raw model output may contain draft text, think blocks, or schema
+  // internals that must never reach the channel.
   const { client } = stubClient({ outputText: "just a plain answer" });
   const b = new Brain("k", "m", undefined, client);
   const r = await b.reply(msg("hello"), [], []);
-  assert.equal(r.text, "just a plain answer");
+  assert.equal(r.text, "");
+  assert.equal(r.endConversation, false);
+});
+
+test("reply: think-wrapped JSON is salvaged — think block stripped, JSON parsed", async () => {
+  const { client } = stubClient({
+    outputText: `<think>draft reasoning with end_conversation: true in it</think>{"text":"the real answer","end_conversation":false}`,
+  });
+  const b = new Brain("k", "m", undefined, client);
+  const r = await b.reply(msg("hi"), [], []);
+  assert.equal(r.text, "the real answer");
+  assert.equal(r.endConversation, false, "the schema's own flag wins over the think-block draft");
+});
+
+test("reply: schema-ish invalid JSON is salvaged via the quoted text field", async () => {
+  const { client } = stubClient({ outputText: `{"text": "salvaged answer", end_conversation: false}` });
+  const b = new Brain("k", "m", undefined, client);
+  const r = await b.reply(msg("hi"), [], []);
+  assert.equal(r.text, "salvaged answer");
+  assert.equal(r.endConversation, false);
+});
+
+test("reply: unclosed-draft + </think> + final answer shape yields the tail", async () => {
+  // The observed leak shape: draft prose with the field name inline, a close
+  // tag, then the actual reply — the post-think tail is the answer.
+  const { client } = stubClient({
+    outputText: `let me think about this, end_conversation: false probably </think> the actual reply`,
+  });
+  const b = new Brain("k", "m", undefined, client);
+  const r = await b.reply(msg("hi"), [], []);
+  assert.equal(r.text, "the actual reply");
   assert.equal(r.endConversation, false);
 });
 

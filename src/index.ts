@@ -5,7 +5,7 @@ import { sql } from "./db.js";
 import { MemoryStore } from "./database.js";
 import { createBrainResolver, guardedLlmFetch } from "./brains.js";
 import { commandDefinitions, handleMemoryButton, handleMemoryCommand, handleSetupModal } from "./commands.js";
-import { detectDismissal, detectWakeWord, questionKeywords, roomAddressCue, shouldInspectForMemory, toolCues } from "./perception.js";
+import { detectDismissal, detectWakeWord, looksLikeSchemaLeak, questionKeywords, roomAddressCue, shouldInspectForMemory, toolCues } from "./perception.js";
 import { ConversationTracker } from "./conversation.js";
 import { ProactiveScheduler } from "./proactive.js";
 import { EventStore } from "./events.js";
@@ -627,7 +627,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   if (replyToId) proactive.observeEngagement(replyToId);
   // This human message counts toward share-of-voice before scoring — it
   // dilutes the bot's floor share for the decide() below.
-  convo.noteMessage(key, false);
+  convo.noteMessage(key, false, event.authorId);
   // An addressed message enrolls the author — opening the conversation if it
   // wasn't already (first participant in → opened).
   // ENGAGEMENT=0 = address-only mode: no conversation state is enrolled at
@@ -657,7 +657,12 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   }
   const lastSpokeAt = convo.lastSpokeAt(key);
   const elapsedSinceLastSpoke = lastSpokeAt === undefined ? Infinity : Date.now() - lastSpokeAt;
-  const decision = brain.decide(event, elapsedSinceLastSpoke, engaged, convo.botShare(key), config.speakThreshold);
+  // The share-of-voice penalty exists to keep the bot off a shared floor —
+  // it only applies when someone OUTSIDE the conversation spoke recently. A
+  // 1:1 ping-pong is structurally ~50% bot forever; with no bystanders there
+  // is no floor to dominate, so share is gated to zero.
+  const share = convo.bystanderVoices(key) > 0 ? convo.botShare(key) : 0;
+  const decision = brain.decide(event, elapsedSinceLastSpoke, engaged, share, config.speakThreshold);
   if (!settings.replyEnabled || !decision.shouldSpeak) {
     // The bot stayed silent on a question — arm the stranded-question timer.
     // A question it already answered never reaches here, so it can't be
@@ -734,6 +739,11 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     const toolsOn = config.replyTools && (toolCues(event.content) || event.mentionsBot || engaged);
     const { text, endConversation } = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, relationships, config.replyModel, toolsOn, client.user!.id, { guildName: message.guild.name, ownerName, botName: message.guild.members.me?.displayName ?? client.user!.username }, toolCtx, imageContext);
     const clean = text ? scrubMentions(text, lookups.names) : "";
+    // Hard send-boundary guard: model internals (schema fields, think blocks)
+    // must never reach the channel no matter which reply path produced them.
+    // Silence over leak — the parser's salvage ladder should catch these
+    // first, so anything reaching here is a shape the ladder missed.
+    if (clean && looksLikeSchemaLeak(clean)) { inc("reply.schema_leak"); return; }
     if (clean) {
       const sent = await message.reply({ content: clean, allowedMentions: { parse: [], repliedUser: false } });
       convo.noteReply(key); inc("reply.sent");

@@ -91,3 +91,50 @@ test("unknown keys and users are simply not participants", () => {
   assert.equal(convo.isOpen("other:chan"), false);
   assert.equal(convo.lastSpokeAt("other:chan"), undefined);
 });
+
+// ── bystanderVoices: the share-of-voice floor only exists when non-participants
+// are speaking ───────────────────────────────────────────────────────────────
+
+test("bystanderVoices: a solo 1:1 ping-pong has no floor to protect", () => {
+  const K = "g:solo";
+  convo.addressed(K, "alice");                    // alice enrolls
+  convo.noteMessage(K, false, "alice");           // her messages…
+  convo.noteReply(K);                             // …ping-pong with the bot…
+  convo.noteMessage(K, false, "alice");
+  convo.noteReply(K);
+  assert.ok(convo.botShare(K) >= 0.4, "bot share is structurally high in a 1:1");
+  assert.equal(convo.bystanderVoices(K), 0, "the only human voice IS the participant — no bystanders");
+});
+
+test("bystanderVoices: a non-participant voice on the floor counts", () => {
+  const K = "g:floor";
+  convo.addressed(K, "alice");
+  convo.noteMessage(K, false, "alice");
+  convo.noteMessage(K, false, "bob");             // bob speaks without joining
+  convo.noteReply(K);
+  assert.equal(convo.bystanderVoices(K), 1, "bob is a bystander — the floor exists");
+  convo.noteMessage(K, false, "carol");
+  assert.equal(convo.bystanderVoices(K), 2, "distinct bystanders count once each");
+  convo.noteMessage(K, false, "bob");             // same bystander again
+  assert.equal(convo.bystanderVoices(K), 2, "repeats don't inflate the count");
+});
+
+test("bystanderVoices: two addressed humans chatting with the bot are still no floor", () => {
+  const K = "g:trio";
+  convo.addressed(K, "alice");
+  convo.addressed(K, "bob");                      // both join the convo
+  convo.noteMessage(K, false, "alice");
+  convo.noteMessage(K, false, "bob");
+  convo.noteReply(K);
+  assert.equal(convo.bystanderVoices(K), 0, "participants aren't bystanders even when there are two");
+});
+
+test("bystanderVoices: an expired participant's messages become bystander traffic", () => {
+  const K = "g:lapsed";
+  convo.addressed(K, "alice");
+  convo.noteMessage(K, false, "alice");
+  convo.noteReply(K);
+  assert.equal(convo.bystanderVoices(K), 0);
+  advance(130_000);                               // alice's TTL lapses
+  assert.equal(convo.bystanderVoices(K), 1, "she decayed out — her recent messages are floor traffic now");
+});

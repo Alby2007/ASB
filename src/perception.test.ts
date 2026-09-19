@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { detectDismissal, detectNamingRequest, detectSelfNaming, detectWakeWord, questionKeywords, roomAddressCue, shouldInspectForMemory } from "./perception.js";
+import { detectDismissal, detectNamingRequest, detectSelfNaming, detectWakeWord, looksLikeSchemaLeak, questionKeywords, roomAddressCue, shouldInspectForMemory } from "./perception.js";
 import type { MessageEvent } from "./types.js";
 
 function msg(content: string, overrides: Partial<MessageEvent> = {}): MessageEvent {
@@ -155,4 +155,22 @@ test("questionKeywords caps and dedupes", () => {
   const many = questionKeywords("apple banana cherry durian elderberry fig grape");
   assert.equal(many.length, 5);
   assert.deepEqual(questionKeywords("raid raid raid tonight raid"), ["raid", "tonight"]);
+});
+
+// ── looksLikeSchemaLeak: the send-boundary guard ──────────────────────────────
+
+test("looksLikeSchemaLeak catches schema fields, think blocks, and field dumps", () => {
+  assert.ok(looksLikeSchemaLeak(`{"text":"hi","end_conversation":false}`));
+  assert.ok(looksLikeSchemaLeak(`draft ramble </think> the answer`));
+  assert.ok(looksLikeSchemaLeak(`<think>reasoning</think>answer`));
+  assert.ok(looksLikeSchemaLeak(`sure, let me set end_conversation to true`));
+  assert.ok(looksLikeSchemaLeak(`{"text": "partial dump`));
+});
+
+test("looksLikeSchemaLeak leaves ordinary human and bot speech alone", () => {
+  assert.equal(looksLikeSchemaLeak("check the text I sent earlier"), false);
+  assert.equal(looksLikeSchemaLeak("the text: hi thing you quoted"), false);   // needs quoted "text"
+  assert.equal(looksLikeSchemaLeak("I think you're right about that"), false); // "think" isn't a tag
+  assert.equal(looksLikeSchemaLeak("end the conversation whenever"), false);   // spaced words aren't the field
+  assert.equal(looksLikeSchemaLeak("lol nice one"), false);
 });

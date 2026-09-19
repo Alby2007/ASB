@@ -178,3 +178,12 @@ export function questionKeywords(content: string, max = 5): string[] {
   }
   return out;
 }
+
+// Send-boundary guard: text that looks like leaked model internals — the
+// reply schema's field names or reasoning-model think blocks — must never
+// reach a channel. These tokens can't false-positive on human speech: nobody
+// writes `end_conversation` or `</think>` in Discord chat, and the "text":
+// pattern requires the literal quoted field name.
+export function looksLikeSchemaLeak(text: string): boolean {
+  return /\bend_conversation\b|<\/?\s*think\s*>|"text"\s*:\s*"/.test(text);
+}

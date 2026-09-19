@@ -4,12 +4,15 @@ type ChannelConvo = {
   participants: Map<string, number>; // userId -> expiry (from last ADDRESSED message)
   openedAt?: number;                 // set when the first participant enrolls; cleared on close
   lastBotSpokeAt?: number;
-  recentBotFlags: boolean[];         // share-of-voice window — channel-level, survives close
+  recentVoices: Array<{ bot: boolean; authorId?: string }>; // share-of-voice window — channel-level, survives close
 };
 
 // Share-of-voice window: the bot's fraction of the last N channel messages is
 // the engaged-tier pacing signal — members don't count seconds since they last
-// spoke, they don't dominate the floor.
+// spoke, they don't dominate the floor. Entries carry the author so callers
+// can tell a shared floor (bystander voices present) from a ping-pong 1:1 —
+// the penalty exists to protect bystanders, and a bot at ~50% in a 1:1 has
+// no floor to dominate.
 const VOICE_WINDOW = 10;
 
 /**
@@ -108,18 +111,32 @@ export class ConversationTracker {
     this.noteMessage(key, true);
   }
 
-  /** Record a channel message for the share-of-voice window (bounded deque). */
-  noteMessage(key: string, fromBot: boolean): void {
+  /** Record a channel message for the share-of-voice window (bounded deque).
+   * authorId lets bystanderVoices() tell floor bystanders from participants. */
+  noteMessage(key: string, fromBot: boolean, authorId?: string): void {
     const ch = this.getOrCreate(key);
-    ch.recentBotFlags.push(fromBot);
-    if (ch.recentBotFlags.length > VOICE_WINDOW) ch.recentBotFlags.shift();
+    ch.recentVoices.push({ bot: fromBot, authorId });
+    if (ch.recentVoices.length > VOICE_WINDOW) ch.recentVoices.shift();
   }
 
   /** The bot's fraction of the last VOICE_WINDOW channel messages (0–1). */
   botShare(key: string): number {
-    const flags = this.channels.get(key)?.recentBotFlags;
-    if (!flags?.length) return 0;
-    return flags.filter(Boolean).length / flags.length;
+    const voices = this.channels.get(key)?.recentVoices;
+    if (!voices?.length) return 0;
+    return voices.filter(v => v.bot).length / voices.length;
+  }
+
+  /** Distinct humans in the window who are NOT current participants —
+   * the floor the bot could actually be dominating. A 1:1 has none. */
+  bystanderVoices(key: string): number {
+    const ch = this.channels.get(key);
+    if (!ch) return 0;
+    this.sweepExpired(key, ch); // an expired participant's messages are bystander traffic again
+    return new Set(
+      ch.recentVoices
+        .filter(v => !v.bot && v.authorId && !ch.participants.has(v.authorId))
+        .map(v => v.authorId)
+    ).size;
   }
 
   lastSpokeAt(key: string): number | undefined {
@@ -129,7 +146,7 @@ export class ConversationTracker {
   private getOrCreate(key: string): ChannelConvo {
     let ch = this.channels.get(key);
     if (!ch) {
-      ch = { participants: new Map(), recentBotFlags: [] };
+      ch = { participants: new Map(), recentVoices: [] };
       this.channels.set(key, ch);
     }
     return ch;
