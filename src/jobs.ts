@@ -9,6 +9,8 @@ import { logError } from "./secrets.js";
 // FOR UPDATE SKIP LOCKED makes concurrent claims impossible and a crashed
 // worker can't hold a claim (no locked_at needed). attempts >= 5 dead-letters
 // by exclusion from the claim index; rows stay inspectable, never auto-deleted.
+// The final failure fires jobs.dead_letter; scripts/requeue-dead-jobs.mjs
+// re-drives them after a fix.
 
 export interface Job {
   id: number;
@@ -19,6 +21,42 @@ export interface Job {
 }
 
 export const MAX_JOB_ATTEMPTS = 5;
+
+/** Permanent failure — the job can never succeed (e.g. unknown type, malformed
+ * payload). Throwing this dead-letters immediately instead of burning retries. */
+export class FatalJobError extends Error {}
+
+// ── Guild pause / idle tracking ───────────────────────────────────────────────
+// Module-level so callers without a worker handle (e.g. /server-build in
+// commands.ts) can serialize against live extraction: ingest calls
+// pipeline.process outside the queue, and interleaving with a worker's
+// extract job would race the per-guild event ordering maxPerGuild protects.
+const pausedGuilds = new Set<string>();
+const guildInFlight = new Map<string, number>();
+const guildIdleWaiters = new Map<string, Array<() => void>>();
+
+/** Exclude a guild from new claims. Does not stop already-claimed jobs —
+ * pair with waitForGuildIdle to fully drain before starting bulk work. */
+export function pauseGuildClaims(guildId: string): void { pausedGuilds.add(guildId); }
+export function resumeGuildClaims(guildId: string): void { pausedGuilds.delete(guildId); }
+
+/** Resolves when the guild has no in-flight jobs, or after timeoutMs — a
+ * wedged job must not hang a server build forever. */
+export function waitForGuildIdle(guildId: string, timeoutMs: number): Promise<void> {
+  if (!guildInFlight.get(guildId)) return Promise.resolve();
+  return new Promise(resolve => {
+    const wrapped = () => { clearTimeout(timer); resolve(); };
+    const timer = setTimeout(() => {
+      const list = guildIdleWaiters.get(guildId);
+      if (list) guildIdleWaiters.set(guildId, list.filter(w => w !== wrapped));
+      resolve();
+    }, timeoutMs);
+    timer.unref();
+    const waiters = guildIdleWaiters.get(guildId) ?? [];
+    waiters.push(wrapped);
+    guildIdleWaiters.set(guildId, waiters);
+  });
+}
 
 /** Insert a job and nudge the worker via NOTIFY (a wake hint only — the 3s
  * poll is the resilient baseline, so a missed notification costs one poll).
@@ -99,7 +137,9 @@ export function startWorker(deps: WorkerDeps): { stop: () => Promise<void> } {
   const maxPerGuild = deps.maxPerGuild ?? 1;
   const pollMs = deps.pollMs ?? 3000;
   const onError = deps.onError ?? ((m: string, e: unknown) => logError(m, e));
-  const inFlightByGuild = new Map<string, number>();
+  // Per-guild counts live in module-scope guildInFlight (shared across workers
+  // in the same process and observable by waitForGuildIdle); the global cap
+  // stays per-worker.
   let inFlight = 0;
   let stopped = false;
   let unlisten: (() => Promise<void>) | undefined;
@@ -111,7 +151,13 @@ export function startWorker(deps: WorkerDeps): { stop: () => Promise<void> } {
       await completeJob(sql, job.id);
       inc("jobs.completed");
     } catch (error) {
-      if (error instanceof BudgetExceeded) {
+      if (error instanceof FatalJobError) {
+        // Permanent failure — park the row out of the claim set immediately;
+        // it stays inspectable like any other dead letter.
+        await sql`UPDATE jobs SET attempts = ${MAX_JOB_ATTEMPTS} WHERE id = ${job.id}`;
+        inc("jobs.dead_letter");
+        onError(`job ${job.id} (${job.type}) dead-lettered: ${error.message}`, error);
+      } else if (error instanceof BudgetExceeded) {
         // Cap is not a fault: un-burn the claim attempt and park the job until
         // the UTC-day counter resets. No log spam — this is expected flow.
         await sql`UPDATE jobs SET attempts = attempts - 1, run_after = ${nextUtcMidnight()} WHERE id = ${job.id}`;
@@ -122,7 +168,15 @@ export function startWorker(deps: WorkerDeps): { stop: () => Promise<void> } {
         const delayMs = Math.min(2 ** job.attempts, 30) * 60_000;
         await sql`UPDATE jobs SET run_after = now() + ${delayMs} * interval '1 millisecond' WHERE id = ${job.id}`;
         inc("jobs.retry");
-        onError(`job ${job.id} (${job.type}) failed — attempt ${job.attempts}/${MAX_JOB_ATTEMPTS}`, error);
+        if (job.attempts >= MAX_JOB_ATTEMPTS) {
+          // The claim just burned the last attempt — this row has left the
+          // runnable set for good. Surface it: silent dead-letters are the
+          // failure mode nobody notices for weeks.
+          inc("jobs.dead_letter");
+          onError(`job ${job.id} (${job.type}) dead-lettered after ${job.attempts} attempts`, error);
+        } else {
+          onError(`job ${job.id} (${job.type}) failed — attempt ${job.attempts}/${MAX_JOB_ATTEMPTS}`, error);
+        }
       }
     }
   }
@@ -139,7 +193,8 @@ export function startWorker(deps: WorkerDeps): { stop: () => Promise<void> } {
     claiming = true;
     try {
       while (!stopped && inFlight < maxInflight) {
-        const atCap = new Set([...inFlightByGuild].filter(([, n]) => n >= maxPerGuild).map(([g]) => g));
+        const atCap = new Set([...guildInFlight].filter(([, n]) => n >= maxPerGuild).map(([g]) => g));
+        for (const g of pausedGuilds) atCap.add(g);
         let job: Job | null;
         try {
           job = await claimNext(sql, atCap);
@@ -149,12 +204,17 @@ export function startWorker(deps: WorkerDeps): { stop: () => Promise<void> } {
         }
         if (!job) return;
         inFlight++;
-        inFlightByGuild.set(job.guild_id, (inFlightByGuild.get(job.guild_id) ?? 0) + 1);
+        guildInFlight.set(job.guild_id, (guildInFlight.get(job.guild_id) ?? 0) + 1);
         void runJob(job).finally(() => {
           inFlight--;
-          const left = (inFlightByGuild.get(job.guild_id) ?? 1) - 1;
-          if (left > 0) inFlightByGuild.set(job.guild_id, left);
-          else inFlightByGuild.delete(job.guild_id);
+          const left = (guildInFlight.get(job.guild_id) ?? 1) - 1;
+          if (left > 0) {
+            guildInFlight.set(job.guild_id, left);
+          } else {
+            guildInFlight.delete(job.guild_id);
+            guildIdleWaiters.get(job.guild_id)?.forEach(r => r());
+            guildIdleWaiters.delete(job.guild_id);
+          }
           if (stopped && inFlight === 0) drainWaiters.splice(0).forEach(r => r());
           else void tick(); // freed capacity — claim again immediately
         });

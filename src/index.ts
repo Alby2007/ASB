@@ -12,7 +12,7 @@ import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
 import { ProfileStore } from "./profiles.js";
 import { buildAliasMap, demangleMentions, findMentionedUsers, scrubMentions, type AliasMap } from "./entity-resolution.js";
-import { enqueue, startWorker } from "./jobs.js";
+import { enqueue, startWorker, FatalJobError } from "./jobs.js";
 import { buildPairContext, type ToolCtx } from "./lookup-tools.js";
 import { qualifyingImages, formatImageContext, IMAGE_MAX_PER_MESSAGE, type AttachmentMeta } from "./vision.js";
 import { withRetry } from "./retry.js";
@@ -108,7 +108,16 @@ async function init() {
   // Deferrable cognition runs here — extract jobs claimed per-guild-serial,
   // global cap 8. LISTEN 'jobs' for wake hints, 3s poll as the baseline.
   worker = startWorker({
-    sql, handle: job => runExtractJob(job.payload as ExtractJobPayload, extractDeps),
+    sql,
+    handle: job => {
+      // Unknown types are a code bug, not a transient fault — dead-letter
+      // immediately rather than retrying something that can never succeed.
+      if (job.type !== "extract") {
+        inc("jobs.unknown_type");
+        return Promise.reject(new FatalJobError(`unknown job type: ${job.type}`));
+      }
+      return runExtractJob(job.payload as ExtractJobPayload, extractDeps);
+    },
     onError: (m, e) => logError(m, e),
   });
 }
@@ -299,6 +308,12 @@ async function sweepMissedSignals(windowMs: number) {
       // No key → nothing to triage or extract with — skip the guild entirely.
       const brain = await brainFor(guild.id);
       if (!brain) continue;
+      // Repair 'queued' marks whose jobs vanished (dormant-drop, crash) or
+      // dead-lettered — orphaned marks would otherwise strand messages forever.
+      const repaired = await store.repairQueuedMarks(guild.id);
+      if (repaired.rejoined) inc("jobs.marks_rejoined", repaired.rejoined);
+      if (repaired.dead) inc("jobs.marks_dead", repaired.dead);
+      if (repaired.requeued) inc("jobs.marks_requeued", repaired.requeued);
       const pending = (await store.listUninspectedMessages(guild.id, new Date(Date.now() - windowMs), client.user!.id))
         .filter(m => !settings.ignoredChannels.includes(m.channelId)); // ignored = invisible, including rows archived before the flag
       if (!pending.length) continue;
@@ -613,7 +628,9 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   // 'extract' job — the live path keeps only recordMessage/decide/reply so a
   // busy guild can't stack unbounded concurrent LLM calls inside one handler.
   // 'queued' marks the row so the sweep (NULL/'durable'/'regex' only) can't
-  // double-extract; a dead job just stays 'queued' — bounded loss, metric'd.
+  // double-extract; orphaned marks (job gone or dead-lettered) are repaired by
+  // the sweep's repairQueuedMarks pass — 'durable' re-enqueues, 'dead' is
+  // terminal but visible.
   if (settings.memoryEnabled && (shouldInspectForMemory(event) || images.length)) {
     try {
       await enqueue(sql, event.guildId, "extract", { event, replyToId, replyToContent });

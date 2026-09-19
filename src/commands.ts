@@ -9,6 +9,7 @@ import { isSafeUrl, resolvesToPrivateAddress } from "./tools.js";
 import { guardedLlmFetch } from "./brains.js";
 import { runProfileBuild, PROFILE_BUILD_COOLDOWN_MS } from "./profile-build.js";
 import { runServerIngest } from "./server-ingest.js";
+import { pauseGuildClaims, resumeGuildClaims, waitForGuildIdle } from "./jobs.js";
 import { metricsSnapshot } from "./metrics.js";
 import type { MessageEvent } from "./types.js";
 import { config } from "./config.js";
@@ -213,8 +214,10 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     const keyLine = keyRow
       ? `**LLM key:** server key \`${keyRow.keyHint}\`${keyRow.validatedAt ? ` · verified ${new Date(keyRow.validatedAt).toLocaleDateString()}` : " · unverified"}`
       : `**LLM key:** operator default${config.requireGuildKeys ? " (guild key required — none set, dormant)" : ""}`;
-    const [usage, depth] = await Promise.all([store.usageToday(guildId), store.queueDepth(guildId)]);
-    const budgetLine = `**LLM usage:** ${usage.toLocaleString()}/${settings.llmDailyCap.toLocaleString()} calls today · **queue:** ${depth} job${depth === 1 ? "" : "s"} pending`;
+    const [usage, qstats] = await Promise.all([store.usageToday(guildId), store.queueStats(guildId)]);
+    const oldestMin = qstats.oldestPendingAt ? Math.max(0, Math.round((Date.now() - qstats.oldestPendingAt.getTime()) / 60_000)) : null;
+    const queueLine = `**queue:** ${qstats.pending} job${qstats.pending === 1 ? "" : "s"} pending${oldestMin !== null ? ` (oldest ${oldestMin}m ago)` : ""}${qstats.dead ? ` · ${qstats.dead} dead-lettered — operator can re-drive with scripts/requeue-dead-jobs.mjs` : ""}`;
+    const budgetLine = `**LLM usage:** ${usage.toLocaleString()}/${settings.llmDailyCap.toLocaleString()} calls today · ${queueLine}`;
     const flagsLine = `**Flags:** memory ${settings.memoryEnabled ? "on" : "paused"} · replies ${settings.replyEnabled ? "on" : "paused"} · ignored channels ${settings.ignoredChannels.length}`;
     return interaction.reply({ ephemeral: true, embeds: [new EmbedBuilder().setTitle("Bot status").setDescription(`**Uptime:** ${uptime}\n\n${counterLines}\n\n${proactiveLine}\n${flagsLine}\n${keyLine}\n${budgetLine}\n\n*${value.messages.toLocaleString()} raw messages · ${value.memories.toLocaleString()} active memories · ${value.lore.toLocaleString()} lore*`)] });
   }
@@ -571,16 +574,21 @@ export async function handleMemoryButton(interaction: ButtonInteraction, store: 
     try {
       await interaction.update({ content: `Server build started for #${(channel as TextChannel).name} — this runs long; results post to this channel when done.`, components: [] });
       buildStarted = true;
-      runServerIngest(channel as TextChannel, {
+      // Ingest calls pipeline.process outside the job queue — pause live
+      // extract claims for this guild and drain anything already claimed so
+      // the two can't interleave event-pipeline writes. The wait is bounded:
+      // a wedged job must not hang a build (the lease reclaims it anyway).
+      pauseGuildClaims(guildId);
+      waitForGuildIdle(guildId, 120_000).then(() => runServerIngest(channel as TextChannel, {
         store, brain, eventStore: evStore ?? new EventStore(),
         pipeline: new EventPipeline(), botId: interaction.client.user.id,
-      }).then(async s => {
+      })).then(async s => {
         const summary = `Server build done for #${(channel as TextChannel).name}: ${s.total.toLocaleString()} messages scanned · ${s.memoriesSaved} memories · ${s.relationshipsRecorded} relationship observations · ${s.eventsCreated} events · ${s.profilesBuilt} profiles built · ${s.llmErrors} LLM errors`;
         await announce(summary);
       }).catch(async err => {
         logError("Server build failed", err);
         await announce(`Server build for #${(channel as TextChannel).name} failed: ${(err as Error).message.slice(0, 180)}`);
-      }).finally(() => { serverBuildRunning = false; });
+      }).finally(() => { serverBuildRunning = false; resumeGuildClaims(guildId); });
       // Interaction tokens expire at ~15 min and a build can run longer — post
       // to the invoking channel, with followUp as the short-run fallback.
       async function announce(text: string) {

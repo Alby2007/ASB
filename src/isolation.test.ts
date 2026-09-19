@@ -114,8 +114,8 @@ test("store read paths return only the querying guild's rows", async () => {
 
     // Usage/queue depth scoped.
     assert.equal(await store.usageToday(A), 7);
-    assert.equal(await store.queueDepth(A), 1);
-    assert.equal(await store.queueDepth(B), 1);
+    assert.equal((await store.queueStats(A)).pending, 1);
+    assert.equal((await store.queueStats(B)).pending, 1);
   } finally { await sql.end(); }
 });
 

@@ -226,13 +226,77 @@ export class MemoryStore {
     return rows[0]?.llm_calls ?? 0;
   }
 
-  /** Live queue depth for /status — dead-lettered jobs (attempts >= 5) don't
-   * count; they no longer consume work. */
-  async queueDepth(guildId: string): Promise<number> {
-    const rows = await this.sql<Array<{ c: number }>>`
-      SELECT count(*)::int AS c FROM jobs WHERE guild_id = ${guildId} AND attempts < 5
+  /** Queue visibility for /status — pending work, dead-lettered rows
+   * (attempts >= 5: excluded from claiming but kept inspectable), and the
+   * oldest pending job's age so a draining-but-stale queue is visible. */
+  async queueStats(guildId: string): Promise<{ pending: number; dead: number; oldestPendingAt: Date | null }> {
+    const rows = await this.sql<Array<{ pending: number; dead: number; oldest: Date | string | null }>>`
+      SELECT count(*) FILTER (WHERE attempts < 5)::int AS pending,
+             count(*) FILTER (WHERE attempts >= 5)::int AS dead,
+             min(created_at) FILTER (WHERE attempts < 5) AS oldest
+      FROM jobs WHERE guild_id = ${guildId}
     `;
-    return rows[0].c;
+    const r = rows[0];
+    return { pending: r?.pending ?? 0, dead: r?.dead ?? 0, oldestPendingAt: r?.oldest ? new Date(r.oldest) : null };
+  }
+
+  /** Reconcile triage marks against job reality. 'queued'/'durable'/'regex'
+   * only mean "extraction was requested" — the mark is the source of truth the
+   * sweep reads, the job row is the source of truth for whether work exists.
+   * Three corrections:
+   *   1. any extraction-marked message with a live job → 'queued' (canonical;
+   *      also dedupes the enqueue-succeeded-but-mark-write-failed window)
+   *   2. 'queued' whose only jobs are dead-lettered → 'dead': terminal for the
+   *      sweep, still reachable by /profile-build's <> 'extracted' scan, and
+   *      overwritten by 'extracted' if the job is later re-driven
+   *   3. 'queued' with no job at all (dormant-drop, crash windows) → 'durable'
+   *      so the sweep re-enqueues it — listUninspectedMessages reads
+   *      durable/regex marks at any age, so no window can strand them */
+  async repairQueuedMarks(guildId: string): Promise<{ rejoined: number; dead: number; requeued: number }> {
+    return this.sql.begin(async sql => {
+      const joined = await sql<Array<{ n: number }>>`
+        WITH upd AS (
+          UPDATE messages m SET triage_result = 'queued'
+          WHERE m.guild_id = ${guildId} AND m.triage_result IN ('durable', 'regex')
+            AND EXISTS (
+              SELECT 1 FROM jobs j
+              WHERE j.guild_id = m.guild_id AND j.attempts < 5
+                AND j.payload->'event'->>'messageId' = m.id
+            )
+          RETURNING 1
+        ) SELECT count(*)::int AS n FROM upd
+      `;
+      const deadRows = await sql<Array<{ n: number }>>`
+        WITH upd AS (
+          UPDATE messages m SET triage_result = 'dead'
+          WHERE m.guild_id = ${guildId} AND m.triage_result = 'queued'
+            AND NOT EXISTS (
+              SELECT 1 FROM jobs j
+              WHERE j.guild_id = m.guild_id AND j.attempts < 5
+                AND j.payload->'event'->>'messageId' = m.id
+            )
+            AND EXISTS (
+              SELECT 1 FROM jobs j
+              WHERE j.guild_id = m.guild_id AND j.attempts >= 5
+                AND j.payload->'event'->>'messageId' = m.id
+            )
+          RETURNING 1
+        ) SELECT count(*)::int AS n FROM upd
+      `;
+      const requeueRows = await sql<Array<{ n: number }>>`
+        WITH upd AS (
+          UPDATE messages m SET triage_result = 'durable'
+          WHERE m.guild_id = ${guildId} AND m.triage_result = 'queued'
+            AND NOT EXISTS (
+              SELECT 1 FROM jobs j
+              WHERE j.guild_id = m.guild_id
+                AND j.payload->'event'->>'messageId' = m.id
+            )
+          RETURNING 1
+        ) SELECT count(*)::int AS n FROM upd
+      `;
+      return { rejoined: joined[0]?.n ?? 0, dead: deadRows[0]?.n ?? 0, requeued: requeueRows[0]?.n ?? 0 };
+    });
   }
 
   // ── Guild LLM keys (BYOK) ────────────────────────────────────────────────────
@@ -999,16 +1063,22 @@ export class MemoryStore {
     });
   }
 
-  /** Recent messages the pipeline never classified — no triage mark and no
-   * evidence row. The periodic sweep re-examines these: regex-passed ones get
-   * extracted directly, the rest go through LLM triage. Note: `messages` has
-   * no bot flag, so other bots' messages are included — bounded noise. */
+  /** Recent messages the pipeline never classified, plus orphaned extraction
+   * marks at ANY age: 'durable'/'regex' only ever mean "requested but not yet
+   * extracted", and a live job would have flipped the mark to 'queued' (the
+   * sweep's repairQueuedMarks pass does that reconciliation first) — so one
+   * of these with no evidence row is definitively stranded work, and the 2h
+   * sweep window must not hide it. Note: `messages` has no bot flag, so other
+   * bots' messages are included — bounded noise. */
   async listUninspectedMessages(guildId: string, since: Date, excludeAuthorId: string, limit = 500): Promise<Array<{ id: string; channelId: string; authorId: string; authorName: string; content: string; createdAt: Date | string; replyToId: string | null; triageResult: string | null }>> {
     const rows = await this.sql<Array<{ id: string; channel_id: string; author_id: string; author_name: string; content: string; created_at: Date | string; reply_to_id: string | null; triage_result: string | null }>>`
       SELECT m.id, m.channel_id, m.author_id, m.author_name, m.content, m.created_at, m.reply_to_id, m.triage_result
       FROM messages m
-      WHERE m.guild_id = ${guildId} AND m.created_at > ${since.toISOString()}
-        AND (m.triage_result IS NULL OR m.triage_result IN ('durable', 'regex'))
+      WHERE m.guild_id = ${guildId}
+        AND (
+          m.triage_result IN ('durable', 'regex')
+          OR (m.triage_result IS NULL AND m.created_at > ${since.toISOString()})
+        )
         AND m.author_id <> ${excludeAuthorId}
         AND m.content <> ''
         AND NOT EXISTS (SELECT 1 FROM memory_evidence e WHERE e.message_id = m.id)

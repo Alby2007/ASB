@@ -2,8 +2,9 @@ import "dotenv/config";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { makeTestSql, makeStore } from "./test-helpers.js";
-import { enqueue, claimNext, startWorker, MAX_JOB_ATTEMPTS, type Job } from "./jobs.js";
+import { enqueue, claimNext, startWorker, MAX_JOB_ATTEMPTS, FatalJobError, pauseGuildClaims, resumeGuildClaims, waitForGuildIdle, type Job } from "./jobs.js";
 import { BudgetExceeded, meteredClient } from "./budget.js";
+import { metricsSnapshot } from "./metrics.js";
 import type { LlmClient } from "./brain.js";
 
 // ── Job queue + budget ───────────────────────────────────────────────────────
@@ -129,6 +130,149 @@ test("worker enforces per-guild serial execution and parallelizes across guilds"
       const [{ c }] = await sql<Array<{ c: number }>>`SELECT count(*)::int AS c FROM jobs`;
       assert.equal(c, 0, "all jobs drained");
     } finally { await worker.stop(); }
+  } finally { await sql.end(); }
+});
+
+test("FatalJobError dead-letters immediately instead of retrying", async () => {
+  const sql = makeTestSql();
+  try {
+    await makeStore(sql);
+    const deadBefore = metricsSnapshot().counts["jobs.dead_letter"] ?? 0;
+    const worker = startWorker({
+      sql: sql as any,
+      pollMs: 20,
+      handle: async () => { throw new FatalJobError("unknown job type: bogus"); },
+    });
+    try {
+      const id = await enqueue(sql as any, "g1", "bogus", { n: 1 });
+      await new Promise(r => setTimeout(r, 200));
+      const [row] = await sql<Array<{ attempts: number }>>`SELECT attempts FROM jobs WHERE id = ${id}`;
+      assert.equal(row?.attempts, MAX_JOB_ATTEMPTS, "fatal failure must dead-letter in one shot");
+      assert.equal(metricsSnapshot().counts["jobs.dead_letter"], deadBefore + 1);
+    } finally { await worker.stop(); }
+  } finally { await sql.end(); }
+});
+
+test("a transient failure on the last attempt surfaces as dead-lettered", async () => {
+  const sql = makeTestSql();
+  try {
+    await makeStore(sql);
+    const deadBefore = metricsSnapshot().counts["jobs.dead_letter"] ?? 0;
+    const worker = startWorker({
+      sql: sql as any,
+      pollMs: 20,
+      handle: async () => { throw new Error("boom"); },
+    });
+    try {
+      const id = await enqueue(sql as any, "g1", "extract", { n: 1 });
+      await sql`UPDATE jobs SET attempts = ${MAX_JOB_ATTEMPTS - 1} WHERE id = ${id}`;
+      await new Promise(r => setTimeout(r, 200));
+      const [row] = await sql<Array<{ attempts: number }>>`SELECT attempts FROM jobs WHERE id = ${id}`;
+      assert.equal(row?.attempts, MAX_JOB_ATTEMPTS);
+      assert.equal(metricsSnapshot().counts["jobs.dead_letter"], deadBefore + 1, "final-attempt failure must metric the dead letter");
+    } finally { await worker.stop(); }
+  } finally { await sql.end(); }
+});
+
+test("paused guilds are excluded from claims until resumed; waitForGuildIdle drains", async () => {
+  const sql = makeTestSql();
+  try {
+    await makeStore(sql);
+    pauseGuildClaims("g-p");
+    try {
+      const done: string[] = [];
+      const worker = startWorker({ sql: sql as any, pollMs: 20, handle: async job => { done.push(job.guild_id); } });
+      try {
+        await enqueue(sql as any, "g-p", "extract", { n: 1 });
+        await enqueue(sql as any, "g-q", "extract", { n: 2 });
+        await new Promise(r => setTimeout(r, 200));
+        assert.deepEqual(done, ["g-q"], "paused guild's jobs must not be claimed");
+        const [{ attempts }] = await sql<Array<{ attempts: number }>>`SELECT attempts FROM jobs WHERE guild_id = 'g-p'`;
+        assert.equal(attempts, 0);
+        resumeGuildClaims("g-p");
+        await new Promise(r => setTimeout(r, 200));
+        assert.deepEqual(done.sort(), ["g-p", "g-q"], "resumed guild's jobs drain normally");
+      } finally { await worker.stop(); }
+    } finally { resumeGuildClaims("g-p"); }
+  } finally { await sql.end(); }
+});
+
+test("waitForGuildIdle resolves on drain, not before; timeout bounds the wait", async () => {
+  const sql = makeTestSql();
+  try {
+    await makeStore(sql);
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    let claimed = false;
+    const worker = startWorker({ sql: sql as any, pollMs: 20, handle: async () => { claimed = true; await gate; } });
+    try {
+      await enqueue(sql as any, "g-w", "extract", { n: 1 });
+      while (!claimed) await new Promise(r => setTimeout(r, 10));
+      let idle = false;
+      void waitForGuildIdle("g-w", 5000).then(() => { idle = true; });
+      await waitForGuildIdle("g-w", 30); // bounded — resolves even though the job is still gated
+      await new Promise(r => setTimeout(r, 50));
+      assert.equal(idle, false, "idle must not resolve while a job runs");
+      release();
+      await new Promise(r => setTimeout(r, 100));
+      assert.equal(idle, true, "idle resolves once the job drains");
+    } finally { await worker.stop(); }
+  } finally { await sql.end(); }
+});
+
+test("repairQueuedMarks: live job keeps 'queued', dead job → 'dead', no job → 'durable'", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    await sql`
+      INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, content, created_at, triage_result)
+      VALUES ('m1','g1','c1','u1','Ann','hello',now(),'queued'),
+             ('m2','g1','c1','u1','Ann','hi',now(),'queued'),
+             ('m3','g1','c1','u1','Ann','yo',now(),'queued'),
+             ('m4','g1','c1','u1','Ann','marked durable, mark write lost',now(),'durable')
+    `;
+    await enqueue(sql as any, "g1", "extract", { event: { messageId: "m1" } });
+    const deadId = await enqueue(sql as any, "g1", "extract", { event: { messageId: "m2" } });
+    await sql`UPDATE jobs SET attempts = ${MAX_JOB_ATTEMPTS} WHERE id = ${deadId}`;
+    await enqueue(sql as any, "g1", "extract", { event: { messageId: "m4" } }); // live job, stale 'durable' mark
+    const res = await store.repairQueuedMarks("g1");
+    assert.deepEqual(res, { rejoined: 1, dead: 1, requeued: 1 });
+    const rows = await sql<Array<{ id: string; triage_result: string }>>`SELECT id, triage_result FROM messages ORDER BY id`;
+    assert.deepEqual(rows.map(r => [r.id, r.triage_result]), [
+      ["m1", "queued"], ["m2", "dead"], ["m3", "durable"], ["m4", "queued"],
+    ]);
+  } finally { await sql.end(); }
+});
+
+test("listUninspectedMessages picks up stranded durable marks at any age", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    // A 'durable' mark days past the sweep window — orphaned work must not be
+    // hidden by created_at; NULL marks stay windowed to bound the scan.
+    await sql`
+      INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, content, created_at, triage_result)
+      VALUES ('old-durable','g1','c1','u1','Ann','stuck', now() - interval '10 days', 'durable'),
+             ('old-null','g1','c1','u1','Ann','too old to triage', now() - interval '10 days', NULL),
+             ('new-null','g1','c1','u1','Ann','fresh', now(), NULL),
+             ('dead-mark','g1','c1','u1','Ann','terminal', now(), 'dead')
+    `;
+    const rows = await store.listUninspectedMessages("g1", new Date(Date.now() - 2 * 60 * 60_000), "bot-id");
+    assert.deepEqual(rows.map(r => r.id).sort(), ["new-null", "old-durable"]);
+  } finally { await sql.end(); }
+});
+
+test("queueStats reports pending, dead, and oldest pending age", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    await enqueue(sql as any, "g1", "extract", { n: 1 });
+    const deadId = await enqueue(sql as any, "g1", "extract", { n: 2 });
+    await sql`UPDATE jobs SET attempts = ${MAX_JOB_ATTEMPTS} WHERE id = ${deadId}`;
+    const stats = await store.queueStats("g1");
+    assert.equal(stats.pending, 1);
+    assert.equal(stats.dead, 1);
+    assert.ok(stats.oldestPendingAt && Math.abs(Date.now() - stats.oldestPendingAt.getTime()) < 60_000);
   } finally { await sql.end(); }
 });
 

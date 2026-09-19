@@ -20,7 +20,8 @@ import { logError } from "./secrets.js";
 // pipeline/event ordering. BudgetExceeded from ANY stage propagates so the
 // worker reschedules the job to the UTC-day reset without burning an attempt;
 // other failures retry with backoff (capped at 5 attempts, then dead-letter —
-// 'queued' marks stay, bounded loss the sweep already tolerates).
+// the sweep's repairQueuedMarks pass turns the stranded 'queued' mark 'dead',
+// terminal but visible, and requeueable via scripts/requeue-dead-jobs.mjs).
 // Lives outside index.ts so it can be unit-tested (index.ts logs in on import).
 
 export type ExtractJobPayload = {
