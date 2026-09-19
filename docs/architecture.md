@@ -38,7 +38,7 @@ ASB (Artificial Server Member) is a single TypeScript/Node process that connects
 | `src/lookup-tools.ts` | `ToolCtx`, `executeLookupTool`, `buildPairContext` | Read-only internal lookup tools (person/relationship/memories/event) over the existing stores |
 | `src/reply-format.ts` | `formatReplyProfile`, `formatPairContext` | Pure formatters shared by the reply prompt and tool outputs |
 | `src/vision.ts` | `qualifyingImages`, `formatImageContext` | Pure image-attachment gate (image/*, byte cap, ≤3/message) + observation-framed label |
-| `src/engagement.ts` | `EngagementTracker` | Per-channel conversational sessions: participant set with per-user TTLs — who is talking *with* the bot; refresh on address only, so drift decays out |
+| `src/conversation.ts` | `ConversationTracker` | Per-channel conversation objects: opens on addressed messages, closes when the last participant leaves (TTL expiry, regex dismissal, or the model's `end_conversation`); share-of-voice pacing is channel-level and survives close |
 
 ---
 
@@ -64,10 +64,14 @@ Discord MessageCreate
   • "direct mention" = @-mention, reply-to-bot, or wake word — the bot's
     username, display name, server nick, or "asb" said in text (perception.ts
     detectWakeWord, word-boundary matched; WAKE_WORD=0 disables)
-  • "engaged" = the author addressed the bot within ENGAGEMENT_TTL_MS (default
-    120s) — engagement.ts tracks per-channel participants; TTL refreshes on
-    addressed messages only, NOT on bot replies, so drifting side-chatter
-    decays out and the bot drops mid-channel-talk (ENGAGEMENT=0 disables)
+  • "engaged" = the author is a participant in the channel's open
+    conversation — enrolled by addressing the bot within ENGAGEMENT_TTL_MS
+    (default 120s); TTL refreshes on addressed messages only, NOT on bot
+    replies, so drifting side-chatter decays out and the bot drops
+    mid-channel-talk (ENGAGEMENT=0 disables). Participants exit three ways:
+    TTL expiry, regex dismissal (the deterministic override — "shut up asb"
+    works even if the model wants to keep chatting), or the reply model's
+    end_conversation flag (REPLY_EXIT=0 disables honoring it)
   • engaged ≠ every message is at the bot: room-directed cues ("did anyone",
     "you guys" — perception.ts roomAddressCue), replying to another human, or
     @-mentioning someone else suppress the bonus for that message only
@@ -95,6 +99,12 @@ Discord MessageCreate
     the other, shared events — zero-signal pairs are dropped
   • author addressed by freshest known name (learned aliases apply instantly)
   • reply output scrubbed: known <@id> → plain @Name, unknown ids stripped
+  • returns { text, end_conversation } via strict json_schema (plain +
+    compound paths, and the tool loop's final forced call); a tool-loop round
+    that answers early degrades to endConversation=false since tools and
+    response_format can't combine — safe, wrap-ups rarely carry toolCues.
+    index.ts sends text, then honors the flag with convo.leave (REPLY_EXIT=0
+    disables; regex dismissal overrides regardless)
   • temperature 0.9, max 1800 chars
   • REPLY_MODEL overrides the reply model on every path (default GROQ_MODEL);
     gpt-oss/qwen models get reasoning_effort=low to keep casual chat fast

@@ -23,6 +23,7 @@ const env = z.object({
   INGEST_TRIAGE_MODEL: z.string().optional(),
   REPLY_MODEL: z.string().optional(),
   REPLY_TOOLS: z.string().optional(),
+  REPLY_EXIT: z.string().optional(),
   INGEST_CHANNEL: z.string().optional(),
   VISION_MODEL: z.string().optional(),
   VISION_API_KEY: z.string().optional(),
@@ -63,6 +64,9 @@ export const config = {
   triageModel: env.INGEST_TRIAGE_MODEL,
   replyModel: env.REPLY_MODEL,
   replyTools: env.REPLY_TOOLS === "1",
+  // Kill switch for honoring the model's end_conversation flag — regex
+  // dismissal keeps working regardless; this only governs the soft exit.
+  replyExit: env.REPLY_EXIT !== "0",
   ingestChannel: env.INGEST_CHANNEL ?? "general-chat",
   // No fallback: unset means image understanding is OFF. A text-only model
   // could silently drop the image block and store a hallucinated description.

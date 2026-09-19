@@ -24,7 +24,7 @@ const DAY_MS = 86_400_000;
  * waiting to see if a human answers first. If the timer survives, index.ts's
  * onFire runs the grounded-answer gate. Hard daily cap bounds the worst case;
  * an ignored attempt raises the confidence floor until engagement resets it.
- * In-memory like EngagementTracker — restart resets gracefully.
+ * In-memory like ConversationTracker — restart resets gracefully.
  */
 export class ProactiveScheduler {
   private pending = new Map<string, Pending>();

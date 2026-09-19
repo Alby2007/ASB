@@ -6,7 +6,7 @@ import { MemoryStore } from "./database.js";
 import { createBrainResolver, guardedLlmFetch } from "./brains.js";
 import { commandDefinitions, handleMemoryButton, handleMemoryCommand, handleSetupModal } from "./commands.js";
 import { detectDismissal, detectWakeWord, questionKeywords, roomAddressCue, shouldInspectForMemory, toolCues } from "./perception.js";
-import { EngagementTracker } from "./engagement.js";
+import { ConversationTracker } from "./conversation.js";
 import { ProactiveScheduler } from "./proactive.js";
 import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
@@ -71,12 +71,13 @@ const visionClient = config.visionModel &&
     ? new OpenAI({ apiKey: config.visionApiKey, baseURL: config.visionBaseUrl })
     : undefined;
 const pipeline = new EventPipeline();
-// Conversational engagement: per-channel participant set with per-user TTLs —
-// who is actively talking *with* the bot, not just when it last spoke.
-const engagement = new EngagementTracker(config.engagementTtlMs);
+// Per-channel conversation state: who's actively talking *with* the bot.
+// Opens on addressed messages, closes when the last participant leaves —
+// TTL expiry, regex dismissal, or the model's end_conversation signal.
+const convo = new ConversationTracker(config.engagementTtlMs);
 // Stranded-question trigger: a question arms a debounced timer; any follow-up
 // (message or reaction) cancels it — the point is waiting to see if a human
-// answers first. In-memory like EngagementTracker — restart resets the daily
+// answers first. In-memory like ConversationTracker — restart resets the daily
 // cap and backoff state gracefully.
 const proactive = new ProactiveScheduler({
   delayMs: config.proactiveDelayMs,
@@ -519,7 +520,7 @@ async function fireProactive(key: string, messageId: string): Promise<void> {
   proactive.noteSent(key, sent.id);
   // Proactive speech counts toward share-of-voice like any other reply — an
   // invisible reply would corrupt the pacing accounting.
-  engagement.noteReply(key);
+  convo.noteReply(key);
   inc("proactive.fired");
   await store.recordMessage({
     guildId, channelId, messageId: sent.id,
@@ -626,13 +627,14 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   if (replyToId) proactive.observeEngagement(replyToId);
   // This human message counts toward share-of-voice before scoring — it
   // dilutes the bot's floor share for the decide() below.
-  engagement.noteMessage(key, false);
-  // An addressed message enrolls the author for the engagement TTL.
-  if (event.mentionsBot) engagement.noteTrigger(key, event.authorId);
-  let engaged = config.engagement && engagement.isEngaged(key, event.authorId);
+  convo.noteMessage(key, false);
+  // An addressed message enrolls the author — opening the conversation if it
+  // wasn't already (first participant in → opened).
+  if (event.mentionsBot && convo.addressed(key, event.authorId)) inc("convo.opened");
+  let engaged = config.engagement && convo.isParticipant(key, event.authorId);
   // Engaged ≠ every message is at the bot: a message aimed at the room ("did
   // anyone see that"), replying to another human, or @-mentioning someone else
-  // doesn't earn the in-conversation bonus — engagement itself is untouched.
+  // doesn't earn the in-conversation bonus — participation itself is untouched.
   if (engaged && !event.mentionsBot) {
     const botId = client.user!.id;
     if (roomAddressCue(event.content)
@@ -641,16 +643,18 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
       engaged = false;
     }
   }
-  // Dismissals fire addressed ("shut up asb") or while engaged ("shush"
-  // mid-convo). An unaddressed dismissal clears engaged → silence, the clean
+  // Dismissals are the deterministic override — they fire addressed ("shut up
+  // asb") or mid-conversation ("shush") regardless of what the model thinks.
+  // An unaddressed dismissal clears participation → silence, the clean
   // drop-out; an addressed one still gets its ack reply, then drops out.
   if ((event.mentionsBot || engaged) && detectDismissal(event.content)) {
-    engagement.dismiss(key, event.authorId);
+    convo.leave(key, event.authorId);
+    inc("convo.leave.dismissal");
     engaged = false;
   }
-  const lastSpokeAt = engagement.lastSpokeAt(key);
+  const lastSpokeAt = convo.lastSpokeAt(key);
   const elapsedSinceLastSpoke = lastSpokeAt === undefined ? Infinity : Date.now() - lastSpokeAt;
-  const decision = brain.decide(event, elapsedSinceLastSpoke, engaged, engagement.botShare(key), config.speakThreshold);
+  const decision = brain.decide(event, elapsedSinceLastSpoke, engaged, convo.botShare(key), config.speakThreshold);
   if (!settings.replyEnabled || !decision.shouldSpeak) {
     // The bot stayed silent on a question — arm the stranded-question timer.
     // A question it already answered never reaches here, so it can't be
@@ -725,11 +729,11 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     // in-thread "what do you know about X" deserves tools. Stray unsolicited
     // replies still need a toolCues signal.
     const toolsOn = config.replyTools && (toolCues(event.content) || event.mentionsBot || engaged);
-    const reply = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, relationships, config.replyModel, toolsOn, client.user!.id, { guildName: message.guild.name, ownerName, botName: message.guild.members.me?.displayName ?? client.user!.username }, toolCtx, imageContext);
-    const clean = reply ? scrubMentions(reply, lookups.names) : "";
+    const { text, endConversation } = await brain.reply({ ...event, authorName }, context, await store.relevantMemories(event.guildId, event.authorId), profiles, relationships, config.replyModel, toolsOn, client.user!.id, { guildName: message.guild.name, ownerName, botName: message.guild.members.me?.displayName ?? client.user!.username }, toolCtx, imageContext);
+    const clean = text ? scrubMentions(text, lookups.names) : "";
     if (clean) {
       const sent = await message.reply({ content: clean, allowedMentions: { parse: [], repliedUser: false } });
-      engagement.noteReply(key); inc("reply.sent");
+      convo.noteReply(key); inc("reply.sent");
       if (engaged && !event.mentionsBot) inc("reply.engaged");
       // Archive the bot's own line so the transcript carries its voice and
       // member→bot reply edges resolve — otherwise reply_to_id dangles.
@@ -741,6 +745,14 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
       // Same rule as inbound bot chatter: archive for transcript fidelity,
       // never a memory source — keep it out of the sweep's extraction set.
       await store.setTriageResults([{ id: sent.id, result: "noise" }]);
+    }
+    // The model's read that this human is done — thanks/bye/wrap-up, or the
+    // exchange is clearly complete. Outside the `clean` block so an empty
+    // sign-off still exits. REPLY_EXIT=0 disables this; regex dismissal is
+    // unaffected either way.
+    if (config.replyExit && endConversation) {
+      convo.leave(key, event.authorId);
+      inc("convo.leave.model");
     }
   } catch (error) {
     if (error instanceof BudgetExceeded) {

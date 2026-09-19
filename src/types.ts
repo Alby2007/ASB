@@ -172,6 +172,17 @@ export type Decision = {
   reasons: string[];
 };
 
+/**
+ * The reply contract: the model's text plus its read on whether this human is
+ * done. `endConversation` removes the author from the channel's conversation —
+ * the model understands "ok cool thanks that's all" better than any regex,
+ * while detectDismissal stays the deterministic override for explicit exits.
+ */
+export type ReplyResult = {
+  text: string;
+  endConversation: boolean;
+};
+
 // ── v0.2 Event types ──────────────────────────────────────────────────────────
 
 export type EventTier = "candidate" | "event";

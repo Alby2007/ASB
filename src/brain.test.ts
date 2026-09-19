@@ -158,3 +158,58 @@ test("proposeGroundedAnswer enforces the caller's confidence floor (backoff)", a
   assert.ok(await b.proposeGroundedAnswer("when?", ["lore"], 0.6));   // baseline floor passes
   assert.equal(await b.proposeGroundedAnswer("when?", ["lore"], 0.85), null); // elevated floor blocks
 });
+
+// ── reply contract: { text, end_conversation } ────────────────────────────────
+
+test("reply: parses {text, end_conversation} via strict json_schema on the plain path", async () => {
+  const { client, calls } = stubClient({
+    outputText: JSON.stringify({ text: "later then", end_conversation: true }),
+  });
+  const b = new Brain("k", "m", undefined, client);
+  const r = await b.reply(msg("ok cool thanks that's all"), [], []);
+  assert.deepEqual(r, { text: "later then", endConversation: true });
+  assert.equal(calls.responses[0].text.format.type, "json_schema");
+  assert.deepEqual(calls.responses[0].text.format.schema.required, ["text", "end_conversation"]);
+});
+
+test("reply: unparseable output degrades to plain text with endConversation=false", async () => {
+  const { client } = stubClient({ outputText: "just a plain answer" });
+  const b = new Brain("k", "m", undefined, client);
+  const r = await b.reply(msg("hello"), [], []);
+  assert.equal(r.text, "just a plain answer");
+  assert.equal(r.endConversation, false);
+});
+
+test("reply: tool-path early answer degrades to endConversation=false", async () => {
+  // tools + response_format can't combine — a round that answers with plain
+  // content and no tool_calls exits unstructured, which must not fake an exit.
+  const client: LlmClient = {
+    responses: { create: async () => ({ output_text: "{}" }) },
+    chat: { completions: { create: async () => ({ choices: [{ message: { content: "the answer", tool_calls: [] } }] }) } },
+  };
+  const b = new Brain("k", "m", undefined, client);
+  const r = await b.reply(msg("question"), [], [], [], [], "m", true);
+  assert.equal(r.text, "the answer");
+  assert.equal(r.endConversation, false);
+});
+
+test("reply: tool-loop exhaustion gets the schema on the final forced call", async () => {
+  // Every round emits a tool_call; the final no-tools call carries
+  // response_format, so the exit signal survives a tool-heavy exchange.
+  let round = 0;
+  const client: LlmClient = {
+    responses: { create: async () => ({ output_text: "{}" }) },
+    chat: { completions: { create: async (p: any) => {
+      round++;
+      if (p.response_format) return { choices: [{ message: { content: JSON.stringify({ text: "done", end_conversation: true }) } }] };
+      // An unknown tool name keeps executeTool off the network — it returns an
+      // error string, the loop continues, and the final forced call is what
+      // this test actually exercises.
+      return { choices: [{ message: { content: null, tool_calls: [{ id: `t${round}`, type: "function", function: { name: "nope_tool", arguments: "{}" } }] } }] };
+    } } },
+  };
+  const b = new Brain("k", "m", undefined, client);
+  const r = await b.reply(msg("look it up"), [], [], [], [], "m", true);
+  assert.equal(r.text, "done");
+  assert.equal(r.endConversation, true);
+});
