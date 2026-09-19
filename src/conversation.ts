@@ -62,12 +62,16 @@ export class ConversationTracker {
   }
 
   /** One participant leaves explicitly (regex dismissal or the model's exit
-   * signal). Others stay in; the convo closes when the last one goes. */
-  leave(key: string, userId: string): void {
+   * signal). Others stay in; the convo closes when the last one goes.
+   * Returns whether a live participant was actually removed — callers count
+   * cause-specific metrics only on true, so a dismissal's ack-reply exit
+   * can't double-count as a model leave. */
+  leave(key: string, userId: string): boolean {
     const ch = this.channels.get(key);
-    if (!ch) return;
-    ch.participants.delete(userId);
+    if (!ch) return false;
+    const removed = ch.participants.delete(userId);
     this.closeIfEmpty(key, ch);
+    return removed;
   }
 
   /** Live participant ids, with expired entries swept out first. */

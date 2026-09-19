@@ -51,7 +51,9 @@ test("re-addressing refreshes the TTL and reopens a closed convo", () => {
 
 test("leave removes only that participant; close() empties everyone", () => {
   convo.addressed(KEY, "dave");
-  convo.leave(KEY, "dave");
+  assert.equal(convo.leave(KEY, "dave"), true, "removing a live participant reports true");
+  assert.equal(convo.leave(KEY, "dave"), false, "a second leave is a no-op — no double-counted exits");
+  assert.equal(convo.leave(KEY, "nobody"), false, "a non-participant leave reports false");
   assert.equal(convo.isParticipant(KEY, "dave"), false);
   assert.equal(convo.isParticipant(KEY, "carol"), true);
   assert.equal(convo.isOpen(KEY), true);

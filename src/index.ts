@@ -630,7 +630,10 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   convo.noteMessage(key, false);
   // An addressed message enrolls the author — opening the conversation if it
   // wasn't already (first participant in → opened).
-  if (event.mentionsBot && convo.addressed(key, event.authorId)) inc("convo.opened");
+  // ENGAGEMENT=0 = address-only mode: no conversation state is enrolled at
+  // all, so every message scores as stranger and the opened metric stays
+  // honest rather than claiming opens that can never be entered.
+  if (config.engagement && event.mentionsBot && convo.addressed(key, event.authorId)) inc("convo.opened");
   let engaged = config.engagement && convo.isParticipant(key, event.authorId);
   // Engaged ≠ every message is at the bot: a message aimed at the room ("did
   // anyone see that"), replying to another human, or @-mentioning someone else
@@ -750,8 +753,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     // exchange is clearly complete. Outside the `clean` block so an empty
     // sign-off still exits. REPLY_EXIT=0 disables this; regex dismissal is
     // unaffected either way.
-    if (config.replyExit && endConversation) {
-      convo.leave(key, event.authorId);
+    if (config.replyExit && endConversation && convo.leave(key, event.authorId)) {
       inc("convo.leave.model");
     }
   } catch (error) {

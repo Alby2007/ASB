@@ -213,3 +213,26 @@ test("reply: tool-loop exhaustion gets the schema on the final forced call", asy
   assert.equal(r.text, "done");
   assert.equal(r.endConversation, true);
 });
+
+test("reply: compound retries unstructured when response_format is rejected, then remembers", async () => {
+  // Groq may reject response_format alongside compound_custom — the retry
+  // keeps built-in tools and loses only the exit signal; the flag flips so
+  // later replies skip the doomed schema'd call instead of paying for it.
+  let calls = 0;
+  const client: LlmClient = {
+    responses: { create: async () => ({ output_text: "{}" }) },
+    chat: { completions: { create: async (p: any) => {
+      calls++;
+      if (p.response_format) throw new Error("unsupported response_format");
+      return { choices: [{ message: { content: "compound answer" } }] };
+    } } },
+  };
+  const b = new Brain("k", "m", undefined, client);
+  const r1 = await b.reply(msg("hi"), [], [], [], [], "groq/compound-mini");
+  assert.equal(r1.text, "compound answer");
+  assert.equal(r1.endConversation, false);
+  assert.equal(calls, 2); // schema'd attempt + unstructured retry
+  const r2 = await b.reply(msg("hi again"), [], [], [], [], "groq/compound-mini");
+  assert.equal(r2.text, "compound answer");
+  assert.equal(calls, 3, "the unsupported flag is remembered — no wasted retry");
+});

@@ -42,6 +42,7 @@ function parseReplyResult(raw: string | null | undefined, structured: boolean): 
 
 export class Brain {
   private client: LlmClient;
+  private compoundSchemaOk = true; // flips false if Groq rejects response_format + compound_custom
   constructor(apiKey: string, private model: string, baseURL?: string, client?: LlmClient) {
     registerSecret(apiKey); // scrubbed out of all error logs from here on
     this.client = client ?? new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
@@ -810,7 +811,7 @@ CONVERSATION CONTROL
       try {
         // compound_custom is a Groq extension the openai SDK doesn't type — it
         // forwards unknown body params, so the cast is all that's needed.
-        const params = {
+        const base = {
           model: useModel,
           temperature: 0.9,
           messages: [
@@ -818,16 +819,32 @@ CONVERSATION CONTROL
             { role: "user" as const, content: situation },
           ],
           compound_custom: { tools: { enabled_tools: ["web_search", "visit_website"] } },
-          response_format: { type: "json_schema" as const, json_schema: { name: "reply", strict: true, schema: REPLY_JSON_SCHEMA } },
         } as OpenAI.ChatCompletionCreateParamsNonStreaming & { compound_custom?: unknown };
-        const res = await this.client.chat.completions.create(params);
+        // Groq may reject response_format alongside compound_custom server-
+        // side — if the schema'd call fails, retry once without it so
+        // Compound's built-in tools survive and only the exit signal is lost.
+        // On success the flag flips off so later replies skip the doomed
+        // attempt instead of paying a wasted call each time. If the retry
+        // also fails the flag stays on (a transient 429 proves nothing about
+        // the schema) and the outer catch falls back to the plain path.
+        let structured = this.compoundSchemaOk;
+        let res;
+        try {
+          res = await this.client.chat.completions.create(
+            structured ? { ...base, response_format: { type: "json_schema" as const, json_schema: { name: "reply", strict: true, schema: REPLY_JSON_SCHEMA } } } : base);
+        } catch (err) {
+          if (!structured) throw err;
+          res = await this.client.chat.completions.create(base);
+          structured = false;
+          this.compoundSchemaOk = false;
+        }
         const msg = res.choices[0]?.message as { content?: string | null; executed_tools?: Array<{ type?: string; arguments?: string }> } | undefined;
         const tools = msg?.executed_tools ?? [];
         if (tools.length) {
           const desc = tools.map(t => `${t.type}${t.arguments ? `(${t.arguments.slice(0, 80)})` : ""}`).join(", ");
           console.log(`[reply] ${useModel} executed tools: ${desc}`);
         }
-        return parseReplyResult(msg?.content, true);
+        return parseReplyResult(msg?.content, structured);
       } catch (err) {
         console.warn(`[reply] ${useModel} failed, falling back to ${this.model}:`, redactSecrets((err as Error).message.slice(0, 120)));
       }
