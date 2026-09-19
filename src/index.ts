@@ -515,6 +515,10 @@ async function fireProactive(key: string, messageId: string): Promise<void> {
   if (!proposal) { inc("proactive.gated"); return; }
   const clean = scrubMentions(proposal.answer, names);
   if (!clean) return;
+  // Same send-boundary guard as the reply path — the answer is a parsed JSON
+  // field, but a model could still embed end_conversation or think-tail text
+  // inside it. The rule is "no matter which path produced it."
+  if (looksLikeSchemaLeak(clean)) { inc("proactive.schema_leak"); return; }
   const sent = await question.reply({ content: clean, allowedMentions: { parse: [], repliedUser: false } });
   proactive.recordFire(key);
   proactive.noteSent(key, sent.id);
