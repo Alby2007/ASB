@@ -158,14 +158,17 @@ test("a transient failure on the last attempt surfaces as dead-lettered", async 
   try {
     await makeStore(sql);
     const deadBefore = metricsSnapshot().counts["jobs.dead_letter"] ?? 0;
+    // Seed the row at attempt 4 BEFORE the worker starts — enqueue's NOTIFY
+    // can otherwise let the worker claim first, and the failing handler's
+    // backoff would park it out of reach of the UPDATE.
+    const id = await enqueue(sql as any, "g1", "extract", { n: 1 });
+    await sql`UPDATE jobs SET attempts = ${MAX_JOB_ATTEMPTS - 1} WHERE id = ${id}`;
     const worker = startWorker({
       sql: sql as any,
       pollMs: 20,
       handle: async () => { throw new Error("boom"); },
     });
     try {
-      const id = await enqueue(sql as any, "g1", "extract", { n: 1 });
-      await sql`UPDATE jobs SET attempts = ${MAX_JOB_ATTEMPTS - 1} WHERE id = ${id}`;
       await new Promise(r => setTimeout(r, 200));
       const [row] = await sql<Array<{ attempts: number }>>`SELECT attempts FROM jobs WHERE id = ${id}`;
       assert.equal(row?.attempts, MAX_JOB_ATTEMPTS);
