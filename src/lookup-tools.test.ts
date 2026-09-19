@@ -81,6 +81,7 @@ test("lookup_relationship renders the shared pair context", async () => {
   const ctx = stubCtx({
     resolveName: n => ({ alice: "u1", bob: "u2" } as Record<string, string>)[n],
     store: {
+      getMember: async () => ({ optedIn: true, optedOut: false }),
       pairwiseContext: async () => ({
         ab: { summary: "rival", valence: -0.3, observationCount: 4 },
         ba: undefined,
@@ -101,12 +102,40 @@ test("lookup_relationship: zero-signal pair reports no dynamic", async () => {
   const ctx = stubCtx({
     resolveName: () => "u1",
     store: {
+      getMember: async () => ({ optedIn: true, optedOut: false }),
       pairwiseContext: async () => ({ ab: undefined, ba: undefined, observations: [], claimsAboutA: [], claimsAboutB: [] }),
       displayNameFor: async () => "X",
     } as unknown as MemoryStore,
     eventStore: { sharedEvents: async () => [] } as unknown as EventStore,
   });
   assert.match(await executeLookupTool("lookup_relationship", { person_a: "a", person_b: "b" }, ctx), /no recorded dynamic/);
+});
+
+test("lookup_relationship refuses when neither party consented; one consenting side suffices", async () => {
+  const pairwiseContext = async () => ({
+    ab: { summary: "friendly", valence: 0.5, observationCount: 2 },
+    ba: undefined, observations: [], claimsAboutA: [], claimsAboutB: [],
+  });
+  const mk = (getMember: (id: string) => Promise<{ optedIn: boolean; optedOut: boolean }>) => stubCtx({
+    resolveName: n => ({ alice: "u1", bob: "u2" } as Record<string, string>)[n],
+    store: {
+      getMember: (_g: string, id: string) => getMember(id),
+      pairwiseContext, displayNameFor: async (_g: string, id: string) => (id === "u1" ? "Alice" : "Bob"),
+    } as unknown as MemoryStore,
+    eventStore: { sharedEvents: async () => [] } as unknown as EventStore,
+  });
+  // Both non-consenting → refusal.
+  const denied = await executeLookupTool("lookup_relationship", { person_a: "alice", person_b: "bob" },
+    mk(async () => ({ optedIn: false, optedOut: false })));
+  assert.match(denied, /haven't opted in/);
+  // Explicit opt-out on one side + never-consented other side → still refused.
+  const denied2 = await executeLookupTool("lookup_relationship", { person_a: "alice", person_b: "bob" },
+    mk(async id => (id === "u1" ? { optedIn: false, optedOut: true } : { optedIn: false, optedOut: false })));
+  assert.match(denied2, /haven't opted in/);
+  // Only Bob opted in → the pair is shared data (persistence uses the same rule).
+  const allowed = await executeLookupTool("lookup_relationship", { person_a: "alice", person_b: "bob" },
+    mk(async id => (id === "u2" ? { optedIn: true, optedOut: false } : { optedIn: false, optedOut: false })));
+  assert.match(allowed, /Alice ↔ Bob/);
 });
 
 test("search_memories: guild-wide and subject-scoped paths", async () => {

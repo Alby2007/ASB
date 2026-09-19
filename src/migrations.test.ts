@@ -361,3 +361,36 @@ test("migration v17 creates jobs + guild_usage and the scale-rails columns", asy
     assert.equal(dropped.length, 0, "rollback should drop both new columns");
   } finally { await sql.end(); }
 });
+
+test("migration v18 adds author_is_bot and events.classifications, rolls back cleanly", async () => {
+  const sql = makeTestSql();
+  try {
+    await resetSchema(sql);
+    await runMigrations(sql as any);
+
+    const cols = await sql<Array<{ table_name: string; column_name: string; column_default: string | null }>>`
+      SELECT table_name, column_name, column_default FROM information_schema.columns
+      WHERE (table_name = 'messages' AND column_name = 'author_is_bot')
+         OR (table_name = 'events' AND column_name = 'classifications')
+      ORDER BY table_name
+    `;
+    assert.equal(cols.length, 2, "both v18 columns must exist");
+    const byName = Object.fromEntries(cols.map(c => [c.column_name, c.column_default]));
+    assert.equal(byName.author_is_bot, "false");
+    assert.equal(byName.classifications, "0");
+
+    // Functional defaults: a fresh row picks up false/0 without explicit values.
+    await sql`INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, content, created_at)
+              VALUES ('m-v18', 'g-v18', 'c', 'u', 'n', 'x', now())`;
+    const [m] = await sql`SELECT author_is_bot FROM messages WHERE id = 'm-v18'`;
+    assert.equal(m.author_is_bot, false);
+
+    await runMigrations(sql as any, 17);
+    const gone = await sql<Array<{ column_name: string }>>`
+      SELECT column_name FROM information_schema.columns
+      WHERE (table_name = 'messages' AND column_name = 'author_is_bot')
+         OR (table_name = 'events' AND column_name = 'classifications')
+    `;
+    assert.equal(gone.length, 0, "rollback should drop both v18 columns");
+  } finally { await sql.end(); }
+});

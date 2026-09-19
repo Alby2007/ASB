@@ -105,7 +105,7 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
         { name: "Derived data", value: "Memories, profiles, and relationship notes form **only for members who opt in** — never automatically." },
         { name: "Your consent", value: consent },
         { name: "Processing", value: "Messages are sent to an OpenAI-compatible LLM provider for analysis — the operator's default, or a provider this server configured with `/setup`." },
-        { name: "Controls & guarantees", value: "`/opt-out` deletes your derived data · `/memory-export` downloads everything stored about you · **removing ASB from this server deletes every row it holds here**." },
+        { name: "Controls & guarantees", value: "`/opt-out` forgets your memories and deletes your profile, attributes, relationships, and stored quotes · `/memory-export` downloads everything stored about you · **removing ASB from this server deletes every row it holds here**." },
       )] });
   }
   if (interaction.commandName === "memory") {
@@ -410,8 +410,12 @@ export async function handleMemoryCommand(interaction: ChatInputCommandInteracti
     await store.setMemberOptOut(guildId, userId, true);
     const forgotten = await store.forgetAllFor(guildId, userId);
     const relForgotten = await store.forgetRelationshipsFor(guildId, userId);
+    await store.deleteAttributesFor(guildId, userId);
+    // Verbatim evidence (quotes, message snapshots) is scrubbed now, not at
+    // retention expiry — opt-out shouldn't wait days to stop holding the words.
+    await store.scrubEvidenceFor(guildId, userId);
     await profileStore.deleteProfile(guildId, userId);
-    return interaction.reply({ content: `Opted out. ${forgotten} memor${forgotten === 1 ? "y" : "ies"} and ${relForgotten} relationship record${relForgotten === 1 ? "" : "s"} about you were forgotten and your profile was deleted — no new memories, relationships, or profile data will be formed about you while you're opted out. Your messages still appear in the raw archive until the server's retention window removes them. Use /opt-in and /profile-build to start again.`, ephemeral: true });
+    return interaction.reply({ content: `Opted out. ${forgotten} memor${forgotten === 1 ? "y" : "ies"} and ${relForgotten} relationship record${relForgotten === 1 ? "" : "s"} about you were forgotten and your profile, attributes, and stored quotes were deleted — no new memories, relationships, or profile data will be formed about you while you're opted out. Your messages still appear in the raw archive until the server's retention window removes them. Use /opt-in and /profile-build to start again.`, ephemeral: true });
   }
   if (interaction.commandName === "opt-in") {
     await store.setMemberOptIn(guildId, interaction.user.id, true);

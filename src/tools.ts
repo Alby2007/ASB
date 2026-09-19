@@ -163,6 +163,30 @@ export async function safeRequest(rawUrl: string, timeoutMs = FETCH_TIMEOUT_MS):
   });
 }
 
+/** SSRF-guarded GET for binary/image bodies — safeRequest plus a manual
+ * redirect loop so every hop is re-validated (isSafeUrl policy at input,
+ * safeLookup at connect). Mirrors visit_url's discipline; returns the body
+ * and resolved MIME. Throws on failure — callers decide fault tolerance. */
+export async function fetchImageBytes(rawUrl: string, maxBytes: number): Promise<{ buf: Buffer; mime: string }> {
+  let url = rawUrl;
+  for (let hop = 0; hop <= 3; hop++) {
+    if (!isSafeUrl(url)) throw new Error("image url not allowed");
+    const res = await safeRequest(url, 10_000);
+    if (res.status >= 300 && res.status < 400) {
+      const next = headerValue(res.headers["location"]);
+      if (!next) throw new Error(`image redirect with no location (HTTP ${res.status})`);
+      url = new URL(next, url).toString();
+      continue;
+    }
+    if (res.status < 200 || res.status >= 300) throw new Error(`image fetch failed: ${res.status}`);
+    const declared = Number(headerValue(res.headers["content-length"]) ?? 0);
+    if (declared > maxBytes) throw new Error(`image over byte cap: ${declared}`);
+    const mime = (headerValue(res.headers["content-type"]) ?? "").split(";")[0].trim() || "image/png";
+    return { buf: await res.readBody(maxBytes), mime };
+  }
+  throw new Error("image fetch: too many redirects");
+}
+
 // ── HTML → text ───────────────────────────────────────────────────────────────
 
 const entities: Record<string, string> = {
@@ -265,7 +289,7 @@ export async function visitUrl(rawUrl: string): Promise<string> {
   }
 }
 
-function headerValue(v: string | string[] | undefined): string | undefined {
+export function headerValue(v: string | string[] | undefined): string | undefined {
   return Array.isArray(v) ? v[0] : v;
 }
 

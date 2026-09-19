@@ -1,4 +1,5 @@
 import { sql as defaultSql, type Sql } from "./db.js";
+import { escapeLike } from "./database.js";
 import type { EventCandidate, EventParticipant, EventTier, ParticipantRole, StoredEvent } from "./types.js";
 
 // ── Row types returned by Postgres ────────────────────────────────────────────
@@ -7,6 +8,7 @@ type EventRow = {
   id: number; guild_id: string; channel_id: string;
   title: string; summary: string; significance: number; tier: string;
   occurred_at: Date | string; closed_at: Date | string | null; reference_count: number;
+  classifications: number;
   created_at: Date | string; updated_at: Date | string;
 };
 
@@ -28,6 +30,7 @@ function rowToStored(row: EventRow, participants: EventParticipant[], messageIds
     occurredAt: new Date(ts(row.occurred_at)),
     closedAt: row.closed_at ? new Date(ts(row.closed_at)) : null,
     referenceCount: Number(row.reference_count),
+    classifications: Number(row.classifications ?? 0),
     participants, messageIds, memoryIds,
     createdAt: ts(row.created_at), updatedAt: ts(row.updated_at),
   };
@@ -62,7 +65,7 @@ export class EventStore {
 
   async getEvent(guildId: string, eventId: number): Promise<StoredEvent | undefined> {
     const rows = await this.sql<EventRow[]>`
-      SELECT id, guild_id, channel_id, title, summary, significance, tier, occurred_at, closed_at, reference_count, created_at, updated_at
+      SELECT id, guild_id, channel_id, title, summary, significance, tier, occurred_at, closed_at, reference_count, classifications, created_at, updated_at
       FROM events WHERE guild_id = ${guildId} AND id = ${eventId}
     `;
     return rows[0] ? this.hydrate(rows[0]) : undefined;
@@ -71,7 +74,7 @@ export class EventStore {
   /** All open (unclosed) events for a guild/channel, ordered newest first. */
   async openEvents(guildId: string, channelId: string): Promise<StoredEvent[]> {
     const rows = await this.sql<EventRow[]>`
-      SELECT id, guild_id, channel_id, title, summary, significance, tier, occurred_at, closed_at, reference_count, created_at, updated_at
+      SELECT id, guild_id, channel_id, title, summary, significance, tier, occurred_at, closed_at, reference_count, classifications, created_at, updated_at
       FROM events WHERE guild_id = ${guildId} AND channel_id = ${channelId} AND closed_at IS NULL
       ORDER BY occurred_at DESC
     `;
@@ -82,15 +85,16 @@ export class EventStore {
   async eventsForMemory(guildId: string, memoryId: number): Promise<StoredEvent[]> {
     const rows = await this.sql<EventRow[]>`
       SELECT e.id, e.guild_id, e.channel_id, e.title, e.summary, e.significance, e.tier,
-             e.occurred_at, e.closed_at, e.reference_count, e.created_at, e.updated_at
+             e.occurred_at, e.closed_at, e.reference_count, e.classifications, e.created_at, e.updated_at
       FROM events e JOIN event_memories em ON em.event_id = e.id WHERE em.memory_id = ${memoryId} AND e.guild_id = ${guildId}
     `;
     return Promise.all(rows.map(r => this.hydrate(r)));
   }
 
-  async listEvents(guildId: string, options: { tier?: EventTier; subjectUserId?: string; page?: number } = {}): Promise<{ events: StoredEvent[]; total: number; page: number }> {
+  async listEvents(guildId: string, options: { tier?: EventTier; subjectUserId?: string; page?: number; limit?: number } = {}): Promise<{ events: StoredEvent[]; total: number; page: number }> {
     const page = Math.max(1, options.page ?? 1);
-    const offset = (page - 1) * 8;
+    const pageSize = options.limit ?? 8;
+    const offset = (page - 1) * pageSize;
     const tier = options.tier ?? "event";
 
     let countResult: [{ count: number }];
@@ -103,21 +107,37 @@ export class EventStore {
       `;
       rows = await this.sql<EventRow[]>`
         SELECT e.id, e.guild_id, e.channel_id, e.title, e.summary, e.significance, e.tier,
-               e.occurred_at, e.closed_at, e.reference_count, e.created_at, e.updated_at
+               e.occurred_at, e.closed_at, e.reference_count, e.classifications, e.created_at, e.updated_at
         FROM events e WHERE e.guild_id = ${guildId} AND e.tier = ${tier}
         AND EXISTS (SELECT 1 FROM event_participants ep WHERE ep.event_id = e.id AND ep.user_id = ${options.subjectUserId})
-        ORDER BY e.occurred_at DESC LIMIT 8 OFFSET ${offset}
+        ORDER BY e.occurred_at DESC LIMIT ${pageSize} OFFSET ${offset}
       `;
     } else {
       countResult = await this.sql<[{ count: number }]>`SELECT COUNT(*)::int as count FROM events WHERE guild_id = ${guildId} AND tier = ${tier}`;
       rows = await this.sql<EventRow[]>`
-        SELECT id, guild_id, channel_id, title, summary, significance, tier, occurred_at, closed_at, reference_count, created_at, updated_at
+        SELECT id, guild_id, channel_id, title, summary, significance, tier, occurred_at, closed_at, reference_count, classifications, created_at, updated_at
         FROM events WHERE guild_id = ${guildId} AND tier = ${tier}
-        ORDER BY occurred_at DESC LIMIT 8 OFFSET ${offset}
+        ORDER BY occurred_at DESC LIMIT ${pageSize} OFFSET ${offset}
       `;
     }
 
     return { events: await Promise.all(rows.map(r => this.hydrate(r))), total: Number(countResult[0].count), page };
+  }
+
+  /** Closed candidates still owed a classification pass — the maintainEvents
+   * work list. Cursored by id (not page) because the loop mutates the filter:
+   * a promotion leaves the tier, a discard bumps classifications — OFFSET
+   * paging would skip rows as the result set shrinks mid-scan. Significance
+   * > 0 means already scored; classifications >= 3 is the re-score cap. */
+  async listUnscoredCandidates(guildId: string, afterId: number, limit = 50): Promise<StoredEvent[]> {
+    const rows = await this.sql<EventRow[]>`
+      SELECT id, guild_id, channel_id, title, summary, significance, tier, occurred_at, closed_at, reference_count, classifications, created_at, updated_at
+      FROM events
+      WHERE guild_id = ${guildId} AND tier = 'candidate' AND closed_at IS NOT NULL
+        AND significance <= 0 AND classifications < 3 AND id > ${afterId}
+      ORDER BY id LIMIT ${limit}
+    `;
+    return Promise.all(rows.map(r => this.hydrate(r)));
   }
 
   /** Promoted events both users participated in — the shared-history layer for
@@ -145,8 +165,8 @@ export class EventStore {
   /** Title search over promoted events — the lookup_event tool path. */
   async searchEvents(guildId: string, query: string, limit = 3): Promise<StoredEvent[]> {
     const rows = await this.sql<EventRow[]>`
-      SELECT id, guild_id, channel_id, title, summary, significance, tier, occurred_at, closed_at, reference_count, created_at, updated_at
-      FROM events WHERE guild_id = ${guildId} AND tier = 'event' AND title ILIKE ${`%${query}%`}
+      SELECT id, guild_id, channel_id, title, summary, significance, tier, occurred_at, closed_at, reference_count, classifications, created_at, updated_at
+      FROM events WHERE guild_id = ${guildId} AND tier = 'event' AND title ILIKE ${`%${escapeLike(query)}%`}
       ORDER BY significance DESC, occurred_at DESC LIMIT ${limit}
     `;
     return Promise.all(rows.map(r => this.hydrate(r)));
@@ -159,7 +179,7 @@ export class EventStore {
       const inserted = await sql<EventRow[]>`
         INSERT INTO events (guild_id, channel_id, title, summary, significance, tier, occurred_at)
         VALUES (${candidate.guildId}, ${candidate.channelId}, ${candidate.title}, ${candidate.summary}, ${candidate.significance}, ${candidate.tier}, ${candidate.occurredAt.toISOString()})
-        RETURNING id, guild_id, channel_id, title, summary, significance, tier, occurred_at, closed_at, reference_count, created_at, updated_at
+        RETURNING id, guild_id, channel_id, title, summary, significance, tier, occurred_at, closed_at, reference_count, classifications, created_at, updated_at
       `;
       const row = inserted[0];
       const eventId = Number(row.id);
@@ -216,6 +236,13 @@ export class EventStore {
 
   async updateSignificance(guildId: string, eventId: number, significance: number, tier: EventTier, title: string, summary: string): Promise<void> {
     await this.sql`UPDATE events SET significance = ${significance}, tier = ${tier}, title = ${title}, summary = ${summary}, updated_at = NOW() WHERE id = ${eventId} AND guild_id = ${guildId}`;
+  }
+
+  /** One LLM classification pass was spent on this event — counted so a
+   * 'discard'-verdict candidate can't be re-classified on every future
+   * reference forever. */
+  async noteClassification(guildId: string, eventId: number): Promise<void> {
+    await this.sql`UPDATE events SET classifications = classifications + 1 WHERE id = ${eventId} AND guild_id = ${guildId}`;
   }
 
   async incrementReferenceCount(guildId: string, eventId: number): Promise<number> {

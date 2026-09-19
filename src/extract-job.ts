@@ -50,6 +50,21 @@ export interface ExtractJobDeps {
 export async function runExtractJob(payload: ExtractJobPayload, deps: ExtractJobDeps): Promise<void> {
   const event: MessageEvent = { ...payload.event, createdAt: new Date(payload.event.createdAt) };
   const guildId = event.guildId;
+  // The payload is an enqueue-time snapshot — re-read the archive row so a
+  // deleted message is dropped (a queued job must not resurrect content the
+  // author deleted, or write fresh evidence for it) and an edit's current
+  // text is what gets extracted. Bot-authored rows are archive-only context,
+  // never a memory source.
+  const stored = await deps.store.getMessage(guildId, event.messageId);
+  if (!stored || stored.authorIsBot) { inc("jobs.dropped_stale"); return; }
+  event.content = stored.content;
+  // The reply target can have been deleted or edited since enqueue too —
+  // refresh it from the archive; gone means no context, not stale context.
+  let replyToContent = payload.replyToContent;
+  if (payload.replyToId) {
+    const ref = await deps.store.getMessage(guildId, payload.replyToId);
+    replyToContent = ref ? `${ref.authorName}: ${ref.content}` : undefined;
+  }
   const brain = await deps.brainFor(guildId);
   if (!brain) { inc("jobs.dropped_dormant"); return; } // went dormant — drop, no retry
   const { store, botId } = deps;
@@ -93,7 +108,7 @@ export async function runExtractJob(payload: ExtractJobPayload, deps: ExtractJob
     imageContext = formatImageContext(descs, event.authorName) || undefined;
   }
 
-  const { memories: candidates, relationships } = await withRetry(() => brain.extractMemories(event, payload.replyToContent, note, imageContext), 3);
+  const { memories: candidates, relationships } = await withRetry(() => brain.extractMemories(event, replyToContent, note, imageContext), 3);
   const aliases = (candidates.length || relationships.length) ? await deps.getAliases(guildId) : new Map<string, string>();
   // Opt-in consent — identical rule to the sweep/ingest paths: derived person
   // data persists only for consenting members; the bot counts as consented.

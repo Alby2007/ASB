@@ -222,6 +222,9 @@ export type StoredEvent = EventCandidate & {
   id: number;
   closedAt: Date | null;
   referenceCount: number;
+  /** Re-classification passes spent on this event — capped so a
+   * 'discard'-verdict candidate stops paying a full LLM call per reference. */
+  classifications: number;
   createdAt: string;
   updatedAt: string;
 };

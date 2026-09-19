@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import type { Memory } from "./database.js";
-import { executeTool, isSafeUrl, readBodyCapped, replyToolDefs } from "./tools.js";
+import { executeTool, fetchImageBytes, replyToolDefs } from "./tools.js";
 import type { AttributeProposal, ContinuityDecision, Decision, DossierSection, ExtractionResult, MemoryCandidate, MessageEvent, PairContext, ProfileSynthesis, ProfileSynthesisInput, ReplyResult, StoredEvent, VerificationVerdict } from "./types.js";
 import type { ToolCtx } from "./lookup-tools.js";
 import { formatPairContext, formatReplyProfile, type ReplyProfile } from "./reply-format.js";
@@ -77,7 +77,7 @@ export class Brain {
     let score = 0.05;
     if (event.mentionsBot) { score += 0.85; reasons.push("direct mention"); }
     else if (engaged) { score += 0.7; reasons.push("in conversation"); }
-    if (event.content.endsWith("?")) { score += 0.1; reasons.push("question"); }
+    if (event.content.trimEnd().endsWith("?")) { score += 0.1; reasons.push("question"); }
     // Proportional recency penalty, evaluated only inside the window so the
     // factor can never go negative and flip into a bonus. It must never
     // suppress an explicit mention — a direct request for a reply. This gate
@@ -132,23 +132,17 @@ export class Brain {
    * the ordinary extraction/reply pipelines; the URL and bytes are never
    * persisted. Callers pass a vision-capable model explicitly (config.visionModel).
    */
-  async describeImage(input: { url: string; contextText?: string; maxBytes?: number }, model: string, client?: LlmClient): Promise<{ description: string; category: "photo" | "screenshot" | "meme" | "art" | "document" | "other" }> {
+  async describeImage(input: { url: string; contextText?: string; maxBytes?: number }, model: string, client?: LlmClient, fetchImage?: (url: string, maxBytes: number) => Promise<{ buf: Buffer; mime: string }>): Promise<{ description: string; category: "photo" | "screenshot" | "meme" | "art" | "document" | "other" }> {
     const maxBytes = input.maxBytes ?? 4_000_000;
     // Fetch the attachment ourselves — providers differ on whether image_url
     // dereferences remote URLs (Gemini's compat endpoint doesn't), while every
     // OpenAI-compat API accepts data: URIs. Bytes live only for this call and
-    // are never persisted. The URL comes from Discord attachment metadata but
-    // still goes through the SSRF guard, and readBody enforces the byte cap
-    // while streaming — a lying Content-Length can't exhaust memory.
-    if (!isSafeUrl(input.url)) throw new Error("image url not allowed");
-    const resp = await fetch(input.url, { signal: AbortSignal.timeout(10_000) });
-    if (!resp.ok) throw new Error(`image fetch failed: ${resp.status}`);
-    const declared = Number(resp.headers.get("content-length") ?? 0);
-    if (declared > maxBytes) throw new Error(`image over byte cap: ${declared}`);
-    const mime = resp.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
-    // Streamed cap — enforces maxBytes as bytes arrive, so a lying or absent
-    // Content-Length can't pull the whole body into memory.
-    const buf = await readBodyCapped(resp, maxBytes);
+    // are never persisted.
+    // fetchImageBytes is SSRF-guarded (safeRequest + manual redirects — the
+    // same discipline as visit_url, every hop re-validated) and caps the body
+    // as it streams — a lying Content-Length can't exhaust memory. The seam is
+    // injectable for tests since safeRequest correctly refuses loopback.
+    const { buf, mime } = await (fetchImage ?? fetchImageBytes)(input.url, maxBytes);
     const dataUri = `data:${mime};base64,${buf.toString("base64")}`;
     const contextLine = input.contextText?.trim()
       ? ` The sender's own caption was: "${input.contextText.trim()}" — use it only to disambiguate, not as part of the description.`
@@ -896,7 +890,16 @@ CONVERSATION CONTROL
           // safe: wrap-ups almost never carry toolCues.
           if (!calls.length) return parseReplyResult(msg?.content, false);
           messages.push(msg!);
-          for (const call of calls) {
+          // Cap executions per round — a model emitting a dozen calls would
+          // otherwise fire a dozen fetches/searches. The API still requires a
+          // tool response for every emitted call, so the excess get a refusal
+          // result rather than being dropped (dropped calls error the next
+          // round) or executed (unbounded spend).
+          for (const call of calls.slice(4)) {
+            inc("reply.tool_call_capped");
+            messages.push({ role: "tool", tool_call_id: call.id, content: "error: too many tool calls in one round — answer with the results you have" });
+          }
+          for (const call of calls.slice(0, 4)) {
             const started = Date.now();
             const result = await executeTool(call.function.name, call.function.arguments, toolCtx);
             console.log(`[reply] tool ${call.function.name}(${call.function.arguments.slice(0, 80)}) → ${result.length} chars in ${Date.now() - started}ms`);

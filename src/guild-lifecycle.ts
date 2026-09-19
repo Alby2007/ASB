@@ -1,6 +1,7 @@
 import { ChannelType, EmbedBuilder, PermissionFlagsBits, type Guild, type GuildBasedChannel, type TextChannel } from "discord.js";
 import { config } from "./config.js";
 import type { MemoryStore } from "./database.js";
+import { pauseGuildClaims } from "./jobs.js";
 
 // Guild lifecycle — announce-then-wait-for-consent: new guilds start dormant
 // (v16 defaults memory_enabled=0/reply_enabled=0), get a disclosure card, and
@@ -50,6 +51,10 @@ export async function handleGuildDelete(
   store: MemoryStore,
 ): Promise<boolean> {
   if (guild.unavailable) return false;
+  // Stop new job claims for the dead guild first — a worker claiming an
+  // extract job mid-purge would re-insert derived rows after it commits.
+  // In-flight jobs still finish; the guildsNotIn sweep catches their residue.
+  pauseGuildClaims(guild.id);
   await store.purgeGuild(guild.id);
   return true;
 }

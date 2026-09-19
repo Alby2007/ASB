@@ -360,3 +360,43 @@ test("pipeline: maintainEvents passes the event's archived messages to classifyE
     ]);
   } finally { await sql.end(); }
 });
+
+test("maintainEvents drains the whole candidate backlog and honors the re-score cap", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store, eventStore } = await makeStore(sql);
+    const pipeline = new EventPipeline();
+    // 12 closed candidates — the old LIMIT-8 pass would strand four of them.
+    for (let i = 0; i < 12; i++) {
+      await store.recordMessage(msg(`mb-${i}`, `backlog message ${i}`));
+      const ev = await eventStore.createEvent({ guildId: guild, channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(Date.now() - 60_000), participants: [] });
+      await eventStore.attachMessage(guild, ev.id, `mb-${i}`);
+      await eventStore.closeEvent(guild, ev.id);
+    }
+    // One already-at-cap row must not cost another LLM call.
+    await store.recordMessage(msg("mb-cap", "capped message"));
+    const capped = await eventStore.createEvent({ guildId: guild, channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(Date.now() - 60_000), participants: [] });
+    await eventStore.attachMessage(guild, capped.id, "mb-cap");
+    await eventStore.closeEvent(guild, capped.id);
+    await sql`UPDATE events SET classifications = 3 WHERE id = ${capped.id}`;
+    // And an open candidate is never classified.
+    const open = await eventStore.createEvent({ guildId: guild, channelId: channel, title: "", summary: "", significance: 0, tier: "candidate", occurredAt: new Date(), participants: [] });
+
+    let calls = 0;
+    const brain = {
+      classifyEvent: async () => { calls++; return { significance: 0, tier: "low" as const, tone: "calm", narrativeComplete: false, futureRelevant: false, title: "", summary: "" }; },
+    } as unknown as Brain;
+    const result = await pipeline.maintainEvents(guild, eventStore, store, brain);
+    assert.equal(calls, 12, "every unscored closed candidate gets exactly one pass");
+    assert.equal(result.discarded, 12);
+
+    // A discard stays candidate-tier but its classification was counted — it
+    // re-enters the work list only until the cap, never forever.
+    const rows = await sql<Array<{ id: number; classifications: number }>>`SELECT id, classifications FROM events WHERE guild_id = ${guild} AND tier = 'candidate' AND closed_at IS NOT NULL`;
+    assert.ok(rows.every(r => r.classifications >= 1));
+    const cappedRow = await eventStore.getEvent(guild, capped.id);
+    assert.equal(cappedRow!.classifications, 3, "the at-cap row was not touched");
+    const openRow = await eventStore.getEvent(guild, open.id);
+    assert.equal(openRow!.classifications, 0, "open candidates are never classified");
+  } finally { await sql.end(); }
+});

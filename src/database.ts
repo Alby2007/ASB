@@ -9,6 +9,10 @@ import { contentPolarity, listAttributes, listAttributesForSubjects, listContest
  * and every per-message regex built from it. Oldest names are evicted. */
 const MAX_KNOWN_NAMES = 32;
 
+/** Escape ILIKE wildcards in user/model-controlled query fragments — a bare
+ * "%" would enumerate every row (bounded by LIMIT, but still a loose read). */
+export const escapeLike = (s: string) => s.replace(/[\\%_]/g, c => `\\${c}`);
+
 export type Memory = Omit<MemoryCandidate, "confidence" | "importance" | "explicitness"> & {
   // DB columns are NOT NULL, so these are always present on a persisted Memory.
   confidence: number;
@@ -370,31 +374,35 @@ export class MemoryStore {
     this.settingsCache.delete(guildId);
   }
 
-  /** Guild ids present in lifecycle-owned tables but absent from the given
-   * set — zombies left when an in-flight write (a maintenance tick's
-   * ensureSettings/setMemberOptIn) races a kick-purge and re-inserts a row
-   * after it commits. Only server_settings and members are checked: every
-   * other guild-scoped table is written from in-guild events, which can't
-   * fire after removal. Caller is responsible for passing a populated cache —
-   * an empty set is treated as "cache not ready" and returns nothing. */
+  /** Guild ids present in guild-scoped tables but absent from the given set —
+   * zombies left when an in-flight write races a kick-purge and re-inserts a
+   * row after it commits: a maintenance tick's ensureSettings/setMemberOptIn,
+   * or an extract job claimed before the purge that lands memories, events,
+   * relationship observations, or attributes afterward. Caller is
+   * responsible for passing a populated cache — an empty set is treated as
+   * "cache not ready" and returns nothing. */
   async guildsNotIn(guildIds: string[]): Promise<string[]> {
     if (!guildIds.length) return [];
     const rows = await this.sql<{ guild_id: string }[]>`
       SELECT guild_id FROM server_settings WHERE NOT (guild_id = ANY(${guildIds}))
-      UNION
-      SELECT guild_id FROM members WHERE NOT (guild_id = ANY(${guildIds}))`;
+      UNION SELECT guild_id FROM members WHERE NOT (guild_id = ANY(${guildIds}))
+      UNION SELECT guild_id FROM memories WHERE NOT (guild_id = ANY(${guildIds}))
+      UNION SELECT guild_id FROM events WHERE NOT (guild_id = ANY(${guildIds}))
+      UNION SELECT guild_id FROM relationship_observations WHERE NOT (guild_id = ANY(${guildIds}))
+      UNION SELECT guild_id FROM profile_attributes WHERE NOT (guild_id = ANY(${guildIds}))
+      UNION SELECT guild_id FROM jobs WHERE NOT (guild_id = ANY(${guildIds}))`;
     return rows.map(r => r.guild_id);
   }
 
   // ── Messages ───────────────────────────────────────────────────────────────
 
-  async recordMessage(event: MessageEvent, replyToId?: string, trackMember = true): Promise<void> {
+  async recordMessage(event: MessageEvent, replyToId?: string, trackMember = true, authorIsBot = false): Promise<void> {
     // Insert-only dedup: a conflict means the message was already archived
     // (re-ingest), so member stats must not double-count. Name/seen-at merges
     // still run — they're idempotent by construction.
     const inserted = await this.sql`
-      INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, content, created_at, reply_to_id)
-      VALUES (${event.messageId}, ${event.guildId}, ${event.channelId}, ${event.authorId}, ${event.authorName}, ${event.content}, ${event.createdAt.toISOString()}, ${replyToId ?? null})
+      INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, content, created_at, reply_to_id, author_is_bot)
+      VALUES (${event.messageId}, ${event.guildId}, ${event.channelId}, ${event.authorId}, ${event.authorName}, ${event.content}, ${event.createdAt.toISOString()}, ${replyToId ?? null}, ${authorIsBot})
       ON CONFLICT (id) DO NOTHING
     `;
     if (inserted.count === 0 && replyToId) {
@@ -992,11 +1000,11 @@ export class MemoryStore {
     });
   }
 
-  async getMessage(guildId: string, messageId: string): Promise<{ id: string; guildId: string; channelId: string; authorId: string; authorName: string; content: string; createdAt: string } | undefined> {
-    const rows = await this.sql<MessageRow[]>`SELECT id, guild_id, channel_id, author_id, author_name, content, created_at FROM messages WHERE guild_id = ${guildId} AND id = ${messageId}`;
+  async getMessage(guildId: string, messageId: string): Promise<{ id: string; guildId: string; channelId: string; authorId: string; authorName: string; content: string; createdAt: string; authorIsBot: boolean } | undefined> {
+    const rows = await this.sql<Array<MessageRow & { author_is_bot: boolean }>>`SELECT id, guild_id, channel_id, author_id, author_name, content, created_at, author_is_bot FROM messages WHERE guild_id = ${guildId} AND id = ${messageId}`;
     if (!rows[0]) return undefined;
     const r = rows[0];
-    return { id: r.id, guildId: r.guild_id, channelId: r.channel_id, authorId: r.author_id, authorName: r.author_name, content: r.content, createdAt: ts(r.created_at) };
+    return { id: r.id, guildId: r.guild_id, channelId: r.channel_id, authorId: r.author_id, authorName: r.author_name, content: r.content, createdAt: ts(r.created_at), authorIsBot: r.author_is_bot };
   }
 
   async hasEvidence(messageId: string): Promise<boolean> {
@@ -1011,7 +1019,6 @@ export class MemoryStore {
   async messagesAboutSubject(
     guildId: string, userId: string, names: string[], since: Date, limit = 1000
   ): Promise<Array<{ id: string; channelId: string; authorId: string; authorName: string; content: string; createdAt: string; replyToContent?: string }>> {
-    const escapeLike = (s: string) => s.replace(/[\\%_]/g, c => `\\${c}`);
     const patterns = [
       ...names.map(n => `%${escapeLike(n)}%`),
       `%<@${userId}>%`, `%<@!${userId}>%`,
@@ -1080,6 +1087,7 @@ export class MemoryStore {
           OR (m.triage_result IS NULL AND m.created_at > ${since.toISOString()})
         )
         AND m.author_id <> ${excludeAuthorId}
+        AND NOT m.author_is_bot
         AND m.content <> ''
         AND NOT EXISTS (SELECT 1 FROM memory_evidence e WHERE e.message_id = m.id)
       ORDER BY m.created_at ASC LIMIT ${limit}
@@ -1286,7 +1294,7 @@ export class MemoryStore {
     let rows: MemoryRow[];
 
     if (options.search) {
-      const search = `%${options.search}%`;
+      const search = `%${escapeLike(options.search)}%`;
       countResult = await this.sql<[{ count: number }]>`SELECT COUNT(*)::int as count FROM memories WHERE guild_id = ${guildId} AND subject_id = ${subjectId} AND status = ${status} AND content ILIKE ${search}`;
       rows = await this.sql<MemoryRow[]>`SELECT * FROM memories WHERE guild_id = ${guildId} AND subject_id = ${subjectId} AND status = ${status} AND content ILIKE ${search} ORDER BY importance * confidence DESC, last_confirmed_at DESC LIMIT 8 OFFSET ${offset}`;
     } else {
@@ -1647,10 +1655,12 @@ export class MemoryStore {
   //   matters recurs and writes a fresh row, so aged rows carry no unique signal.
   // - candidate-tier events that have closed (discarded or timed out): never
   //   surfaced anywhere. Promoted 'event' rows are the feature and are kept.
-  // Child tables have no cascade, so they're deleted first. memory_evidence is
-  // deliberately not pruned — evidence is retained for inspectability even on
-  // forgotten memories, and its size tracks live memory count.
-  async pruneDerivedData(guildId: string, olderThanDays = 90): Promise<{ history: number; names: number; aliases: number; events: number; usage: number }> {
+  // Child tables have no cascade, so they're deleted first. memory_evidence
+  // ROWS are deliberately kept — the audit trail (type, effect, reason) is
+  // retained for inspectability even on forgotten memories — but their
+  // verbatim text columns expire with the raw-message retention window,
+  // otherwise a deleted message's words would persist inside evidence.
+  async pruneDerivedData(guildId: string, olderThanDays = 90, verbatimDays?: number): Promise<{ history: number; names: number; aliases: number; events: number; usage: number; evidence: number }> {
     const cutoff = new Date(Date.now() - olderThanDays * 86_400_000).toISOString();
     const staleEvents = this.sql`SELECT id FROM events WHERE guild_id = ${guildId} AND tier = 'candidate' AND closed_at IS NOT NULL AND occurred_at < ${cutoff}`;
     const history = await this.sql`
@@ -1667,7 +1677,35 @@ export class MemoryStore {
     // is enough for /status-style review; without this it grows ~365
     // rows/guild/year forever.
     const usage = await this.sql`DELETE FROM guild_usage WHERE guild_id = ${guildId} AND day < (now() AT TIME ZONE 'UTC')::date - 30`;
-    return { history: history.count, names: names.count, aliases: aliases.count, events: events.count, usage: usage.count };
+    let evidence = { count: 0 };
+    if (verbatimDays !== undefined) {
+      const vcutoff = new Date(Date.now() - verbatimDays * 86_400_000).toISOString();
+      evidence = await this.sql`
+        UPDATE memory_evidence SET quote = '', message_content_snapshot = ''
+        WHERE created_at < ${vcutoff} AND (quote <> '' OR message_content_snapshot <> '')
+        AND memory_id IN (SELECT id FROM memories WHERE guild_id = ${guildId})
+      `;
+    }
+    return { history: history.count, names: names.count, aliases: aliases.count, events: events.count, usage: usage.count, evidence: evidence.count };
+  }
+
+  /** Opt-out scrub: blank the verbatim text columns on every evidence row
+   * citing this subject's memories — immediately, not at retention expiry.
+   * Metadata (type, effect, reason, observed_at) stays for the audit trail. */
+  async scrubEvidenceFor(guildId: string, subjectId: string): Promise<number> {
+    const result = await this.sql`
+      UPDATE memory_evidence SET quote = '', message_content_snapshot = ''
+      WHERE (quote <> '' OR message_content_snapshot <> '')
+      AND memory_id IN (SELECT id FROM memories WHERE guild_id = ${guildId} AND subject_id = ${subjectId})
+    `;
+    return result.count;
+  }
+
+  /** Hard-delete a subject's attribute rows — derived data about an opted-out
+   * member shouldn't linger even in a non-active status. */
+  async deleteAttributesFor(guildId: string, subjectId: string): Promise<number> {
+    const result = await this.sql`DELETE FROM profile_attributes WHERE guild_id = ${guildId} AND subject_id = ${subjectId}`;
+    return result.count;
   }
 
   // Admin triage view: the last N memories written for the guild across all
@@ -1695,7 +1733,7 @@ export class MemoryStore {
     // episodes attached to 'server' are consent-exempt shared context.
     const rows = await this.sql<Array<{ subject_id: string; content: string; confidence: number }>>`
       SELECT subject_id, content, confidence FROM memories
-      WHERE guild_id = ${guildId} AND status = 'active' AND content ILIKE ${`%${query}%`}
+      WHERE guild_id = ${guildId} AND status = 'active' AND content ILIKE ${`%${escapeLike(query)}%`}
       AND (subject_id = 'server' OR subject_id IN (SELECT user_id FROM members WHERE guild_id = ${guildId} AND opted_in = 1 AND opted_out = 0))
       ${kinds?.length ? this.sql`AND kind = ANY(${kinds})` : this.sql``}
       ORDER BY importance * confidence DESC LIMIT ${limit}

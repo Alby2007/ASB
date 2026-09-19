@@ -180,3 +180,42 @@ test("enqueue → claim → runExtractJob is the end-to-end drain path", async (
     assert.equal(marks.get("m-e2e"), "extracted", "empty extraction still writes the terminal mark");
   } finally { await sql.end(); }
 });
+
+test("deleted, edited, and bot-authored messages are re-read at execution time", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store, eventStore } = await makeStore(sql);
+    await store.settings("g6");
+    await store.setMemberOptIn("g6", "u1", true);
+    const base = { guildId: "g6", channelId: "c1", authorId: "u1", authorName: "Alice", createdAt: new Date(), mentionsBot: false };
+
+    let extractCalls = 0;
+    let lastContent = "";
+    const brain: Partial<Brain> = {
+      extractMemories: async (e: MessageEvent) => { extractCalls++; lastContent = e.content; return { memories: [], relationships: [] }; },
+    };
+    const deps = stubDeps(store, eventStore, brain);
+
+    // Deleted after enqueue — the payload still carries the old content, but
+    // the archive row is gone: the job must drop, never extract deleted words.
+    const delEvent = { ...base, messageId: "m-del", content: "secret i regret" };
+    await store.recordMessage(delEvent as MessageEvent, undefined, true);
+    await store.deleteMessage("g6", "m-del");
+    await runExtractJob(payloadFor(delEvent), deps);
+    assert.equal(extractCalls, 0, "a deleted message must not be extracted");
+
+    // Edited after enqueue — the snapshot is stale; current text is extracted.
+    const editEvent = { ...base, messageId: "m-edit", content: "i love jazz" };
+    await store.recordMessage(editEvent as MessageEvent, undefined, true);
+    await store.updateMessageContent("g6", "m-edit", "i hate jazz actually");
+    await runExtractJob(payloadFor(editEvent), deps);
+    assert.equal(extractCalls, 1);
+    assert.equal(lastContent, "i hate jazz actually", "edits win over the enqueue snapshot");
+
+    // Bot-authored row — archived as context, never a memory source.
+    const botEvent = { ...base, messageId: "m-bot", authorId: "otherbot", content: "BOT OUTPUT" };
+    await store.recordMessage(botEvent as MessageEvent, undefined, false, true);
+    await runExtractJob(payloadFor(botEvent), deps);
+    assert.equal(extractCalls, 1, "bot-authored rows never reach extraction");
+  } finally { await sql.end(); }
+});

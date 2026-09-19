@@ -128,6 +128,7 @@ const migrations: Migration[] = [
           occurred_at     TIMESTAMPTZ NOT NULL,
           closed_at       TIMESTAMPTZ,
           reference_count INTEGER NOT NULL DEFAULT 0,
+          classifications INTEGER NOT NULL DEFAULT 0,
           created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
@@ -494,6 +495,23 @@ const migrations: Migration[] = [
       await sql`ALTER TABLE server_settings DROP COLUMN IF EXISTS llm_daily_cap`;
     },
   },
+  {
+    version: 18,
+    name: "v18_bot_flag_and_event_classifications",
+    // messages.author_is_bot: other bots' messages are archive-only context —
+    // the sweep must never triage/extract them and a queued extract job drops
+    // them at execution. events.classifications: counts re-classification
+    // passes so a 'discard'-verdict candidate stops paying a full LLM call on
+    // every future reference (bounded retries, not forever).
+    up: async (sql) => {
+      await sql`ALTER TABLE messages ADD COLUMN IF NOT EXISTS author_is_bot BOOLEAN NOT NULL DEFAULT FALSE`;
+      await sql`ALTER TABLE events ADD COLUMN IF NOT EXISTS classifications INTEGER NOT NULL DEFAULT 0`;
+    },
+    down: async (sql) => {
+      await sql`ALTER TABLE messages DROP COLUMN IF EXISTS author_is_bot`;
+      await sql`ALTER TABLE events DROP COLUMN IF EXISTS classifications`;
+    },
+  },
 ];
 
 /** Highest known migration version — tests assert against this instead of a
@@ -510,7 +528,8 @@ export async function runMigrations(sql: Sql, targetVersion?: number): Promise<v
       author_id  TEXT NOT NULL,
       author_name TEXT NOT NULL,
       content    TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL
+      created_at TIMESTAMPTZ NOT NULL,
+      author_is_bot BOOLEAN NOT NULL DEFAULT FALSE
     )
   `;
   await sql`

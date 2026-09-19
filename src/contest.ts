@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Brain } from "./brain.js";
 import type { MemoryStore } from "./database.js";
 import { botMemoryCue, contestCue } from "./perception.js";
@@ -31,7 +32,10 @@ export async function runContestCheck(
     const hasContestable = (await store.contestableMemories(event.guildId, event.authorId)).length > 0;
     if (hasContestable) {
       inc("contest.cue_miss");
-      console.warn(`[contest] cue miss with contestable memories — guild ${event.guildId} author ${event.authorId}: "${event.content.slice(0, 200)}"`);
+      // No raw content in operator logs — a content hash correlates repeated
+      // phrasings for cue tuning without turning the log into a PII store.
+      const hash = createHash("sha256").update(event.content).digest("hex").slice(0, 10);
+      console.warn(`[contest] cue miss with contestable memories — guild ${event.guildId} author ${event.authorId} msg ${event.messageId} content-hash ${hash}`);
     }
     return { contests: 0, confirms: 0 };
   }

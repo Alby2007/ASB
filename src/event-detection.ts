@@ -4,6 +4,7 @@ import type { MemoryStore } from "./database.js";
 import type { ContinuityDecision, MessageEvent, StoredEvent } from "./types.js";
 import { calculateSignificance } from "./event-significance.js";
 import { logError } from "./secrets.js";
+import { BudgetExceeded } from "./budget.js";
 
 // ── Heuristic pre-filter constants ────────────────────────────────────────────
 
@@ -230,10 +231,16 @@ export class EventPipeline {
     const ev = await eventStore.getEvent(guildId, eventId);
     if (!ev || ev.tier === "event") return false; // already promoted or not found
     if (ev.referenceCount < 2) return false;      // wait for more evidence
+    // A 'discard' verdict doesn't change tier, so without this cap a rejected
+    // candidate would pay a full classifyEvent call on every future reference,
+    // forever. Three passes is enough — the signal it needs is more refs, not
+    // more re-reads of the same cluster.
+    if (ev.classifications >= 3) return false;
 
     // Re-classify using current cluster data
     const cluster = await buildCluster(ev, memoryStore);
     const classification = await brain.classifyEvent(cluster);
+    await eventStore.noteClassification(guildId, eventId);
     const { score, tier } = calculateSignificance({
       distinctParticipants: ev.participants.length,
       messageCount: ev.messageIds.length,
@@ -267,40 +274,46 @@ export class EventPipeline {
   ): Promise<{ closed: number; promoted: number; discarded: number }> {
     const closed = await eventStore.closeStaleEvents(guildId, maxAgeMs);
 
-    // Score all closed candidate events that have not been given a score yet
-    const unscored = await eventStore.listEvents(guildId, { tier: "candidate" });
+    // Score all closed candidate events that have not been given a score yet —
+    // cursor the whole backlog, not just the first page, or a guild generating
+    // more than a page of candidates a day never drains. The query filters to
+    // the work list (closed, unscored, under the re-score cap); the id cursor
+    // makes each row visible exactly once even as promotions/discards mutate
+    // the filter mid-scan.
     let promoted = 0, discarded = 0;
-
-    for (const ev of unscored.events) {
-      if (ev.closedAt == null) continue; // still open
-      // significance is only written once a candidate has been classified; a
-      // positive value means this row was already scored in a previous run —
-      // skip it rather than spending another LLM call.
-      if (ev.significance > 0) continue;
-      const cluster = await buildCluster(ev, memoryStore);
-      let classification;
-      try {
-        classification = await brain.classifyEvent(cluster);
-      } catch (err) {
-        logError(`  [classifyEvent error] event ${ev.id}:`, err);
-        continue;
-      }
-      const { score, tier } = calculateSignificance({
-        distinctParticipants: ev.participants.length,
-        messageCount: ev.messageIds.length,
-        memoryCount: ev.memoryIds.length,
-        tone: classification.tone,
-        narrativeComplete: classification.narrativeComplete,
-        futureRelevant: classification.futureRelevant,
-      });
-      if (tier === "event") {
-        await eventStore.updateSignificance(guildId, ev.id, score, "event", classification.title, classification.summary);
-        promoted++;
-      } else if (tier === "discard") {
-        // Discard: close the record with significance 0 and leave tier as candidate
-        // (we never hard-delete — "discard" just means we don't surface it)
-        await eventStore.updateSignificance(guildId, ev.id, score, "candidate", ev.title, ev.summary);
-        discarded++;
+    let afterId = 0;
+    for (;;) {
+      const batch = await eventStore.listUnscoredCandidates(guildId, afterId, 50);
+      if (!batch.length) break;
+      for (const ev of batch) {
+        afterId = ev.id;
+        const cluster = await buildCluster(ev, memoryStore);
+        let classification;
+        try {
+          classification = await brain.classifyEvent(cluster);
+          await eventStore.noteClassification(guildId, ev.id);
+        } catch (err) {
+          if (err instanceof BudgetExceeded) throw err; // daily cap — the caller's per-guild loop handles it
+          logError(`  [classifyEvent error] event ${ev.id}:`, err);
+          continue;
+        }
+        const { score, tier } = calculateSignificance({
+          distinctParticipants: ev.participants.length,
+          messageCount: ev.messageIds.length,
+          memoryCount: ev.memoryIds.length,
+          tone: classification.tone,
+          narrativeComplete: classification.narrativeComplete,
+          futureRelevant: classification.futureRelevant,
+        });
+        if (tier === "event") {
+          await eventStore.updateSignificance(guildId, ev.id, score, "event", classification.title, classification.summary);
+          promoted++;
+        } else if (tier === "discard") {
+          // Discard: close the record with significance 0 and leave tier as candidate
+          // (we never hard-delete — "discard" just means we don't surface it)
+          await eventStore.updateSignificance(guildId, ev.id, score, "candidate", ev.title, ev.summary);
+          discarded++;
+        }
       }
     }
 

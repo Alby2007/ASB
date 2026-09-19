@@ -205,7 +205,11 @@ export function startWorker(deps: WorkerDeps): { stop: () => Promise<void> } {
         if (!job) return;
         inFlight++;
         guildInFlight.set(job.guild_id, (guildInFlight.get(job.guild_id) ?? 0) + 1);
-        void runJob(job).finally(() => {
+        // The .catch must come FIRST: runJob's own catch block runs recovery
+        // SQL, which itself throws during a DB outage — a rejection surviving
+        // the finally would be an unhandled rejection and a fatal exit on
+        // Node ≥15, i.e. a restart loop at exactly the DB's least-healthy moment.
+        void runJob(job).catch(e => onError(`job ${job.id} (${job.type}) recovery failed`, e)).finally(() => {
           inFlight--;
           const left = (guildInFlight.get(job.guild_id) ?? 1) - 1;
           if (left > 0) {

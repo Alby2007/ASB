@@ -14,7 +14,7 @@ import { EventStore } from "./events.js";
 import { EventPipeline } from "./event-detection.js";
 import { ProfileStore } from "./profiles.js";
 import { buildAliasMap, demangleMentions, findMentionedUsers, scrubMentions, type AliasMap } from "./entity-resolution.js";
-import { enqueue, startWorker, FatalJobError } from "./jobs.js";
+import { enqueue, startWorker, FatalJobError, resumeGuildClaims } from "./jobs.js";
 import { buildPairContext, type ToolCtx } from "./lookup-tools.js";
 import { qualifyingImages, formatImageContext, IMAGE_MAX_PER_MESSAGE, type AttachmentMeta } from "./vision.js";
 import { withRetry } from "./retry.js";
@@ -112,8 +112,12 @@ async function init() {
   // Armed questions survive restarts as 'proactive-fire' rows — repopulate
   // the pending map so release() dedup keeps working. A row already past
   // run_after claims on the next poll and fires normally.
+  // Newest row first — restore() is first-wins, and a channel can hold a
+  // superseded 'proactive-fire' row alongside its replacement (re-armed
+  // questions don't delete the old job). Without ordering Postgres could
+  // return the stale row first and arm the superseded question.
   for (const row of await sql<Array<{ guild_id: string; payload: { channelId?: string; messageId?: string } }>>`
-    SELECT guild_id, payload FROM jobs WHERE type = 'proactive-fire' AND attempts < 5
+    SELECT guild_id, payload FROM jobs WHERE type = 'proactive-fire' AND attempts < 5 ORDER BY id DESC
   `) {
     if (row.payload.channelId && row.payload.messageId) {
       proactive.restore(`${row.guild_id}:${row.payload.channelId}`, row.payload.messageId, Date.now());
@@ -177,6 +181,7 @@ client.once(Events.ClientReady, async ready => {
 // be unit-tested (this module logs in on import).
 client.on(Events.GuildCreate, guild => {
   if (!store) return; // fires before init on connect — ClientReady runs first in practice
+  resumeGuildClaims(guild.id); // a re-join un-pauses what a kick-purge paused
   announceIfNeeded(guild, store).catch(error => { inc("guild.announce_error"); logError(`Join announcement failed in ${guild.name}`, error); });
 });
 
@@ -203,8 +208,10 @@ async function applyRetention() {
   for (const guild of client.guilds.cache.values()) {
     // These three calls sit outside the feature-level try/catches below — a DB
     // blip here must skip the guild, not reject the whole interval callback.
+    let retentionDays = config.rawMessageRetentionDays;
     try {
       const settings = await store.settings(guild.id, config.rawMessageRetentionDays);
+      retentionDays = settings.rawRetentionDays;
       // The bot opts itself in — memories the room forms about it are part of
       // its persona surface (framed as community claims, not self-truth).
       await store.setMemberOptIn(guild.id, client.user!.id, true);
@@ -213,9 +220,9 @@ async function applyRetention() {
       if (deleted) console.log(`Retention deleted ${deleted} raw messages in ${guild.name}`);
     } catch (error) { inc("maintenance.retention_error"); logError(`Retention/maintenance failed in ${guild.name}`, error); continue; }
     try {
-      const pruned = await store.pruneDerivedData(guild.id);
-      if (pruned.history + pruned.names + pruned.aliases + pruned.events + pruned.usage) {
-        console.log(`Pruned derived data in ${guild.name}: ${pruned.history} history, ${pruned.names} unresolved names, ${pruned.aliases} alias candidates, ${pruned.events} events, ${pruned.usage} usage rows`);
+      const pruned = await store.pruneDerivedData(guild.id, undefined, retentionDays);
+      if (pruned.history + pruned.names + pruned.aliases + pruned.events + pruned.usage + pruned.evidence) {
+        console.log(`Pruned derived data in ${guild.name}: ${pruned.history} history, ${pruned.names} unresolved names, ${pruned.aliases} alias candidates, ${pruned.events} events, ${pruned.usage} usage rows, ${pruned.evidence} evidence verbatim`);
       }
     } catch (error) { inc("maintenance.prune_error"); logError("Derived-data pruning failed", error); }
     // Dormant guilds (no key) skip every LLM pass — retention/pruning above
@@ -577,7 +584,7 @@ async function fireProactive(key: string, messageId: string): Promise<void> {
     guildId, channelId, messageId: sent.id,
     authorId: client.user!.id, authorName: question.guild?.members.me?.displayName ?? client.user!.username,
     content: clean, createdAt: sent.createdAt ?? new Date(), mentionsBot: false,
-  }, messageId, false);
+  }, messageId, false, true);
   await store.setTriageResults([{ id: sent.id, result: "noise" }]);
 }
 
@@ -616,7 +623,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   if (!brain) return;
   // Resolve the reply target first so it can be persisted with the raw message.
   const replyToId = message.reference?.messageId ?? undefined;
-  if (settings.memoryEnabled) await store.recordMessage(event, replyToId, !message.author.bot);
+  if (settings.memoryEnabled) await store.recordMessage(event, replyToId, !message.author.bot, message.author.bot);
   // Bot chatter is archive-only context: it resolves references and appears in
   // recentContext, but is never a memory source, never enters the event
   // pipeline, and never triggers a reply — no bot→bot loops.
@@ -625,14 +632,15 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     return;
   }
   let replyToContent: string | undefined;
+  let replyToAuthorId: string | undefined;
   if (replyToId) {
     const ref = await store.getMessage(event.guildId, replyToId);
-    if (ref) replyToContent = `${ref.authorName}: ${ref.content}`;
+    if (ref) { replyToContent = `${ref.authorName}: ${ref.content}`; replyToAuthorId = ref.authorId; }
     else {
       // Reply target isn't archived (bot message that predates this, pre-boot
       // history) — ask Discord for it so the reference still resolves.
       const live = await message.channel.messages.fetch(replyToId).catch(() => undefined);
-      if (live) replyToContent = `${live.member?.displayName ?? live.author.username}: ${live.content}`;
+      if (live) { replyToContent = `${live.member?.displayName ?? live.author.username}: ${live.content}`; replyToAuthorId = live.author.id; }
     }
   }
   // Per-image describe, per-image fault tolerance — a dead URL or a 429 skips
@@ -682,7 +690,10 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   // dilutes the bot's floor share for the decide() below.
   const verdict = evaluateSpeechTurn({
     event, botId: client.user!.id,
-    repliedToOtherUser: message.mentions.repliedUser !== null && message.mentions.repliedUser.id !== client.user!.id,
+    // mentions.repliedUser is null when the sender suppresses the reply ping —
+    // use the resolved target's author instead so a ping-off reply to a human
+    // still reads as "aimed at a human", not as a bot-directed message.
+    repliedToOtherUser: replyToAuthorId !== undefined && replyToAuthorId !== client.user!.id,
     mentionsOtherUsers: message.mentions.users.some(u => u.id !== client.user!.id),
   }, convo, (e, ms, eng, share) => brain.decide(e, ms, eng, share, config.speakThreshold), { engagement: config.engagement });
   const decision = verdict.decision;
@@ -782,7 +793,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
         guildId: event.guildId, channelId: event.channelId, messageId: sent.id,
         authorId: client.user!.id, authorName: message.guild.members.me?.displayName ?? client.user!.username,
         content: clean, createdAt: sent.createdAt ?? new Date(), mentionsBot: false,
-      }, event.messageId, false);
+      }, event.messageId, false, true);
       // Same rule as inbound bot chatter: archive for transcript fidelity,
       // never a memory source — keep it out of the sweep's extraction set.
       await store.setTriageResults([{ id: sent.id, result: "noise" }]);

@@ -354,3 +354,33 @@ test("pruneDerivedData drops guild_usage rows older than 30 days, keeps recent",
     assert.equal(rows[0].llm_calls, 1, "today's counter survives");
   } finally { await sql.end(); }
 });
+
+test("pruneDerivedData scrubs verbatim evidence columns at the retention window, keeps the audit row", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    await store.recordMessage({
+      guildId: "g-ev", channelId: "c", messageId: "m-ev", authorId: "u1",
+      authorName: "Alice", content: "words", createdAt: new Date(), mentionsBot: false,
+    });
+    const saved = await store.saveMemory(
+      { guildId: "g-ev", channelId: "c", messageId: "m-ev", authorId: "u1", authorName: "Alice", content: "words", createdAt: new Date(), mentionsBot: false },
+      { subjectId: "u1", kind: "person_fact", content: "fact", reason: "r", evidenceType: "explicit_fact", effect: "support" },
+    );
+    // saveMemory writes the citing evidence row — give it verbatim text.
+    const [evid] = await sql`
+      UPDATE memory_evidence SET quote = 'verbatim quote', message_content_snapshot = 'full snapshot'
+      WHERE memory_id = ${saved.id} RETURNING id`;
+    // Fresh evidence is inside the window — verbatim text must survive.
+    const fresh = await store.pruneDerivedData("g-ev", 90, 30);
+    assert.equal(fresh.evidence, 0);
+    // Age the evidence past the verbatim window — the words go, the row stays.
+    await sql`UPDATE memory_evidence SET created_at = now() - interval '40 days' WHERE id = ${evid.id}`;
+    const pruned = await store.pruneDerivedData("g-ev", 90, 30);
+    assert.equal(pruned.evidence, 1);
+    const [row] = await sql`SELECT quote, message_content_snapshot, reason FROM memory_evidence WHERE id = ${evid.id}`;
+    assert.equal(row.quote, "");
+    assert.equal(row.message_content_snapshot, "");
+    assert.equal(row.reason, "r", "audit metadata is retained");
+  } finally { await sql.end(); }
+});

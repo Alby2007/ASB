@@ -20,10 +20,25 @@ export type ToolCtx = {
   resolveName: (name: string) => string | undefined;
 };
 
+/** Derived-data consent for a member row: opted in and not opted out. The bot
+ * is auto-opted-in by the retention pass, so human↔bot pairs surface — the
+ * same "either party consents" rule persistence applies. */
+async function memberConsented(store: MemoryStore, guildId: string, userId: string): Promise<boolean> {
+  const m = await store.getMember(guildId, userId);
+  return !!m?.optedIn && !m.optedOut;
+}
+
 /** Assemble one pair's relationship context — shared by the reply prompt's
  * ≤6-pair section and the lookup_relationship tool so both render identically.
- * Returns undefined when the pair has zero signal. */
+ * Returns undefined when the pair has zero signal OR when neither party
+ * consents: pair data is shared once either side opts in (the persistence
+ * rule in persist-extraction.ts), and gating here covers every consumer —
+ * including rows written before consent gating existed. */
 export async function buildPairContext(store: MemoryStore, eventStore: EventStore, guildId: string, aId: string, bId: string): Promise<PairContext | undefined> {
+  const [aOk, bOk] = await Promise.all([
+    memberConsented(store, guildId, aId), memberConsented(store, guildId, bId),
+  ]);
+  if (!aOk && !bOk) return undefined;
   const [pc, events] = await Promise.all([
     store.pairwiseContext(guildId, aId, bId),
     eventStore.sharedEvents(guildId, aId, bId, 3),
@@ -48,8 +63,7 @@ export const LOOKUP_TOOL_NAMES = new Set(["lookup_person", "lookup_relationship"
 /** Derived-data consent: opted in and not opted out. Non-members (including
  * "unknown" subjects) are not consented — their rows are inert anyway. */
 async function hasConsent(ctx: ToolCtx, userId: string): Promise<boolean> {
-  const m = await ctx.store.getMember(ctx.guildId, userId);
-  return !!m?.optedIn && !m.optedOut;
+  return memberConsented(ctx.store, ctx.guildId, userId);
 }
 
 /** Execute one lookup tool against ctx. Always resolves to a string. */
@@ -78,6 +92,11 @@ export async function executeLookupTool(name: string, args: Record<string, unkno
       const aId = ctx.resolveName(a), bId = ctx.resolveName(b);
       if (!aId) return `no member known as "${a}"`;
       if (!bId) return `no member known as "${b}"`;
+      // Pair data is shared once EITHER side consents — the same rule the
+      // persistence path applies (persist-extraction.ts). Gating reads the
+      // same way filters any rows written before consent gating existed.
+      if (!(await hasConsent(ctx, aId)) && !(await hasConsent(ctx, bId)))
+        return `"${a}" and "${b}" haven't opted in to profiles`;
       const pc = await buildPairContext(ctx.store, ctx.eventStore, ctx.guildId, aId, bId);
       return pc ? formatPairContext(pc).replace(/^- /, "") : `no recorded dynamic between "${a}" and "${b}"`;
     }
@@ -105,6 +124,9 @@ export async function executeLookupTool(name: string, args: Record<string, unkno
     }
 
     if (name === "lookup_event") {
+      // Deliberately ungated: events are shared server context, not person
+      // profiles — participants are part of what happened, like minutes of a
+      // meeting. Person-scoped memories still require subject consent above.
       const title = typeof args.title === "string" ? args.title.trim() : "";
       if (!title) return "error: missing title";
       const events = await ctx.eventStore.searchEvents(ctx.guildId, title, 3);

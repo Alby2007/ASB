@@ -8,7 +8,7 @@ ASB ("the bot") is a Discord bot that participates in servers like a member. Thi
 
 **Dormant until enabled.** When the bot joins a server it posts a disclosure card and records **nothing** — observation starts only after a server admin runs `/memory-resume`. Everything below applies once enabled.
 
-**Raw message archive.** Messages in channels the bot can read are archived to a PostgreSQL database so the bot can reply with context, extract knowledge, and audit where a memory came from. Raw messages are retained for **30 days** by default (the operator may configure 1–365 days) and then permanently deleted.
+**Raw message archive.** Messages in channels the bot can read are archived to a PostgreSQL database so the bot can reply with context, extract knowledge, and audit where a memory came from. Raw messages are retained for **30 days** by default (the operator may configure 1–365 days) and then permanently deleted — including the verbatim quote/snapshot columns inside memory evidence (audit metadata like evidence type and reason is kept, the quoted words are not).
 
 **Member registry.** Per server, per user: display names/nicknames observed, message count, and first/last activity timestamps. This exists so the bot can tell who a name refers to — it is infrastructure, not a profile.
 
@@ -28,7 +28,7 @@ ASB ("the bot") is a Discord bot that participates in servers like a member. Thi
 
 - **Deleting a Discord message** removes its archived copy and scrubs the verbatim text from any evidence it produced (audit metadata like evidence type is kept).
 - **Editing a message** updates the archived copy. Evidence snapshots deliberately keep the original text, as the record of what a memory was derived from.
-- **`/opt-out`** deletes all your derived data (memories, relationships, profile, attributes) and prevents any new derived data about you. Your raw messages remain in the archive until retention expires.
+- **`/opt-out`** removes all your derived data and prevents any new derived data about you: relationships, profile, and attributes are deleted outright; memories are marked forgotten (invisible to every read path — the row's audit metadata is kept, while its verbatim quotes are scrubbed immediately). Your raw messages remain in the archive until retention expires.
 - **`/forget`** removes a single memory.
 - **`/memory-export`** lets you download everything the bot holds about you.
 - Server admins can set a shorter retention window via `/memory-purge` or disable memory/reply features entirely via `/memory-pause`.

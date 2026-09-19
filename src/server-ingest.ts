@@ -10,6 +10,7 @@ import { ProfileStore } from "./profiles.js";
 import { buildAliasMap } from "./entity-resolution.js";
 import { persistExtraction } from "./persist-extraction.js";
 import { sleep, withRetry } from "./retry.js";
+import { BudgetExceeded } from "./budget.js";
 import { logError } from "./secrets.js";
 import type { MessageEvent } from "./types.js";
 
@@ -89,7 +90,7 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
       // Bot chatter is archive-only context (same rule as the live path):
       // record it for the transcript, mark it so no pipeline ever extracts it.
       if (msg.author.bot) {
-        await store.recordMessage(event, replyToId, false);
+        await store.recordMessage(event, replyToId, false, true);
         await store.setTriageResults([{ id: msg.id, result: "noise" }]);
         continue;
       }
@@ -256,6 +257,12 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
       // and are retried on the next run.
       await store.setTriageResults(batch.map(item => ({ id: item.event.messageId, result: "extracted" })));
     } catch (err) {
+      // Daily cap reached — churning the remaining backlog just burns
+      // attempt-after-attempt against a meter that can't pass until midnight.
+      if (err instanceof BudgetExceeded) {
+        console.log(`  extraction halted at batch ${batchCalls}: daily LLM cap reached — remaining messages keep their queued verdict`);
+        break;
+      }
       llmErrors++;
       logError(`  [batch extraction error] batch ${batchCalls}:`, err);
       for (const item of batch) savedIdsByMessage.set(item.event.messageId, []);
