@@ -100,9 +100,14 @@ export class Brain {
     return { shouldSpeak: score >= threshold, score: Math.max(0, Math.min(1, score)), reasons };
   }
 
-  async extractMemories(event: MessageEvent, replyToContent?: string, note?: string, imageContext?: string): Promise<ExtractionResult> {
+  async extractMemories(event: MessageEvent, replyToContent?: string, note?: string, imageContext?: string, natureVocab?: string[]): Promise<ExtractionResult> {
     const replyContext = replyToContent ? `\n\nThis message is a reply to: "${replyToContent}"` : "";
     const noteContext = note ? `\n\nNote: ${note}` : "";
+    // Established nature labels keep the vocabulary coherent — "close friends"
+    // gets reused instead of fragmenting into "besties"/"buds"/"buds forever".
+    const vocabContext = natureVocab?.length
+      ? ` For the nature field, prefer reusing one of these established labels when it fits: ${natureVocab.map(n => `"${n}"`).join(", ")}.`
+      : "";
     // Attached-image content is the bot's own observation, not the author's
     // words — evidenceType must reflect that (observed/inferred, never stated),
     // and depicted people are not attributed without textual naming.
@@ -110,7 +115,7 @@ export class Brain {
     const response = await this.client.responses.create({
       model: this.model,
       max_output_tokens: 2048, // extraction output is bounded — cap spend on injected verbosity
-      input: `Extract only durable, useful memories from this Discord message. Do not infer sensitive traits, diagnoses, private information, or insults. A single casual message rarely merits memory. Classify the language as evidenceType and its relation to the proposed memory as effect, but do not decide lifecycle transitions. Provide language interpretation only; confidence, importance, and explicitness will be calculated deterministically by the database.\n\nsubjectId rules: use the Author ID below when the memory is about the message author. If the memory is about a different person mentioned in the message, use their Discord user ID if it appears in the message as a mention (<@ID>). If the subject cannot be resolved to a Discord user ID, use "unknown". Never use descriptive labels or slugs.\nsubjectName: the subject's name exactly as written in the message (empty string if none).\n\nQuoted text: if the message's first-person text describes someone other than the author — e.g. "I am <other person's name>", a pasted bio or profile card, or clearly copied/generated text — do not attribute it to the author. Attribute it to the named person via subjectName, or skip it entirely if it reads as pasted content rather than a genuine statement.\n\nAlso emit relationship assertions when the message describes a durable interpersonal dynamic between two people (friendship, conflict, dating, rivalry). For each: subjectName (empty string = the message author), otherName, nature (e.g. "close friends", "antagonizes", "dating"), valence from -1 (hostile) to +1 (close), and a short reason.\n\nAuthor ID: ${event.authorId}\nMessage: ${event.content}${replyContext}${noteContext}${imgContext}`,
+      input: `Extract only durable, useful memories from this Discord message. Do not infer sensitive traits, diagnoses, private information, or insults. A single casual message rarely merits memory. Classify the language as evidenceType and its relation to the proposed memory as effect, but do not decide lifecycle transitions. Provide language interpretation only; confidence, importance, and explicitness will be calculated deterministically by the database.\n\nsubjectId rules: use the Author ID below when the memory is about the message author. If the memory is about a different person mentioned in the message, use their Discord user ID if it appears in the message as a mention (<@ID>). If the subject cannot be resolved to a Discord user ID, use "unknown". Never use descriptive labels or slugs.\nsubjectName: the subject's name exactly as written in the message (empty string if none).\n\nQuoted text: if the message's first-person text describes someone other than the author — e.g. "I am <other person's name>", a pasted bio or profile card, or clearly copied/generated text — do not attribute it to the author. Attribute it to the named person via subjectName, or skip it entirely if it reads as pasted content rather than a genuine statement.\n\nAlso emit relationship assertions when the message describes a durable interpersonal dynamic between two people (friendship, conflict, dating, rivalry). For each: subjectName (empty string = the message author), otherName, nature (e.g. "close friends", "antagonizes", "dating"), valence from -1 (hostile) to +1 (close), and a short reason.${vocabContext}\n\nAuthor ID: ${event.authorId}\nMessage: ${event.content}${replyContext}${noteContext}${imgContext}`,
       text: { format: { type: "json_schema", name: "memory_candidates", strict: true, schema: {
         type: "object", properties: {
           memories: { type: "array", items: { type: "object", properties: {
@@ -261,8 +266,12 @@ export class Brain {
    */
   async extractMemoriesBatch(
     messages: Array<{ event: MessageEvent; replyToContent?: string; note?: string }>,
-    model: string
+    model: string,
+    natureVocab?: string[]
   ): Promise<Map<string, ExtractionResult>> {
+    const vocabContext = natureVocab?.length
+      ? ` For the nature field, prefer reusing one of these established labels when it fits: ${natureVocab.map(n => `"${n}"`).join(", ")}.`
+      : "";
     const numbered = messages.map((m, i) => {
       const replyCtx = m.replyToContent ? ` [replying to: "${m.replyToContent}"]` : "";
       const noteCtx = m.note ? ` [note: ${m.note}]` : "";
@@ -324,7 +333,7 @@ export class Brain {
       model,
       messages: [{
         role: "user",
-        content: `Extract only durable, useful memories from each of the following Discord messages. For each message, return its index, any memories found (empty array if none), and any relationship assertions. Do not infer sensitive traits, diagnoses, private information, or insults. A single casual message rarely merits memory.\n\nsubjectId rules: use the Author ID when the memory is about the author. For third-party mentions use their Discord ID from <@ID> syntax. Otherwise use "unknown". Never use descriptive slugs.\nsubjectName: the subject's name exactly as written in the message (empty string if none).\nquoted text: if a message's first-person text describes someone other than its author — e.g. "I am <other person's name>", a pasted bio or profile card, or clearly copied/generated text — do not attribute it to the author. Attribute it to the named person via subjectName, or skip it entirely if it reads as pasted content.\nrelationships: emit when a message describes a durable interpersonal dynamic between two people (friendship, conflict, dating, rivalry). subjectName empty string = the message author; otherName, nature (e.g. "close friends", "antagonizes", "dating"), valence from -1 (hostile) to +1 (close), and a short reason.\n\nMessages:\n\n${numbered}`,
+        content: `Extract only durable, useful memories from each of the following Discord messages. For each message, return its index, any memories found (empty array if none), and any relationship assertions. Do not infer sensitive traits, diagnoses, private information, or insults. A single casual message rarely merits memory.\n\nsubjectId rules: use the Author ID when the memory is about the author. For third-party mentions use their Discord ID from <@ID> syntax. Otherwise use "unknown". Never use descriptive slugs.\nsubjectName: the subject's name exactly as written in the message (empty string if none).\nquoted text: if a message's first-person text describes someone other than its author — e.g. "I am <other person's name>", a pasted bio or profile card, or clearly copied/generated text — do not attribute it to the author. Attribute it to the named person via subjectName, or skip it entirely if it reads as pasted content.\nrelationships: emit when a message describes a durable interpersonal dynamic between two people (friendship, conflict, dating, rivalry). subjectName empty string = the message author; otherName, nature (e.g. "close friends", "antagonizes", "dating"), valence from -1 (hostile) to +1 (close), and a short reason.${vocabContext}\n\nMessages:\n\n${numbered}`,
       }],
       response_format: { type: "json_schema", json_schema: { name: "batch_memories", strict: true, schema } },
     });
@@ -588,7 +597,7 @@ export class Brain {
       contextBefore?: Array<{ authorName: string; content: string }>;
     }>,
     model: string
-  ): Promise<Map<number, { verdict: "literal" | "joke" | "unclear"; reason: string }>> {
+  ): Promise<Map<number, { verdict: "literal" | "joke" | "unclear" | "misattributed"; reason: string }>> {
     if (!items.length) return new Map();
     const numbered = items.map((m, i) => {
       const aka = m.authorNames?.length ? ` (aka: ${m.authorNames.join(", ")})` : "";
@@ -602,13 +611,13 @@ export class Brain {
       model,
       messages: [{
         role: "user",
-        content: `Each item pairs a relationship assertion extracted from a Discord message with the original message it came from. The assertion claims a dynamic ("nature") involving the named other person. Judge the source message:\n- "literal": a sincere statement the asserted dynamic can be believed from\n- "joke": sarcasm, edgy humor, exaggeration, bait, or a bit\n- "unclear": none of the above can be decided\nThese servers contain heavy irony — when a message reads as shitposting or edgy bait, choose "joke".\n\nItems:\n${numbered}`,
+        content: `Each item pairs a relationship assertion extracted from a Discord message with the original message it came from. The assertion claims a dynamic ("nature") involving the named other person. Judge the source message:\n- "literal": a sincere statement the asserted dynamic can be believed from\n- "joke": sarcasm, edgy humor, exaggeration, bait, or a bit\n- "misattributed": the source is quoting, pasting, forwarding, or speaking as someone OTHER than the poster — the claimed dynamic may exist, it just isn't evidenced by this author's statement\n- "unclear": none of the above can be decided\nThese servers contain heavy irony — when a message reads as shitposting or edgy bait, choose "joke".\n\nItems:\n${numbered}`,
       }],
       response_format: { type: "json_schema", json_schema: { name: "verify_relationships", strict: true, schema: {
         type: "object", properties: {
           results: { type: "array", items: { type: "object", properties: {
             index: { type: "number" },
-            verdict: { type: "string", enum: ["literal", "joke", "unclear"] },
+            verdict: { type: "string", enum: ["literal", "joke", "misattributed", "unclear"] },
             reason: { type: "string" },
           }, required: ["index", "verdict", "reason"], additionalProperties: false } },
         }, required: ["results"], additionalProperties: false,
@@ -618,16 +627,55 @@ export class Brain {
     const raw = JSON.parse(response.choices[0].message.content ?? "{}") as {
       results?: Array<{ index: number; verdict: string; reason: string }>;
     };
-    const out = new Map<number, { verdict: "literal" | "joke" | "unclear"; reason: string }>();
+    const out = new Map<number, { verdict: "literal" | "joke" | "unclear" | "misattributed"; reason: string }>();
     for (const r of raw.results ?? []) {
       const m = items[r.index];
-      const verdict = r.verdict === "literal" || r.verdict === "joke" ? r.verdict : "unclear";
+      const verdict = r.verdict === "literal" || r.verdict === "joke" || r.verdict === "misattributed" ? r.verdict : "unclear";
       if (m) out.set(m.observationId, { verdict, reason: r.reason });
     }
     for (const m of items) {
       if (!out.has(m.observationId)) out.set(m.observationId, { verdict: "unclear", reason: "omitted by model" });
     }
     return out;
+  }
+
+  /**
+   * Holistic read of a pair's exchange window — the pair-analysis job's input.
+   * Unlike extraction (one message → claims), this sees the pattern of how two
+   * people actually talk to each other over ~90 days. confident=false when the
+   * sample is too thin or ambiguous to say anything durable — the caller stores
+   * an 'unclear' marker so the throttle timestamp still advances.
+   */
+  async analyzePairWindow(
+    aName: string, bName: string,
+    exchanges: Array<{ authorName: string; content: string; createdAt: string }>,
+    model: string
+  ): Promise<{ confident: boolean; nature: string; valence: number; reason: string }> {
+    const lines = exchanges.map(e => `${e.authorName}: ${e.content.slice(0, 300)}`).join("\n");
+    const response = await this.client.chat.completions.create({
+      model,
+      messages: [{
+        role: "user",
+        content: `These are Discord messages where ${aName} and ${bName} addressed each other over roughly the last 90 days. Judge their interpersonal dynamic from how they actually talk to each other — not from claims others make about them.\n\nReturn:\n- confident: false if the sample is too thin, ambiguous, or the messages are mostly noise — do not guess\n- nature: a short label for the dynamic (e.g. "close friends", "collaborates with", "antagonizes", "mentors")\n- valence: -1 hostile to +1 close, based on tone and how they treat each other\n- reason: one sentence of evidence from the exchanges\n\nThese servers contain heavy irony — banter and mock-hostility between friends is common. Read the pattern, not single messages.\n\nExchanges:\n${lines}`,
+      }],
+      response_format: { type: "json_schema", json_schema: { name: "pair_analysis", strict: true, schema: {
+        type: "object", properties: {
+          confident: { type: "boolean" },
+          nature: { type: "string" },
+          valence: { type: "number" },
+          reason: { type: "string" },
+        }, required: ["confident", "nature", "valence", "reason"], additionalProperties: false,
+      } } },
+    });
+    const raw = JSON.parse(response.choices[0].message.content ?? "{}") as {
+      confident?: boolean; nature?: string; valence?: number; reason?: string;
+    };
+    return {
+      confident: raw.confident === true && !!raw.nature,
+      nature: raw.nature ?? "",
+      valence: typeof raw.valence === "number" ? Math.max(-1, Math.min(1, raw.valence)) : 0,
+      reason: raw.reason ?? "",
+    };
   }
 
   /**

@@ -1,4 +1,4 @@
-import type { PairContext } from "./types.js";
+import type { PairContext, PairContextEdge } from "./types.js";
 
 // Prompt rendering for the reply path — shared by brain.reply()'s prompt
 // sections and the internal lookup tools (lookup-tools.ts), so a person or a
@@ -16,13 +16,32 @@ export function monthYear(iso: string): string {
 
 /** Render one pair's relationship context as a single prompt line. Direction
  * is preserved explicitly — "A says about B" means A is the asserting side.
- * Claims are attributed ("B claimed about A"), never stated as facts. */
+ * Claims are attributed ("B claimed about A"), never stated as facts. Depth
+ * renders as a confidence tier, gossip-only edges are flagged "all
+ * secondhand", stale edges say so, and behavior-only pairs surface strictly
+ * as contact frequency — never phrased as a relationship claim. */
 export function formatPairContext(ctx: PairContext): string {
-  const edge = (name: string, e: { summary: string; valence: number | null; observationCount: number }, other: string) =>
-    `${name} says about ${other}: "${e.summary}" (${e.valence != null ? e.valence.toFixed(2) : "no valence"}, ${e.observationCount} obs)`;
+  const tier = (n: number) => n >= 5 ? "well-established" : n >= 2 ? "described a few times" : "claimed once";
+  const edge = (name: string, e: PairContextEdge, other: string) => {
+    if (e.inferred || !e.summary) return null; // behavior-only — rendered via behavioralCount below
+    let s = `${name} says about ${other}: "${e.summary}" (${e.valence != null ? e.valence.toFixed(2) : "no valence"}, ${tier(e.observationCount)})`;
+    if (e.partyCount === 0) s += " — all secondhand";
+    if (e.trend) s += `, lately ${e.trend}`;
+    if (e.lastObservedAt && Date.now() - new Date(e.lastObservedAt).getTime() > 60 * 86_400_000) {
+      s += " (not recently observed)";
+    }
+    return s;
+  };
   const parts: string[] = [];
-  if (ctx.aToB) parts.push(edge(ctx.aName, ctx.aToB, ctx.bName));
-  if (ctx.bToA) parts.push(edge(ctx.bName, ctx.bToA, ctx.aName));
+  const aEdge = ctx.aToB ? edge(ctx.aName, ctx.aToB, ctx.bName) : null;
+  const bEdge = ctx.bToA ? edge(ctx.bName, ctx.bToA, ctx.aName) : null;
+  if (aEdge) parts.push(aEdge);
+  if (bEdge) parts.push(bEdge);
+  if (ctx.behavioralCount >= 5) {
+    parts.push(aEdge || bEdge
+      ? `also interact frequently (${ctx.behavioralCount} times in 90d)`
+      : `frequent interaction (${ctx.behavioralCount} times in 90d) — dynamic not recorded`);
+  }
   const reasons = ctx.reasons.map(r => `${r.fromName}: "${r.reason}" (${shortDate(r.at)})`).join("; ");
   if (reasons) parts.push(`recent: ${reasons}`);
   if (ctx.claimsAboutA.length) parts.push(`${ctx.bName} claimed about ${ctx.aName}: ${ctx.claimsAboutA.map(c => `"${c}"`).join(", ")}`);

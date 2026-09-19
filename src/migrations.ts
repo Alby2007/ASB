@@ -512,6 +512,51 @@ const migrations: Migration[] = [
       await sql`ALTER TABLE events DROP COLUMN IF EXISTS classifications`;
     },
   },
+  {
+    version: 19,
+    name: "v19_relationship_observation_author",
+    // Assertor provenance: who said the thing matters for opt-out deletion
+    // (your words' derivatives shouldn't survive you) and for judging whether
+    // the assertion is self-report vs third-party claim. Backfilled from the
+    // source message where it still exists; rows whose source already aged
+    // out stay NULL — they're prunable exactly because provenance was lost.
+    up: async (sql) => {
+      await addColumn(sql, "relationship_observations", "author_id TEXT");
+      await sql`
+        UPDATE relationship_observations o SET author_id = m.author_id
+        FROM messages m WHERE m.id = o.message_id AND m.guild_id = o.guild_id AND o.author_id IS NULL
+      `;
+    },
+    down: async (sql) => {
+      await sql`ALTER TABLE relationship_observations DROP COLUMN IF EXISTS author_id`;
+    },
+  },
+  {
+    version: 20,
+    name: "v20_relationship_intelligence",
+    // Observations gain a source channel: 'message' = single-message
+    // assertion (verdict-gated), 'pair_window' = the pair-analysis job's
+    // holistic read of an exchange window (verdict set at write — the
+    // analysis IS the verification). Edges gain derived columns, all
+    // rebuilt by recomputeEdges: behavioral_count stamps the deterministic
+    // interaction graph onto claimed edges; party_count tracks self-report
+    // depth; trend marks warming/cooling from recent-vs-alltime valence;
+    // inferred marks behavior-only edges that carry no claim at all.
+    up: async (sql) => {
+      await addColumn(sql, "relationship_observations", "source TEXT NOT NULL DEFAULT 'message'");
+      await addColumn(sql, "relationships", "behavioral_count INTEGER NOT NULL DEFAULT 0");
+      await addColumn(sql, "relationships", "party_count INTEGER NOT NULL DEFAULT 0");
+      await addColumn(sql, "relationships", "trend TEXT");
+      await addColumn(sql, "relationships", "inferred SMALLINT NOT NULL DEFAULT 0");
+    },
+    down: async (sql) => {
+      await sql`ALTER TABLE relationship_observations DROP COLUMN IF EXISTS source`;
+      await sql`ALTER TABLE relationships DROP COLUMN IF EXISTS behavioral_count`;
+      await sql`ALTER TABLE relationships DROP COLUMN IF EXISTS party_count`;
+      await sql`ALTER TABLE relationships DROP COLUMN IF EXISTS trend`;
+      await sql`ALTER TABLE relationships DROP COLUMN IF EXISTS inferred`;
+    },
+  },
 ];
 
 /** Highest known migration version — tests assert against this instead of a

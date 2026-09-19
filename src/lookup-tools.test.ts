@@ -270,7 +270,7 @@ test("buildPairContext shares the reply-prompt assembly for tools", async () => 
     await store.recordMessage(msg("hi", { authorId: "u2", authorName: "Bob" }));
     await store.setMemberOptIn("g1", "u1", true);
     await store.setMemberOptIn("g1", "u2", true);
-    await store.recordRelationship("g1", "u1", "u2", "m1", "antagonizes", -0.5, "mocked them");
+    await store.recordRelationship("g1", "u1", "u2", "m1", "u1", "antagonizes", -0.5, "mocked them");
     await sql`UPDATE relationship_observations SET verdict = 'literal' WHERE guild_id = 'g1'`;
     await store.recomputeEdges("g1");
 

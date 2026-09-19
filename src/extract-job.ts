@@ -108,7 +108,10 @@ export async function runExtractJob(payload: ExtractJobPayload, deps: ExtractJob
     imageContext = formatImageContext(descs, event.authorName) || undefined;
   }
 
-  const { memories: candidates, relationships } = await withRetry(() => brain.extractMemories(event, replyToContent, note, imageContext), 3);
+  // Established nature labels — the model reuses "close friends" instead of
+  // fragmenting the vocabulary into synonym churn. One cheap indexed query.
+  const natureVocab = await store.relationshipNatureVocab(guildId);
+  const { memories: candidates, relationships } = await withRetry(() => brain.extractMemories(event, replyToContent, note, imageContext, natureVocab), 3);
   const aliases = (candidates.length || relationships.length) ? await deps.getAliases(guildId) : new Map<string, string>();
   // Opt-in consent — identical rule to the sweep/ingest paths: derived person
   // data persists only for consenting members; the bot counts as consented.

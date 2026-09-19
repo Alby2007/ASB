@@ -86,8 +86,9 @@ test("relationships use subject-consent — either opted-in party is enough", as
     isConsented = await consentFor(store);
     out = await persistExtraction({ memories: [], relationships: [rel] }, msg(), { store, aliases: ALIASES, isConsented });
     assert.equal(out.relationshipsRecorded, 1);
-    const rows = await sql<Array<{ subject_id: string; other_id: string }>>`SELECT subject_id, other_id FROM relationship_observations WHERE guild_id = 'g1'`;
+    const rows = await sql<Array<{ subject_id: string; other_id: string; author_id: string }>>`SELECT subject_id, other_id, author_id FROM relationship_observations WHERE guild_id = 'g1'`;
     assert.equal(rows.length, 1);
     assert.deepEqual([rows[0].subject_id, rows[0].other_id], ["u1", "u2"]);
+    assert.equal(rows[0].author_id, "u-author", "the assertor is recorded — opt-out must find their authored claims");
   } finally { await sql.end(); }
 });

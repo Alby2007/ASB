@@ -62,10 +62,12 @@ export async function persistExtraction(
       await store.logUnresolvedName(event.guildId, rel.otherName, event.messageId);
     }
     if (subjectId === "unknown" || otherId === "unknown") continue;
-    // Subject-consent: either party opted in is enough — the observation is
-    // the consented party's claim about the room, not a dossier on the other.
+    // Subject-consent: either edge party opted in is enough — the gate
+    // protects the people the claim is ABOUT, so a non-consenting assertor's
+    // claim about consenting members still persists. The assertor is recorded
+    // (author_id) so opt-out can erase their authored claims later.
     if (!(await isConsented(subjectId)) && !(await isConsented(otherId))) continue;
-    if (await store.recordRelationship(event.guildId, subjectId, otherId, event.messageId, rel.nature, rel.valence, rel.reason ?? "")) {
+    if (await store.recordRelationship(event.guildId, subjectId, otherId, event.messageId, event.authorId, rel.nature, rel.valence, rel.reason ?? "")) {
       relationshipsRecorded++;
       ctx.onRelationshipRecorded?.();
     }

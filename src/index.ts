@@ -15,6 +15,7 @@ import { EventPipeline } from "./event-detection.js";
 import { ProfileStore } from "./profiles.js";
 import { buildAliasMap, demangleMentions, findMentionedUsers, scrubMentions, type AliasMap } from "./entity-resolution.js";
 import { enqueue, startWorker, FatalJobError, resumeGuildClaims } from "./jobs.js";
+import { runPairAnalysisJob, type PairAnalysisPayload } from "./pair-analysis-job.js";
 import { buildPairContext, type ToolCtx } from "./lookup-tools.js";
 import { qualifyingImages, formatImageContext, IMAGE_MAX_PER_MESSAGE, type AttachmentMeta } from "./vision.js";
 import { withRetry } from "./retry.js";
@@ -146,6 +147,13 @@ async function init() {
           throw error;
         });
       }
+      if (job.type === "pair-analysis") {
+        const p = job.payload as PairAnalysisPayload;
+        if (!p?.aId || !p.bId) {
+          return Promise.reject(new FatalJobError("malformed pair-analysis payload"));
+        }
+        return runPairAnalysisJob(job.guild_id, p, pairAnalysisDeps);
+      }
       // Unknown types are a code bug, not a transient fault — dead-letter
       // immediately rather than retrying something that can never succeed.
       if (job.type !== "extract") {
@@ -221,10 +229,13 @@ async function applyRetention() {
     } catch (error) { inc("maintenance.retention_error"); logError(`Retention/maintenance failed in ${guild.name}`, error); continue; }
     try {
       const pruned = await store.pruneDerivedData(guild.id, undefined, retentionDays);
-      if (pruned.history + pruned.names + pruned.aliases + pruned.events + pruned.usage + pruned.evidence) {
-        console.log(`Pruned derived data in ${guild.name}: ${pruned.history} history, ${pruned.names} unresolved names, ${pruned.aliases} alias candidates, ${pruned.events} events, ${pruned.usage} usage rows, ${pruned.evidence} evidence verbatim`);
+      if (pruned.history + pruned.names + pruned.aliases + pruned.events + pruned.usage + pruned.evidence + pruned.observations) {
+        console.log(`Pruned derived data in ${guild.name}: ${pruned.history} history, ${pruned.names} unresolved names, ${pruned.aliases} alias candidates, ${pruned.events} events, ${pruned.usage} usage rows, ${pruned.evidence} evidence verbatim, ${pruned.observations} dead relationship observations`);
       }
     } catch (error) { inc("maintenance.prune_error"); logError("Derived-data pruning failed", error); }
+    // Hoisted so the relationship rebuild and the pair-analysis enqueue share
+    // one archive scan — interactionPairs reads every 90d message.
+    let guildInteractions: Array<{ aId: string; bId: string; count: number; firstAt: string; lastAt: string }> = [];
     // Dormant guilds (no key) skip every LLM pass — retention/pruning above
     // still ran; they're lifecycle ops, not cognition.
     const brain = await brainFor(guild.id);
@@ -281,9 +292,38 @@ async function applyRetention() {
           if (v) { await store.setObservationVerdict(b.observationId, v.verdict); judged++; }
         }
       }
-      const edgeCount = await store.recomputeEdges(guild.id);
+      // The deterministic interaction graph feeds the edge rebuild: stamped
+      // onto claimed edges as behavioral support, and frequent-contact pairs
+      // with no claims materialize as inferred edges. Computed once — the
+      // pair-analysis enqueue below reuses the same list.
+      const aliasMap = (await guildLookups(guild.id)).map;
+      guildInteractions = await store.interactionPairs(guild.id, aliasMap);
+      const edgeCount = await store.recomputeEdges(guild.id, guildInteractions);
       if (unverified.length) console.log(`Verified ${judged} relationship observations in ${guild.name}; recomputed ${edgeCount} edges`);
     } catch (error) { logError("Relationship verification failed", error); }
+    // Pair-analysis: durable holistic reads of the busiest pairs' exchange
+    // windows — most real relationships are never verbalized, so single-message
+    // extraction can't see them. Both parties must consent (it reads both
+    // people's messages), throttled to one read per pair per 7d and only when
+    // new interaction happened since, capped at 5 enqueues per pass.
+    try {
+      const consented = new Set(
+        (await store.listMembers(guild.id)).filter(m => m.optedIn && !m.optedOut).map(m => m.userId)
+      );
+      consented.add(client.user!.id); // the bot opts itself in
+      let enqueued = 0;
+      for (const p of guildInteractions) {
+        if (enqueued >= 5 || p.count < 10) break; // sorted desc — the tail is thinner
+        if (!consented.has(p.aId) || !consented.has(p.bId)) continue;
+        const last = await store.lastPairWindowAt(guild.id, p.aId, p.bId);
+        const lastMs = last ? new Date(last).getTime() : 0;
+        if (lastMs && Date.now() - lastMs < 7 * 86_400_000) continue;
+        if (lastMs && new Date(p.lastAt).getTime() <= lastMs) continue;
+        await enqueue(sql, guild.id, "pair-analysis", { aId: p.aId, bId: p.bId });
+        enqueued++;
+      }
+      if (enqueued) console.log(`Queued ${enqueued} pair-analysis jobs in ${guild.name}`);
+    } catch (error) { inc("pair_analysis.enqueue_error"); logError("Pair-analysis enqueue failed", error); }
     // Semantic dedup — the LLM scans each member's memory list for rephrased
     // duplicates the trigram fast-path can't see ("allergic to peanuts" /
     // "can't eat nuts"). It proposes groups; applyDedupGroups enforces
@@ -531,6 +571,16 @@ const extractDeps = {
   invalidateLookups: (guildId: string) => { lookupCache.delete(guildId); },
 };
 
+// Same deps-injection pattern as extractDeps — the handler lives outside
+// index.ts for testability; these close over the live singletons.
+const pairAnalysisDeps = {
+  get store() { return store; },
+  brainFor,
+  getAliases: (guildId: string) => guildLookups(guildId).then(e => e.map),
+  get botId() { return client.user!.id; },
+  get analysisModel() { return config.verifyModel ?? config.model; },
+};
+
 /**
  * A pending question's timer survived — the room stayed silent. Re-verify
  * everything at send time: kill switches, the question still existing and
@@ -739,6 +789,13 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     const pairList: Array<[string, string]> = [];
     for (let i = 0; i < pairIds.length; i++)
       for (let j = i + 1; j < pairIds.length; j++) pairList.push([pairIds[i], pairIds[j]]);
+    // The bot's own dynamic with the author feeds persona modulation — but the
+    // bot is auto-opted-in, so the either-party consent gate inside
+    // pairwiseContext can't guard this pair. Author consent is required here.
+    const authorMember = await store.getMember(event.guildId, event.authorId);
+    if (authorMember?.optedIn && !authorMember.optedOut) {
+      pairList.push([event.authorId, client.user!.id]);
+    }
     pairList.sort((x, y) => Number(y.includes(event.authorId)) - Number(x.includes(event.authorId)));
     const relationships = (await Promise.all(pairList.slice(0, 6).map(([aId, bId]) =>
       buildPairContext(store, eventStore, event.guildId, aId, bId)

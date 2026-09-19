@@ -224,6 +224,9 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
   const optedIn = new Set(members.filter(m => m.optedIn && !m.optedOut).map(m => m.userId));
   optedIn.add(botId); // the bot is a willing subject
   const isConsented = (id: string) => id === "unknown" || id === "server" || optedIn.has(id);
+  // Established nature labels — reused across the whole ingest so the
+  // vocabulary stays coherent instead of fragmenting into synonyms.
+  const natureVocab = await store.relationshipNatureVocab(guild.id);
 
   for (let i = 0; i < toExtract.length; i += LLM_BATCH_SIZE) {
     const batch = toExtract.slice(i, i + LLM_BATCH_SIZE);
@@ -242,7 +245,7 @@ export async function runServerIngest(channel: TextChannel, deps: ServerIngestDe
       }
     }
     try {
-      const results = await withRetry(() => brain.extractMemoriesBatch(batch, BATCH_MODEL));
+      const results = await withRetry(() => brain.extractMemoriesBatch(batch, BATCH_MODEL, natureVocab));
       for (const item of batch) {
         const result = results.get(item.event.messageId) ?? { memories: [], relationships: [] };
         const { savedIds } = await persistExtraction(result, item.event, {

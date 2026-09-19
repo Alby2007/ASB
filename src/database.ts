@@ -83,7 +83,20 @@ type RelationshipRow = {
   id: number; guild_id: string; subject_id: string; other_id: string;
   summary: string; valence: number | null; observation_count: number;
   last_observed_at: Date | string | null; updated_at: Date | string;
+  behavioral_count: number; party_count: number; trend: string | null; inferred: number;
 };
+
+function rowToEdge(r: RelationshipRow): RelationshipEdge {
+  return {
+    id: Number(r.id), guildId: r.guild_id, subjectId: r.subject_id, otherId: r.other_id,
+    summary: r.summary, valence: r.valence != null ? Number(r.valence) : null,
+    observationCount: Number(r.observation_count),
+    lastObservedAt: r.last_observed_at ? ts(r.last_observed_at) : null,
+    updatedAt: ts(r.updated_at),
+    behavioralCount: Number(r.behavioral_count), partyCount: Number(r.party_count),
+    trend: r.trend, inferred: !!r.inferred,
+  };
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -591,32 +604,33 @@ export class MemoryStore {
   // unverified assertion never surfaces in profiles or dossiers. Edges
   // materialize at the next maintenance pass, not at record time.
 
-  async recordRelationship(guildId: string, subjectId: string, otherId: string, messageId: string, nature: string, valence: number | null, reason = ""): Promise<boolean> {
+  // authorId is the assertor — the member whose message the claim came from.
+  // Stored because the subject/other pair alone can't tell self-report from
+  // third-party assertion, and opt-out must erase a member's authored claims
+  // even when the message itself is gone.
+  async recordRelationship(guildId: string, subjectId: string, otherId: string, messageId: string, authorId: string, nature: string, valence: number | null, reason = ""): Promise<boolean> {
     if (subjectId === otherId || subjectId === "unknown" || otherId === "unknown" || subjectId === "server" || otherId === "server") return false;
     const inserted = await this.sql`
-      INSERT INTO relationship_observations (guild_id, subject_id, other_id, message_id, nature, valence, reason)
-      VALUES (${guildId}, ${subjectId}, ${otherId}, ${messageId}, ${nature}, ${valence}, ${reason})
+      INSERT INTO relationship_observations (guild_id, subject_id, other_id, message_id, author_id, nature, valence, reason)
+      VALUES (${guildId}, ${subjectId}, ${otherId}, ${messageId}, ${authorId}, ${nature}, ${valence}, ${reason})
       ON CONFLICT (subject_id, other_id, message_id) DO NOTHING
       RETURNING id
     `;
     return inserted.length > 0;
   }
 
-  /** All edges where the subject is either side of the relationship, strongest first. */
+  /** All edges where the subject is either side of the relationship — claimed
+   * edges first by depth, then behavior-only (inferred) edges by contact
+   * frequency. */
   async relationshipsFor(guildId: string, subjectId: string): Promise<RelationshipEdge[]> {
     const rows = await this.sql<RelationshipRow[]>`
-      SELECT id, guild_id, subject_id, other_id, summary, valence, observation_count, last_observed_at, updated_at
+      SELECT id, guild_id, subject_id, other_id, summary, valence, observation_count,
+             last_observed_at, updated_at, behavioral_count, party_count, trend, inferred
       FROM relationships
       WHERE guild_id = ${guildId} AND (subject_id = ${subjectId} OR other_id = ${subjectId})
-      ORDER BY observation_count DESC
+      ORDER BY inferred ASC, observation_count DESC, behavioral_count DESC
     `;
-    return rows.map(r => ({
-      id: Number(r.id), guildId: r.guild_id, subjectId: r.subject_id, otherId: r.other_id,
-      summary: r.summary, valence: r.valence != null ? Number(r.valence) : null,
-      observationCount: Number(r.observation_count),
-      lastObservedAt: r.last_observed_at ? ts(r.last_observed_at) : null,
-      updatedAt: ts(r.updated_at),
-    }));
+    return rows.map(rowToEdge);
   }
 
   // ── Sincerity verification ─────────────────────────────────────────────────
@@ -758,12 +772,12 @@ export class MemoryStore {
    * relationship_map input; unverified assertions stay invisible here too. */
   async relationshipObservationsFor(guildId: string, subjectId: string): Promise<Array<{
     otherId: string; nature: string; valence: number | null; reason: string;
-    direction: "member_subject" | "member_other"; createdAt: string;
+    direction: "member_subject" | "member_other"; source: string; createdAt: string;
   }>> {
     const rows = await this.sql<Array<{
-      subject_id: string; other_id: string; nature: string; valence: number | null; reason: string; created_at: Date | string;
+      subject_id: string; other_id: string; nature: string; valence: number | null; reason: string; source: string; created_at: Date | string;
     }>>`
-      SELECT subject_id, other_id, nature, valence, reason, created_at FROM relationship_observations
+      SELECT subject_id, other_id, nature, valence, reason, source, created_at FROM relationship_observations
       WHERE guild_id = ${guildId} AND (subject_id = ${subjectId} OR other_id = ${subjectId})
         AND verdict = 'literal'
       ORDER BY created_at DESC
@@ -774,6 +788,7 @@ export class MemoryStore {
       valence: r.valence != null ? Number(r.valence) : null,
       reason: r.reason,
       direction: r.subject_id === subjectId ? "member_subject" as const : "member_other" as const,
+      source: r.source,
       createdAt: ts(r.created_at),
     }));
   }
@@ -785,9 +800,12 @@ export class MemoryStore {
   async pairwiseContext(guildId: string, aId: string, bId: string): Promise<{
     ab?: RelationshipEdge;
     ba?: RelationshipEdge;
-    observations: Array<{ fromId: string; toId: string; nature: string; valence: number | null; reason: string; createdAt: string }>;
+    observations: Array<{ fromId: string; toId: string; nature: string; valence: number | null; reason: string; source: string; createdAt: string }>;
     claimsAboutA: string[];   // active memories about aId authored by bId
     claimsAboutB: string[];   // active memories about bId authored by aId
+    /** Undirected 90d interaction count — from whichever edge rows carry the
+     *  stamp (claimed or inferred). Zero when the pair never registered. */
+    behavioralCount: number;
   }> {
     // Subject-consent: pair context only renders when at least one side opted
     // in — an edge between two non-consenting members can't be formed now, and
@@ -797,25 +815,19 @@ export class MemoryStore {
       WHERE guild_id = ${guildId} AND opted_in = 1 AND opted_out = 0
         AND user_id IN (${aId}, ${bId})
     `;
-    if (!consentRows.length) return { observations: [], claimsAboutA: [], claimsAboutB: [] };
+    if (!consentRows.length) return { observations: [], claimsAboutA: [], claimsAboutB: [], behavioralCount: 0 };
     const edgeRows = await this.sql<RelationshipRow[]>`
-      SELECT id, guild_id, subject_id, other_id, summary, valence, observation_count, last_observed_at, updated_at
+      SELECT id, guild_id, subject_id, other_id, summary, valence, observation_count,
+             last_observed_at, updated_at, behavioral_count, party_count, trend, inferred
       FROM relationships
       WHERE guild_id = ${guildId}
         AND ((subject_id = ${aId} AND other_id = ${bId}) OR (subject_id = ${bId} AND other_id = ${aId}))
     `;
-    const toEdge = (r: RelationshipRow): RelationshipEdge => ({
-      id: Number(r.id), guildId: r.guild_id, subjectId: r.subject_id, otherId: r.other_id,
-      summary: r.summary, valence: r.valence != null ? Number(r.valence) : null,
-      observationCount: Number(r.observation_count),
-      lastObservedAt: r.last_observed_at ? ts(r.last_observed_at) : null,
-      updatedAt: ts(r.updated_at),
-    });
 
     const obsRows = await this.sql<Array<{
-      subject_id: string; other_id: string; nature: string; valence: number | null; reason: string; created_at: Date | string;
+      subject_id: string; other_id: string; nature: string; valence: number | null; reason: string; source: string; created_at: Date | string;
     }>>`
-      SELECT subject_id, other_id, nature, valence, reason, created_at FROM relationship_observations
+      SELECT subject_id, other_id, nature, valence, reason, source, created_at FROM relationship_observations
       WHERE guild_id = ${guildId} AND verdict = 'literal'
         AND ((subject_id = ${aId} AND other_id = ${bId}) OR (subject_id = ${bId} AND other_id = ${aId}))
       ORDER BY created_at DESC LIMIT 5
@@ -833,12 +845,13 @@ export class MemoryStore {
     const ab = edgeRows.find(r => r.subject_id === aId);
     const ba = edgeRows.find(r => r.subject_id === bId);
     return {
-      ab: ab ? toEdge(ab) : undefined,
-      ba: ba ? toEdge(ba) : undefined,
+      ab: ab ? rowToEdge(ab) : undefined,
+      ba: ba ? rowToEdge(ba) : undefined,
+      behavioralCount: edgeRows.reduce((m, r) => Math.max(m, Number(r.behavioral_count)), 0),
       observations: obsRows.map(r => ({
         fromId: r.subject_id, toId: r.other_id, nature: r.nature,
         valence: r.valence != null ? Number(r.valence) : null,
-        reason: r.reason, createdAt: ts(r.created_at),
+        reason: r.reason, source: r.source, createdAt: ts(r.created_at),
       })),
       claimsAboutA: claimRows.filter(r => r.subject_id === aId).slice(0, 3).map(r => r.content),
       claimsAboutB: claimRows.filter(r => r.subject_id === bId).slice(0, 3).map(r => r.content),
@@ -915,10 +928,13 @@ export class MemoryStore {
   // counterparty for surfacing; the directed rows stay authoritative.
 
   /** Edges involving subjectId, merged by counterparty: counts summed, valence
-   * observation-weighted, natures unioned (latest first). */
+   * observation-weighted, natures unioned (latest first). behavioralCount is
+   * the undirected interaction stamp (max across directions — same number);
+   * trend comes from the most recently observed edge. */
   async mergedEdges(guildId: string, subjectId: string): Promise<Array<{
     otherId: string; summary: string; natures: string[];
     valence: number | null; observationCount: number; lastObservedAt: string | null;
+    behavioralCount: number; trend: string | null; inferred: boolean;
   }>> {
     const edges = await this.relationshipsFor(guildId, subjectId);
     const byOther = new Map<string, RelationshipEdge[]>();
@@ -939,8 +955,11 @@ export class MemoryStore {
         summary: byRecency[0].summary,
         natures: [...new Set(byRecency.map(e => e.summary).filter(Boolean))],
         valence, observationCount: total, lastObservedAt: byRecency[0].lastObservedAt,
+        behavioralCount: list.reduce((m, e) => Math.max(m, e.behavioralCount), 0),
+        trend: byRecency[0].trend,
+        inferred: list.every(e => e.inferred),
       };
-    }).sort((a, b) => b.observationCount - a.observationCount);
+    }).sort((a, b) => b.observationCount - a.observationCount || b.behavioralCount - a.behavioralCount);
   }
 
   /** Unverified observations joined to their source message + author names +
@@ -960,7 +979,7 @@ export class MemoryStore {
              msg.content AS source_message, msg.channel_id, msg.created_at AS msg_created_at
       FROM relationship_observations o
       JOIN messages msg ON msg.id = o.message_id
-      LEFT JOIN members mem ON mem.guild_id = o.guild_id AND mem.user_id = msg.author_id
+      LEFT JOIN members mem ON mem.guild_id = o.guild_id AND mem.user_id = COALESCE(o.author_id, msg.author_id)
       WHERE o.guild_id = ${guildId} AND o.verdict IS NULL
       ORDER BY o.id LIMIT ${limit}
     `;
@@ -978,26 +997,165 @@ export class MemoryStore {
   }
 
   /** Rebuild the durable edges from literal-verdicted observations only —
-   * unverified, unclear, and joke rows never form or feed an edge. This is the
-   * sole writer to `relationships`. Delete + re-aggregate in one transaction;
-   * returns the edge count. */
-  async recomputeEdges(guildId: string): Promise<number> {
+   * unverified, unclear, misattributed, and joke rows never form or feed an
+   * edge (pair_window rows arrive pre-verdicted, so they flow through here
+   * like any literal). Aggregation: valence is the *weighted* average of the
+   * five most recent observations — a claim authored by an edge party weighs
+   * double a third party's, so a pair's own words outweigh gossip. summary is
+   * the modal nature over the same window (latest-nature flip-flops under
+   * contradiction); trend compares recent-vs-alltime weighted valence.
+   *
+   * `interactions` is the deterministic 90d interaction graph (from
+   * interactionPairs): stamped onto claimed edges as behavioral_count, and
+   * pairs with frequent contact but no claims materialize as inferred edges —
+   * rows that render as contact frequency, never as a relationship claim.
+   * This is the sole writer to `relationships`. Delete + re-aggregate in one
+   * transaction; returns the edge count. */
+  async recomputeEdges(
+    guildId: string,
+    interactions: Array<{ aId: string; bId: string; count: number }> = []
+  ): Promise<number> {
     return await this.sql.begin(async sql => {
       await sql`DELETE FROM relationships WHERE guild_id = ${guildId}`;
       const inserted = await sql`
-        INSERT INTO relationships (guild_id, subject_id, other_id, summary, valence, observation_count, last_observed_at, updated_at)
+        INSERT INTO relationships (guild_id, subject_id, other_id, summary, valence, observation_count, party_count, trend, behavioral_count, inferred, last_observed_at, updated_at)
         SELECT guild_id, subject_id, other_id,
-               (array_agg(nature ORDER BY created_at DESC))[1],
-               AVG(valence),
-               COUNT(*)::int,
-               MAX(created_at), NOW()
-        FROM relationship_observations
-        WHERE guild_id = ${guildId} AND verdict = 'literal'
-        GROUP BY guild_id, subject_id, other_id
+               COALESCE(summary, ''), recent_val, n, party_n,
+               CASE WHEN n >= 3 AND recent_val - all_val >= 0.2 THEN 'warming'
+                    WHEN n >= 3 AND recent_val - all_val <= -0.2 THEN 'cooling' END,
+               0, 0, last_at, NOW()
+        FROM (
+          SELECT guild_id, subject_id, other_id,
+                 MODE() WITHIN GROUP (ORDER BY nature) FILTER (WHERE rn <= 5) AS summary,
+                 SUM(valence * w) FILTER (WHERE rn <= 5 AND valence IS NOT NULL)
+                   / NULLIF(SUM(w) FILTER (WHERE rn <= 5 AND valence IS NOT NULL), 0) AS recent_val,
+                 SUM(valence * w) FILTER (WHERE valence IS NOT NULL)
+                   / NULLIF(SUM(w) FILTER (WHERE valence IS NOT NULL), 0) AS all_val,
+                 COUNT(*)::int AS n,
+                 COUNT(*) FILTER (WHERE author_id IN (subject_id, other_id))::int AS party_n,
+                 MAX(created_at) AS last_at
+          FROM (
+            SELECT *, CASE WHEN author_id IN (subject_id, other_id) THEN 2 ELSE 1 END AS w,
+                   ROW_NUMBER() OVER (PARTITION BY guild_id, subject_id, other_id ORDER BY created_at DESC) rn
+            FROM relationship_observations
+            WHERE guild_id = ${guildId} AND verdict = 'literal'
+          ) lit
+          GROUP BY guild_id, subject_id, other_id
+        ) agg
         RETURNING id
       `;
-      return inserted.length;
+      let total = inserted.length;
+      if (interactions.length) {
+        const aIds = interactions.map(p => p.aId);
+        const bIds = interactions.map(p => p.bId);
+        const cnts = interactions.map(p => p.count);
+        // The interaction stamp is undirected — write it on both directions
+        // of any claimed edge so readers see it from either side.
+        await sql`
+          UPDATE relationships r SET behavioral_count = v.cnt
+          FROM (SELECT * FROM unnest(${aIds}::text[], ${bIds}::text[], ${cnts}::int[])) AS v(a_id, b_id, cnt)
+          WHERE r.guild_id = ${guildId}
+            AND ((r.subject_id = v.a_id AND r.other_id = v.b_id)
+              OR (r.subject_id = v.b_id AND r.other_id = v.a_id))
+        `;
+        // Inferred edges: frequent contact, zero claims. Both directions so
+        // directional reads see the pair symmetrically. Subject-consent at
+        // write — at least one party opted in, same rule as observations.
+        const inferred = await sql`
+          INSERT INTO relationships (guild_id, subject_id, other_id, summary, valence, observation_count, party_count, behavioral_count, inferred, last_observed_at, updated_at)
+          SELECT ${guildId}, v.a_id, v.b_id, '', NULL::double precision, 0, 0, v.cnt, 1, NULL::timestamptz, NOW()
+          FROM (SELECT * FROM unnest(${aIds}::text[], ${bIds}::text[], ${cnts}::int[])) AS v(a_id, b_id, cnt)
+          WHERE v.cnt >= 5
+            AND NOT EXISTS (
+              SELECT 1 FROM relationships r WHERE r.guild_id = ${guildId}
+                AND ((r.subject_id = v.a_id AND r.other_id = v.b_id)
+                  OR (r.subject_id = v.b_id AND r.other_id = v.a_id)))
+            AND EXISTS (
+              SELECT 1 FROM members m WHERE m.guild_id = ${guildId}
+                AND m.user_id IN (v.a_id, v.b_id) AND m.opted_in = 1 AND m.opted_out = 0)
+          UNION ALL
+          SELECT ${guildId}, v.b_id, v.a_id, '', NULL::double precision, 0, 0, v.cnt, 1, NULL::timestamptz, NOW()
+          FROM (SELECT * FROM unnest(${aIds}::text[], ${bIds}::text[], ${cnts}::int[])) AS v(a_id, b_id, cnt)
+          WHERE v.cnt >= 5
+            AND NOT EXISTS (
+              SELECT 1 FROM relationships r WHERE r.guild_id = ${guildId}
+                AND ((r.subject_id = v.a_id AND r.other_id = v.b_id)
+                  OR (r.subject_id = v.b_id AND r.other_id = v.a_id)))
+            AND EXISTS (
+              SELECT 1 FROM members m WHERE m.guild_id = ${guildId}
+                AND m.user_id IN (v.a_id, v.b_id) AND m.opted_in = 1 AND m.opted_out = 0)
+          RETURNING id
+        `;
+        total += inferred.length;
+      }
+      return total;
     });
+  }
+
+  /** Exchange-window fetch for the pair-analysis job: messages authored by
+   * either party that address the other — <@id> mention or written name-ref
+   * (the same signal interactionPairs counts). 90d-bounded, capped, returned
+   * oldest-first for prompt readability. */
+  async pairExchanges(
+    guildId: string, aId: string, bId: string,
+    aliasMap: Map<string, string>, limit = 40
+  ): Promise<Array<{ id: string; authorId: string; authorName: string; content: string; createdAt: string }>> {
+    const rows = await this.sql<Array<{ id: string; author_id: string; author_name: string; content: string; created_at: Date | string }>>`
+      SELECT id, author_id, author_name, content, created_at FROM messages
+      WHERE guild_id = ${guildId} AND author_id IN (${aId}, ${bId})
+        AND length(content) > 0 AND created_at > NOW() - interval '90 days'
+      ORDER BY created_at DESC LIMIT 500
+    `;
+    const exchanges: Array<{ id: string; authorId: string; authorName: string; content: string; createdAt: string }> = [];
+    for (const r of rows) {
+      const other = r.author_id === aId ? bId : aId;
+      const mentioned = r.content.includes(`<@${other}>`) || r.content.includes(`<@!${other}>`)
+        || findMentionedUsers(r.content, aliasMap).includes(other);
+      if (mentioned) exchanges.push({ id: r.id, authorId: r.author_id, authorName: r.author_name, content: r.content, createdAt: ts(r.created_at) });
+      if (exchanges.length >= limit) break;
+    }
+    return exchanges.reverse();
+  }
+
+  /** Last pair-window analysis for a pair — any verdict counts (unconfident
+   * runs write 'unclear' markers so the timestamp still throttles retries). */
+  async lastPairWindowAt(guildId: string, aId: string, bId: string): Promise<string | null> {
+    const rows = await this.sql<Array<{ last_at: Date | string | null }>>`
+      SELECT MAX(created_at) AS last_at FROM relationship_observations
+      WHERE guild_id = ${guildId} AND source = 'pair_window'
+        AND ((subject_id = ${aId} AND other_id = ${bId}) OR (subject_id = ${bId} AND other_id = ${aId}))
+    `;
+    return rows[0]?.last_at ? ts(rows[0].last_at) : null;
+  }
+
+  /** Persist a pair-window analysis as a symmetric observation pair. The
+   * analysis IS the verification — confident reads land verdict='literal'
+   * (edges feed immediately), unconfident runs land 'unclear' markers (no
+   * edge feed, auto-pruned at 90d, and the row's timestamp throttles
+   * re-analysis via lastPairWindowAt). author_id stays NULL: the system is
+   * the assertor — opt-out deletion matches on edge parties regardless. */
+  async recordWindowObservation(
+    guildId: string, aId: string, bId: string, messageId: string,
+    nature: string, valence: number | null, reason: string, confident: boolean
+  ): Promise<void> {
+    const verdict = confident ? "literal" : "unclear";
+    await this.sql`
+      INSERT INTO relationship_observations (guild_id, subject_id, other_id, message_id, author_id, nature, valence, reason, verdict, source)
+      VALUES (${guildId}, ${aId}, ${bId}, ${messageId}, NULL, ${nature}, ${valence}, ${reason}, ${verdict}, 'pair_window'),
+             (${guildId}, ${bId}, ${aId}, ${messageId}, NULL, ${nature}, ${valence}, ${reason}, ${verdict}, 'pair_window')
+      ON CONFLICT (subject_id, other_id, message_id) DO NOTHING
+    `;
+  }
+
+  /** Established nature labels for the extraction prompt — reuse keeps the
+   * vocabulary coherent ("close friends" once, not a synonym zoo). */
+  async relationshipNatureVocab(guildId: string, limit = 20): Promise<string[]> {
+    const rows = await this.sql<Array<{ nature: string }>>`
+      SELECT nature, COUNT(*) AS c FROM relationship_observations
+      WHERE guild_id = ${guildId} AND verdict = 'literal'
+      GROUP BY nature ORDER BY c DESC LIMIT ${limit}
+    `;
+    return rows.map(r => r.nature);
   }
 
   async getMessage(guildId: string, messageId: string): Promise<{ id: string; guildId: string; channelId: string; authorId: string; authorName: string; content: string; createdAt: string; authorIsBot: boolean } | undefined> {
@@ -1411,23 +1569,36 @@ export class MemoryStore {
   }
 
   /** Hard-delete every relationship observation and edge involving a subject —
-   * either side. Unlike memories (soft-forgotten for inspectability), these
-   * tables have no status column or inspection surface, so opt-out deletes.
-   * Edges are removed eagerly rather than waiting on recomputeEdges — a
-   * guild-wide rebuild for one opt-out would be wasteful and would leave a
-   * stale edge visible until the next maintenance run. Returns the
-   * observation count (edges aggregate many observations). */
+   * as either edge party or as the assertor. Unlike memories (soft-forgotten
+   * for inspectability), these tables have no status column or inspection
+   * surface, so opt-out deletes. Edges are removed eagerly rather than waiting
+   * on recomputeEdges — a guild-wide rebuild for one opt-out would be wasteful
+   * and would leave a stale edge visible until the next maintenance run.
+   * Returns the observation count (edges aggregate many observations). */
   async forgetRelationshipsFor(guildId: string, subjectId: string): Promise<number> {
     return await this.sql.begin(async sql => {
-      const obs = await sql`
+      const gone = await sql<Array<{ subject_id: string; other_id: string }>>`
         DELETE FROM relationship_observations
-        WHERE guild_id = ${guildId} AND (subject_id = ${subjectId} OR other_id = ${subjectId})
+        WHERE guild_id = ${guildId} AND (subject_id = ${subjectId} OR other_id = ${subjectId} OR author_id = ${subjectId})
+        RETURNING subject_id, other_id
       `;
       await sql`
         DELETE FROM relationships
         WHERE guild_id = ${guildId} AND (subject_id = ${subjectId} OR other_id = ${subjectId})
       `;
-      return obs.count;
+      // An edge fed by a now-deleted observation keeps its stale aggregate
+      // (count, valence, summary) until the next recompute — drop every edge
+      // that consumed a deleted row instead. Surviving literal observations
+      // rebuild it on the next maintenance pass.
+      if (gone.length) {
+        const pairs = [...new Set(gone.map(g => `${g.subject_id}|${g.other_id}`))];
+        await sql`
+          DELETE FROM relationships r
+          WHERE r.guild_id = ${guildId}
+            AND (r.subject_id || '|' || r.other_id) = ANY(${pairs})
+        `;
+      }
+      return gone.length;
     });
   }
 
@@ -1660,7 +1831,7 @@ export class MemoryStore {
   // retained for inspectability even on forgotten memories — but their
   // verbatim text columns expire with the raw-message retention window,
   // otherwise a deleted message's words would persist inside evidence.
-  async pruneDerivedData(guildId: string, olderThanDays = 90, verbatimDays?: number): Promise<{ history: number; names: number; aliases: number; events: number; usage: number; evidence: number }> {
+  async pruneDerivedData(guildId: string, olderThanDays = 90, verbatimDays?: number): Promise<{ history: number; names: number; aliases: number; events: number; usage: number; evidence: number; observations: number }> {
     const cutoff = new Date(Date.now() - olderThanDays * 86_400_000).toISOString();
     const staleEvents = this.sql`SELECT id FROM events WHERE guild_id = ${guildId} AND tier = 'candidate' AND closed_at IS NOT NULL AND occurred_at < ${cutoff}`;
     const history = await this.sql`
@@ -1677,6 +1848,21 @@ export class MemoryStore {
     // is enough for /status-style review; without this it grows ~365
     // rows/guild/year forever.
     const usage = await this.sql`DELETE FROM guild_usage WHERE guild_id = ${guildId} AND day < (now() AT TIME ZONE 'UTC')::date - 30`;
+    // Two classes of dead observation: a NULL-verdict row whose source message
+    // is gone can never be verified (listUnverifiedObservations JOINs
+    // messages), and a non-literal verdict never feeds an edge. Both are
+    // permanent dead weight — prune them. Literal rows survive a dead source:
+    // the rendered verdict is the derived truth, same stance as evidence
+    // metadata outliving its scrubbed quote.
+    const deadSource = await this.sql`
+      DELETE FROM relationship_observations
+      WHERE guild_id = ${guildId} AND verdict IS NULL
+        AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = message_id AND m.guild_id = ${guildId})
+    `;
+    const deadVerdict = await this.sql`
+      DELETE FROM relationship_observations
+      WHERE guild_id = ${guildId} AND verdict IN ('joke', 'unclear', 'misattributed') AND created_at < ${cutoff}
+    `;
     let evidence = { count: 0 };
     if (verbatimDays !== undefined) {
       const vcutoff = new Date(Date.now() - verbatimDays * 86_400_000).toISOString();
@@ -1686,7 +1872,7 @@ export class MemoryStore {
         AND memory_id IN (SELECT id FROM memories WHERE guild_id = ${guildId})
       `;
     }
-    return { history: history.count, names: names.count, aliases: aliases.count, events: events.count, usage: usage.count, evidence: evidence.count };
+    return { history: history.count, names: names.count, aliases: aliases.count, events: events.count, usage: usage.count, evidence: evidence.count, observations: deadSource.count + deadVerdict.count };
   }
 
   /** Opt-out scrub: blank the verbatim text columns on every evidence row

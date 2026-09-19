@@ -394,3 +394,64 @@ test("migration v18 adds author_is_bot and events.classifications, rolls back cl
     assert.equal(gone.length, 0, "rollback should drop both v18 columns");
   } finally { await sql.end(); }
 });
+
+test("migration v19 adds relationship_observations.author_id and backfills from source messages", async () => {
+  const sql = makeTestSql();
+  try {
+    await resetSchema(sql);
+    await runMigrations(sql as any, 18); // stop short of v19 — no author_id yet
+    await sql`INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, content, created_at)
+              VALUES ('m-live', 'g1', 'c1', 'u9', 'Zed', 'they are close friends', now())`;
+    await sql`INSERT INTO relationship_observations (guild_id, subject_id, other_id, message_id, nature)
+              VALUES ('g1', 'u1', 'u2', 'm-live', 'close friends')`;
+    await sql`INSERT INTO relationship_observations (guild_id, subject_id, other_id, message_id, nature)
+              VALUES ('g1', 'u1', 'u3', 'm-dead', 'rivals')`; // source already gone
+
+    await runMigrations(sql as any); // apply v19
+    const rows = await sql<Array<{ message_id: string; author_id: string | null }>>`
+      SELECT message_id, author_id FROM relationship_observations ORDER BY message_id`;
+    assert.equal(rows.find(r => r.message_id === "m-live")?.author_id, "u9", "backfilled from the source message");
+    assert.equal(rows.find(r => r.message_id === "m-dead")?.author_id, null, "dead source stays NULL — provenance already lost");
+
+    await runMigrations(sql as any, 18);
+    const cols = await sql<Array<{ column_name: string }>>`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_name = 'relationship_observations' AND column_name = 'author_id'`;
+    assert.equal(cols.length, 0, "rollback should drop author_id");
+  } finally { await sql.end(); }
+});
+
+test("migration v20 adds observation source and edge intelligence columns", async () => {
+  const sql = makeTestSql();
+  try {
+    await resetSchema(sql);
+    await runMigrations(sql as any);
+
+    const obsCols = await sql<Array<{ column_name: string; column_default: string | null }>>`
+      SELECT column_name, column_default FROM information_schema.columns
+      WHERE table_name = 'relationship_observations' AND column_name = 'source'`;
+    assert.equal(obsCols.length, 1, "relationship_observations.source missing");
+    assert.ok(obsCols[0].column_default?.includes("'message'"), "source should default to 'message'");
+
+    const edgeCols = await sql<Array<{ column_name: string }>>`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_name = 'relationships'
+        AND column_name IN ('behavioral_count', 'party_count', 'trend', 'inferred')`;
+    assert.equal(edgeCols.length, 4, "relationships should gain all four edge-intelligence columns");
+
+    // Functional defaults: existing/fresh rows pick up 'message'/0 without writes.
+    await sql`INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, content, created_at)
+              VALUES ('m-v20', 'g1', 'c1', 'u1', 'A', 'x', now())`;
+    await sql`INSERT INTO relationship_observations (guild_id, subject_id, other_id, message_id, nature)
+              VALUES ('g1', 'u1', 'u2', 'm-v20', 'friends')`;
+    const [o] = await sql`SELECT source FROM relationship_observations WHERE message_id = 'm-v20'`;
+    assert.equal(o.source, "message");
+
+    await runMigrations(sql as any, 19);
+    const gone = await sql<Array<{ column_name: string }>>`
+      SELECT column_name FROM information_schema.columns
+      WHERE (table_name = 'relationship_observations' AND column_name = 'source')
+         OR (table_name = 'relationships' AND column_name IN ('behavioral_count', 'party_count', 'trend', 'inferred'))`;
+    assert.equal(gone.length, 0, "rollback should drop all v20 columns");
+  } finally { await sql.end(); }
+});

@@ -43,14 +43,19 @@ export async function buildPairContext(store: MemoryStore, eventStore: EventStor
     store.pairwiseContext(guildId, aId, bId),
     eventStore.sharedEvents(guildId, aId, bId, 3),
   ]);
-  if (!pc.ab && !pc.ba && !pc.observations.length && !pc.claimsAboutA.length && !pc.claimsAboutB.length && !events.length) return undefined;
+  if (!pc.ab && !pc.ba && !pc.observations.length && !pc.claimsAboutA.length && !pc.claimsAboutB.length && !events.length && !pc.behavioralCount) return undefined;
   const [aName, bName] = await Promise.all([
     store.displayNameFor(guildId, aId), store.displayNameFor(guildId, bId),
   ]);
+  const edge = (e: typeof pc.ab) => e ? {
+    summary: e.summary, valence: e.valence, observationCount: e.observationCount,
+    partyCount: e.partyCount, trend: e.trend, lastObservedAt: e.lastObservedAt, inferred: e.inferred,
+  } : undefined;
   return {
     aName, bName,
-    aToB: pc.ab ? { summary: pc.ab.summary, valence: pc.ab.valence, observationCount: pc.ab.observationCount } : undefined,
-    bToA: pc.ba ? { summary: pc.ba.summary, valence: pc.ba.valence, observationCount: pc.ba.observationCount } : undefined,
+    aToB: edge(pc.ab),
+    bToA: edge(pc.ba),
+    behavioralCount: pc.behavioralCount,
     reasons: pc.observations.map(o => ({ fromName: o.fromId === aId ? aName : bName, reason: o.reason, at: o.createdAt })),
     claimsAboutA: pc.claimsAboutA,
     claimsAboutB: pc.claimsAboutB,

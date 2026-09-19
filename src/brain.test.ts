@@ -134,6 +134,52 @@ test("verifyMemoriesBatch: omitted items fall back to unclear", async () => {
   assert.deepEqual(out.get(2), { verdict: "unclear", reason: "omitted by model" });
 });
 
+test("verifyRelationshipsBatch: misattributed maps through instead of collapsing to unclear", async () => {
+  // A pasted/reposted claim isn't evidence of the assertor's view — it needs
+  // its own verdict so the observation is terminal-with-a-reason, not merely
+  // "couldn't tell" (which carries no signal about why it failed).
+  const { client, calls } = stubClient({
+    chatContent: JSON.stringify({ results: [
+      { index: 0, verdict: "misattributed", reason: "pasted bio" },
+      { index: 1, verdict: "literal", reason: "sincere" },
+    ] }),
+  });
+  const b = new Brain("k", "m", undefined, client);
+  const out = await b.verifyRelationshipsBatch([
+    { observationId: 10, authorName: "Alice", nature: "dating", otherName: "Bob", sourceMessage: "pasted: 'me and bob are dating'" },
+    { observationId: 11, authorName: "Carol", nature: "rivals", otherName: "Dan", sourceMessage: "dan keeps stealing my lunch" },
+  ], "verify-model");
+  assert.deepEqual(out.get(10), { verdict: "misattributed", reason: "pasted bio" });
+  assert.deepEqual(out.get(11), { verdict: "literal", reason: "sincere" });
+  assert.match(calls.chat[0].response_format.json_schema.schema.properties.results.items.properties.verdict.enum.join(","), /misattributed/);
+});
+
+test("analyzePairWindow parses a confident read and clamps valence", async () => {
+  const { client, calls } = stubClient({
+    chatContent: JSON.stringify({ confident: true, nature: "collaborates", valence: 1.4, reason: "ship together weekly" }),
+  });
+  const b = new Brain("k", "m", undefined, client);
+  const out = await b.analyzePairWindow("Alice", "Bob", [
+    { authorName: "Alice", content: "bob pushed the fix", createdAt: "2026-09-01T00:00:00Z" },
+    { authorName: "Bob", content: "alice merged it", createdAt: "2026-09-01T01:00:00Z" },
+  ], "verify-model");
+  assert.equal(out.confident, true);
+  assert.equal(out.nature, "collaborates");
+  assert.equal(out.valence, 1); // clamped to [-1, 1]
+  assert.match(calls.chat[0].messages[0].content, /Alice and Bob addressed each other/);
+});
+
+test("analyzePairWindow unconfident or malformed output stays unconfident", async () => {
+  const { client } = stubClient({ chatContent: JSON.stringify({ confident: false, nature: "", valence: 0, reason: "thin" }) });
+  const b = new Brain("k", "m", undefined, client);
+  const out = await b.analyzePairWindow("Alice", "Bob", [], "verify-model");
+  assert.equal(out.confident, false);
+  // confident=true with no nature is still unconfident — a label-less "edge" is noise
+  const c2 = stubClient({ chatContent: JSON.stringify({ confident: true, nature: "", valence: 0.5, reason: "x" }) });
+  const out2 = await new Brain("k", "m", undefined, c2.client).analyzePairWindow("A", "B", [], "m");
+  assert.equal(out2.confident, false);
+});
+
 // ── proposeGroundedAnswer ─────────────────────────────────────────────────────
 
 test("proposeGroundedAnswer returns an answer when context answers and clears the floor", async () => {

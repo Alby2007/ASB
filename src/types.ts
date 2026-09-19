@@ -54,6 +54,18 @@ export type RelationshipEdge = {
   id: number; guildId: string; subjectId: string; otherId: string;
   summary: string; valence: number | null; observationCount: number;
   lastObservedAt: string | null; updatedAt: string;
+  /** 90d mention/name-ref count stamped from the interaction graph —
+   *  deterministic contact frequency, not a claim about the dynamic. */
+  behavioralCount: number;
+  /** Literal observations authored by an edge party — self-report depth.
+   *  Zero means every claim about this pair came from a third party. */
+  partyCount: number;
+  /** 'warming' | 'cooling' | null — recent-5 weighted valence vs all-time,
+   *  only set with ≥3 observations. */
+  trend: string | null;
+  /** Behavior-only edge: frequent interaction, zero literal claims. Renders
+   *  as contact frequency, never as a relationship claim. */
+  inferred: boolean;
 };
 
 export type Member = {
@@ -236,11 +248,21 @@ export type StoredEvent = EventCandidate & {
  * asserting side) says about B; bToA is the reverse. Claims are attributed
  * assertions, not facts about the subject.
  */
+export type PairContextEdge = {
+  summary: string; valence: number | null; observationCount: number;
+  partyCount: number; trend: string | null; lastObservedAt: string | null;
+  /** Behavior-only edge — render as contact frequency, never a claim. */
+  inferred: boolean;
+};
+
 export type PairContext = {
   aName: string;
   bName: string;
-  aToB?: { summary: string; valence: number | null; observationCount: number };
-  bToA?: { summary: string; valence: number | null; observationCount: number };
+  aToB?: PairContextEdge;
+  bToA?: PairContextEdge;
+  /** Interaction-graph count for the pair — behavior signal, not a claim.
+   *  Surfaces as "frequent interaction" when no edge exists. */
+  behavioralCount: number;
   reasons: Array<{ fromName: string; reason: string; at: string }>;
   claimsAboutA: string[];   // things B asserted about A
   claimsAboutB: string[];   // things A asserted about B

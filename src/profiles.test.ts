@@ -125,9 +125,9 @@ test("recordRelationship is idempotent per message; edges roll up only after lit
   try {
     const { store } = await makeStore(sql);
     // Same (subject, other, message) twice → one observation
-    assert.equal(await store.recordRelationship("g1", "u1", "u2", "m1", "close friends", 0.8), true);
-    assert.equal(await store.recordRelationship("g1", "u1", "u2", "m1", "close friends", 0.8), false);
-    await store.recordRelationship("g1", "u1", "u2", "m2", "close friends", 0.4);
+    assert.equal(await store.recordRelationship("g1", "u1", "u2", "m1", "u1", "close friends", 0.8), true);
+    assert.equal(await store.recordRelationship("g1", "u1", "u2", "m1", "u1", "close friends", 0.8), false);
+    await store.recordRelationship("g1", "u1", "u2", "m2", "u1", "close friends", 0.4);
     // Unverified observations never surface as an edge
     assert.deepEqual(await store.relationshipsFor("g1", "u1"), []);
     // Literal verdicts + recompute → edge with stats over literal observations
@@ -140,8 +140,8 @@ test("recordRelationship is idempotent per message; edges roll up only after lit
     // Visible from the other side too
     assert.equal((await store.relationshipsFor("g1", "u2")).length, 1);
     // Self/unknown/server pairs are rejected
-    assert.equal(await store.recordRelationship("g1", "u1", "u1", "m3", "x", 0), false);
-    assert.equal(await store.recordRelationship("g1", "u1", "unknown", "m4", "x", 0), false);
+    assert.equal(await store.recordRelationship("g1", "u1", "u1", "m3", "u1", "x", 0), false);
+    assert.equal(await store.recordRelationship("g1", "u1", "unknown", "m4", "u1", "x", 0), false);
   } finally { await sql.end(); }
 });
 
@@ -271,9 +271,9 @@ test("forgetRelationshipsFor deletes observations and edges on both sides of the
   try {
     const { store } = await makeStore(sql);
     // Both directions need coverage: u1 as subject in one edge, as other in another.
-    await store.recordRelationship("g1", "u1", "u2", "m1", "close friends", 0.8, "t");
-    await store.recordRelationship("g1", "u3", "u1", "m2", "rivals", -0.5, "t");
-    await store.recordRelationship("g1", "u2", "u3", "m3", "siblings", 0.9, "t"); // control — u1 not involved
+    await store.recordRelationship("g1", "u1", "u2", "m1", "u1", "close friends", 0.8, "t");
+    await store.recordRelationship("g1", "u3", "u1", "m2", "u3", "rivals", -0.5, "t");
+    await store.recordRelationship("g1", "u2", "u3", "m3", "u2", "siblings", 0.9, "t"); // control — u1 not involved
     await sql`UPDATE relationship_observations SET verdict = 'literal' WHERE guild_id = 'g1'`;
     await store.recomputeEdges("g1");
 
@@ -285,6 +285,105 @@ test("forgetRelationshipsFor deletes observations and edges on both sides of the
     assert.equal(remaining[0].otherId, "u3");
     await store.recomputeEdges("g1");
     assert.deepEqual(await store.relationshipsFor("g1", "u1"), []);
+  } finally { await sql.end(); }
+});
+
+test("forgetRelationshipsFor erases the member's authored claims too, and orphaned edges die eagerly", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    // u1 asserts u2→u3 — u1 is the assertor, not an edge party. u2 asserts the same edge.
+    await store.recordRelationship("g1", "u2", "u3", "m1", "u1", "close friends", 0.8, "u1 said so");
+    await store.recordRelationship("g1", "u2", "u3", "m2", "u2", "close friends", 0.6, "u2 said so");
+    await sql`UPDATE relationship_observations SET verdict = 'literal' WHERE guild_id = 'g1'`;
+    await store.recomputeEdges("g1");
+    assert.equal((await store.relationshipsFor("g1", "u2"))[0]?.observationCount, 2);
+
+    // u1 opts out: their authored claim is erased even though u1 isn't an edge
+    // party, and the edge it fed is dropped rather than carrying a stale
+    // aggregate — the surviving observation rebuilds it at next recompute.
+    assert.equal(await store.forgetRelationshipsFor("g1", "u1"), 1);
+    assert.deepEqual(await store.relationshipsFor("g1", "u2"), [], "edge dropped eagerly — no stale aggregate");
+    await store.recomputeEdges("g1");
+    const edge = (await store.relationshipsFor("g1", "u2"))[0];
+    assert.equal(edge.observationCount, 1, "the surviving authored observation rebuilds the edge");
+
+    // u2 opts out — party-side delete removes the last literal observation,
+    // and the edge is dropped eagerly rather than lingering until recompute.
+    assert.equal(await store.forgetRelationshipsFor("g1", "u2"), 1);
+    assert.deepEqual(await store.relationshipsFor("g1", "u3"), []);
+  } finally { await sql.end(); }
+});
+
+test("opt-out erases pair_window observations and inferred edges too", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    await store.setMemberOptIn("g1", "u1", true);
+    await store.setMemberOptIn("g1", "u3", true);
+    // A system-asserted window observation (author NULL) + an inferred edge —
+    // both are rows in the same tables, so the same delete paths must catch them.
+    await store.recordWindowObservation("g1", "u1", "u2", "mw1", "collaborates", 0.6, "window read", true);
+    await store.recomputeEdges("g1", [{ aId: "u3", bId: "u4", count: 12 }]);
+    assert.equal((await store.relationshipsFor("g1", "u1"))[0].summary, "collaborates");
+    assert.equal((await store.relationshipsFor("g1", "u3"))[0].inferred, true);
+
+    // Party-side opt-out: window obs deleted by subject/other match (author_id
+    // NULL doesn't matter — the pair itself is the party).
+    assert.equal(await store.forgetRelationshipsFor("g1", "u1"), 2); // both directions
+    assert.deepEqual(await store.relationshipsFor("g1", "u1"), []);
+
+    // Inferred edge dies on party opt-out — contact-frequency is still their data.
+    assert.equal(await store.forgetRelationshipsFor("g1", "u3"), 0); // no observations — edges only
+    assert.deepEqual(await store.relationshipsFor("g1", "u3"), []);
+    // Nothing rebuilds them.
+    await store.recomputeEdges("g1");
+    assert.deepEqual(await store.relationshipsFor("g1", "u4"), []);
+  } finally { await sql.end(); }
+});
+
+test("pruneDerivedData drops observations that can never surface, keeps the rest", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    await store.recordMessage(msg("still here", { messageId: "m-live", authorId: "u1" }));
+    // Unverifiable forever: NULL verdict + source message gone (or never archived).
+    await store.recordRelationship("g1", "u1", "u2", "m-dead", "u1", "close friends", 0.8, "t");
+    // Unverified but verifiable — the source message still exists.
+    await store.recordRelationship("g1", "u1", "u2", "m-live", "u1", "rivals", -0.2, "t");
+    // Terminal non-literal verdicts never feed edges — aged ones are dead audit weight.
+    await store.recordRelationship("g1", "u1", "u3", "m-joke-old", "u1", "bit", 0.1, "t");
+    await store.recordRelationship("g1", "u1", "u3", "m-joke-new", "u1", "bit", 0.1, "t");
+    await sql`UPDATE relationship_observations SET verdict = 'joke' WHERE message_id IN ('m-joke-old', 'm-joke-new')`;
+    await sql`UPDATE relationship_observations SET created_at = now() - interval '100 days' WHERE message_id = 'm-joke-old'`;
+    // Literal with a dead source keeps feeding edges — the verdict is the derived truth.
+    await store.recordRelationship("g1", "u1", "u4", "m-lit-dead", "u1", "siblings", 0.9, "t");
+    await sql`UPDATE relationship_observations SET verdict = 'literal' WHERE message_id = 'm-lit-dead'`;
+
+    const pruned = await store.pruneDerivedData("g1");
+    assert.equal(pruned.observations, 2, "dead-source NULL + aged non-literal");
+    const left = await sql<Array<{ message_id: string }>>`SELECT message_id FROM relationship_observations WHERE guild_id = 'g1' ORDER BY message_id`;
+    assert.deepEqual(left.map(r => r.message_id), ["m-joke-new", "m-lit-dead", "m-live"]);
+  } finally { await sql.end(); }
+});
+
+test("edge valence averages the five most recent literal observations, not all-time", async () => {
+  const sql = makeTestSql();
+  try {
+    const { store } = await makeStore(sql);
+    // Six observations: one old hostile period, then the relationship warmed.
+    await store.recordRelationship("g1", "u1", "u2", "m0", "u1", "rivals", -1.0, "old beef");
+    for (let i = 1; i <= 5; i++) {
+      await store.recordRelationship("g1", "u1", "u2", `m${i}`, "u1", "close friends", 0.8, "recent");
+    }
+    await sql`UPDATE relationship_observations SET verdict = 'literal' WHERE guild_id = 'g1'`;
+    await sql`UPDATE relationship_observations SET created_at = now() - interval '30 days' WHERE message_id = 'm0'`;
+    await store.recomputeEdges("g1");
+
+    const [edge] = await store.relationshipsFor("g1", "u1");
+    assert.equal(edge.observationCount, 6, "all-time depth is preserved");
+    assert.ok(Math.abs(edge.valence! - 0.8) < 0.001, `recent valence wins — got ${edge.valence}`);
+    assert.equal(edge.summary, "close friends", "latest nature is the summary");
   } finally { await sql.end(); }
 });
 
@@ -538,8 +637,8 @@ test("mergedEdges collapses directed edges into one counterparty view", async ()
   try {
     const { store } = await makeStore(sql);
     // A→B and B→A are stored as separate directed edges…
-    await store.recordRelationship("g1", "u1", "u2", "m1", "close friends", 0.8, "said so");
-    await store.recordRelationship("g1", "u2", "u1", "m2", "trusts them", 0.4, "returned it");
+    await store.recordRelationship("g1", "u1", "u2", "m1", "u1", "close friends", 0.8, "said so");
+    await store.recordRelationship("g1", "u2", "u1", "m2", "u2", "trusts them", 0.4, "returned it");
     await sql`UPDATE relationship_observations SET verdict = 'literal' WHERE guild_id = 'g1'`;
     await store.recomputeEdges("g1");
     const edges = await store.mergedEdges("g1", "u1");
@@ -574,8 +673,8 @@ test("relationshipObservationsFor returns both directions with labels", async ()
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
-    await store.recordRelationship("g1", "u1", "u2", "m1", "antagonizes", -0.5, "mocked them");
-    await store.recordRelationship("g1", "u2", "u1", "m2", "defends", 0.7, "stood up for them");
+    await store.recordRelationship("g1", "u1", "u2", "m1", "u1", "antagonizes", -0.5, "mocked them");
+    await store.recordRelationship("g1", "u2", "u1", "m2", "u2", "defends", 0.7, "stood up for them");
     // Only literal-verdicted observations are surfaced
     assert.equal((await store.relationshipObservationsFor("g1", "u1")).length, 0);
     await sql`UPDATE relationship_observations SET verdict = 'literal' WHERE guild_id = 'g1'`;
@@ -592,9 +691,9 @@ test("recomputeEdges builds edges only from literal-verdicted observations", asy
   const sql = makeTestSql();
   try {
     const { store } = await makeStore(sql);
-    await store.recordRelationship("g1", "u1", "u2", "m1", "dating", 0.9, "joke ship");
-    await store.recordRelationship("g1", "u1", "u2", "m2", "close friends", 0.8, "real signal");
-    await store.recordRelationship("g1", "u1", "u2", "m3", "flirts", 0.5, "ambiguous bit");
+    await store.recordRelationship("g1", "u1", "u2", "m1", "u1", "dating", 0.9, "joke ship");
+    await store.recordRelationship("g1", "u1", "u2", "m2", "u1", "close friends", 0.8, "real signal");
+    await store.recordRelationship("g1", "u1", "u2", "m3", "u1", "flirts", 0.5, "ambiguous bit");
     // Nothing is visible while all observations are unverified
     await store.recomputeEdges("g1");
     assert.equal((await store.relationshipsFor("g1", "u1")).length, 0);

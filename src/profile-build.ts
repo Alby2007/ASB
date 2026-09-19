@@ -45,6 +45,7 @@ export async function runProfileBuild(
   const aliasMap = await buildAliasMap(guildId, store);
   const optedIn = new Set(members.filter(m => m.optedIn && !m.optedOut).map(m => m.userId));
   const isConsented = (id: string) => id === "unknown" || id === "server" || optedIn.has(id);
+  const natureVocab = await store.relationshipNatureVocab(guildId);
 
   let memories = 0, relationships = 0;
   for (let i = 0; i < rows.length; i += EXTRACT_BATCH) {
@@ -73,7 +74,7 @@ export async function runProfileBuild(
       }
     }
     try {
-      const results = await withRetry(() => brain.extractMemoriesBatch(batch, config.ingestModel ?? config.model), 3);
+      const results = await withRetry(() => brain.extractMemoriesBatch(batch, config.ingestModel ?? config.model, natureVocab), 3);
       for (const item of batch) {
         const result = results.get(item.event.messageId) ?? { memories: [], relationships: [] };
         const persisted = await persistExtraction(result, item.event, { store, aliases: aliasMap, isConsented });
