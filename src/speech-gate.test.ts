@@ -43,6 +43,7 @@ function makeHarness(opts?: { throttleCapacity?: number; engagement?: boolean; t
   let seq = 0;
   return {
     convo,
+    throttle,
     /** Play one human message through the gate; a `spoke` result records the
      * bot's reply in the voice window exactly like index.ts's noteReply. */
     play(turn: Turn): Outcome {
@@ -133,6 +134,23 @@ test("per-user throttle: a burst is free, then replies suppress until refill", (
   assert.equal(throttled.spoke, false);
   assert.equal(h.play({ content: "asb 4", mentionsBot: true }).spoke, false);
   assert.equal(h.play({ content: "asb again", mentionsBot: true, advanceMs: 45_000 }).spoke, true, "refill restores one reply");
+});
+
+// A decided reply that never reaches the channel (empty model output, leak
+// drop, send error) must not burn the member's burst — otherwise failed
+// generations cascade into suppressing the NEXT addressed message.
+test("a failed send refunds the throttle token — silence isn't speech", () => {
+  const h = makeHarness({ throttleCapacity: 2, throttleRefillMs: 45_000 });
+  assert.equal(h.play({ content: "asb 1", mentionsBot: true }).spoke, true);
+  assert.equal(h.play({ content: "asb 2", mentionsBot: true }).spoke, true);
+  // Third decided reply fails mid-generation — handleMessage refunds.
+  const failed = h.play({ content: "asb 3", mentionsBot: true });
+  assert.equal(failed.verdict!.decision.shouldSpeak, true);
+  assert.equal(failed.spoke, false, "bucket empty without the fix path");
+  h.throttle.refund("g1", "u1");
+  // Fourth message replies instead of being suppressed by the dead send.
+  const spoke = h.throttle.consume("g1", "u1");
+  assert.equal(spoke, true, "refunded token lets the next addressed message through");
 });
 
 // The model's end_conversation maps to convo.leave — the NEXT turn is then

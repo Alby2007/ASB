@@ -35,4 +35,13 @@ export class ReplyThrottle {
     b.tokens -= 1;
     return true;
   }
+
+  /** Give back a token when a decided reply never reached the channel —
+   *  empty model output, leak-guard drop, send error. A message the member
+   *  never saw must not count against their burst, or failed generations
+   *  cascade into suppressing the NEXT addressed message. */
+  refund(guildId: string, userId: string): void {
+    const b = this.buckets.get(`${guildId}:${userId}`);
+    if (b) b.tokens = Math.min(this.opts.capacity, b.tokens + 1);
+  }
 }

@@ -839,7 +839,7 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
     // must never reach the channel no matter which reply path produced them.
     // Silence over leak — the parser's salvage ladder should catch these
     // first, so anything reaching here is a shape the ladder missed.
-    if (clean && looksLikeSchemaLeak(clean)) { inc("reply.schema_leak"); return; }
+    if (clean && looksLikeSchemaLeak(clean)) { inc("reply.schema_leak"); replyThrottle.refund(event.guildId, event.authorId); return; }
     if (clean) {
       const sent = await message.reply({ content: clean, allowedMentions: { parse: [], repliedUser: false } });
       convo.noteReply(key); inc("reply.sent");
@@ -854,6 +854,11 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
       // Same rule as inbound bot chatter: archive for transcript fidelity,
       // never a memory source — keep it out of the sweep's extraction set.
       await store.setTriageResults([{ id: sent.id, result: "noise" }]);
+    } else {
+      // Decide said speak but nothing sendable came back — the member sees
+      // silence on an addressed message. Refund so the failure doesn't eat
+      // their burst, and count it: without this the drop is invisible.
+      inc("reply.empty"); replyThrottle.refund(event.guildId, event.authorId);
     }
     // The model's read that this human is done — thanks/bye/wrap-up, or the
     // exchange is clearly complete. Outside the `clean` block so an empty
@@ -865,12 +870,14 @@ async function handleMessage(message: OmitPartialGroupDMChannel<Message>) {
   } catch (error) {
     if (error instanceof BudgetExceeded) {
       inc("budget.reply_blocked");
+      replyThrottle.refund(event.guildId, event.authorId);
       if (budgetNoticeOnce(event.channelId)) {
         await message.reply({ content: "I've hit this server's daily LLM limit, so I can't respond right now — it resets at midnight UTC. An admin can raise it with `/limits`.", allowedMentions: { parse: [], repliedUser: false } }).catch(() => {});
       }
       return;
     }
     inc("llm.reply_error"); logError("Reply generation failed", error);
+    replyThrottle.refund(event.guildId, event.authorId);
   }
 }
 
